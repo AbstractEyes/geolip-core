@@ -2,6 +2,9 @@
 
 Geometric observer framework for deep learning.
 
+This paradigm is under heavy construction, and the current abstract solution
+is invalid to the goal.
+
 Part of the [GeoLIP](https://github.com/AbstractEyes/glip-autoencoder) ecosystem.
 
 ## Install
