@@ -1,8 +1,8 @@
 """
 Conv Encoder — 8-layer conv backbone + full GeoLIP classification pipeline.
 
-ConvEncoder:        Simple conv backbone. Feature extraction only.
-GeoLIPConvEncoder:  ConvEncoder → S^(d-1) → MagnitudeFlow → GeoLIP(ConstellationObserver) → task head.
+ConvEncoder:        Implements Input stage. 8-layer conv → S^(d-1).
+GeoLIPConvEncoder:  ConvEncoder → MagnitudeFlow → ConstellationObserver → task head.
 
 The observer observes. The task head and CE loss live HERE.
 
@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..core.activation import make_activation
-from ..core.observer import Input, GeoLIP
+from ..core.observer import Input
 from ..core.constellation import ConstellationObserver
 from ..core.patchwork import MagnitudeFlow
 from ..core.core import param_count, model_summary
@@ -77,12 +77,12 @@ class ConvEncoder(Input):
 # ══════════════════════════════════════════════════════════════════
 
 class GeoLIPConvEncoder(nn.Module):
-    """ConvEncoder wired to the GeoLIP observation framework + classification head.
+    """ConvEncoder wired to ConstellationObserver + classification head.
 
-    ConvEncoder → L2 normalize → MagnitudeFlow → GeoLIP(ConstellationObserver) → task head.
+    ConvEncoder → L2 normalize → MagnitudeFlow → ConstellationObserver → task head.
 
-    The GeoLIP instance runs the observation loop. The task head and CE loss
-    are owned HERE — classification is this class's job, not the observer's.
+    The observer handles observation and self-organization. The task head
+    and CE loss are owned HERE — classification is this class's job.
 
     Args:
         num_classes: classification targets
@@ -139,32 +139,29 @@ class GeoLIPConvEncoder(nn.Module):
             mag_min=mag_min, mag_max=mag_max, n_comp=n_comp,
         )
 
-        # Observer framework
-        constellation_obs = ConstellationObserver(
+        # Observer — holds the constellation observation pipeline
+        self.observer = ConstellationObserver(
             dim=output_dim, n_anchors=n_anchors,
             n_comp=n_comp, d_comp=d_comp,
             anchor_drop=anchor_drop, anchor_init='repulsion',
             activation=activation, assign_temp=assign_temp,
         )
-        self.geolip = GeoLIP(dim=output_dim, observers={
-            'constellation': constellation_obs,
-        })
 
         # Task head — classification is THIS class's job
         self.task_head = nn.Sequential(
-            nn.Linear(self.geolip.feature_dim, constellation_obs.patchwork.output_dim),
+            nn.Linear(self.observer.feature_dim, self.observer.patchwork.output_dim),
             make_activation(activation),
-            nn.LayerNorm(constellation_obs.patchwork.output_dim),
+            nn.LayerNorm(self.observer.patchwork.output_dim),
             nn.Dropout(0.1),
-            nn.Linear(constellation_obs.patchwork.output_dim, num_classes),
+            nn.Linear(self.observer.patchwork.output_dim, num_classes),
         )
 
         self._init_encoder_weights()
 
     @property
     def constellation_observer(self):
-        """Convenience accessor for the constellation observer."""
-        return self.geolip.observers['constellation']
+        """Convenience accessor."""
+        return self.observer
 
     def _init_encoder_weights(self):
         for m in self.encoder.modules():
@@ -190,7 +187,7 @@ class GeoLIPConvEncoder(nn.Module):
         """Training: two views → observation + logits."""
         emb1, mag1, mc1 = self._encode(v1)
         emb2, mag2, mc2 = self._encode(v2)
-        out = self.geolip.observe_paired(emb1, emb2, mag1=mag1, mag2=mag2)
+        out = self.observer.observe_paired(emb1, emb2, mag1=mag1, mag2=mag2)
         out['logits'] = self.task_head(out['features1'])
         out['logits_aug'] = self.task_head(out['features2'])
         out['mag_comp1'] = mc1
@@ -200,7 +197,7 @@ class GeoLIPConvEncoder(nn.Module):
     def forward(self, x):
         """Eval: single view → observation + logits."""
         emb, mag, mag_comp = self._encode(x)
-        out = self.geolip.observe(emb, mag=mag)
+        out = self.observer.observe(emb, mag=mag)
         out['logits'] = self.task_head(out['features'])
         out['mag_comp'] = mag_comp
         return out
@@ -210,19 +207,11 @@ class GeoLIPConvEncoder(nn.Module):
 
         Returns: (total_loss, loss_dict)
         """
-        # Flatten namespaced keys for observer_loss compatibility
-        # GeoLIP namespaces as 'constellation/key', observer_loss expects flat keys
-        obs = self.constellation_observer
-        flat = {}
-        for k, v in output.items():
-            if k.startswith('constellation/'):
-                flat[k[len('constellation/'):]] = v
-            else:
-                flat[k] = v
+        obs = self.observer
 
-        # Observer self-organization
+        # Observer self-organization (keys are flat — no namespace prefix)
         obs_loss, ld = observer_loss(
-            flat,
+            output,
             anchors=obs.constellation.anchors,
             targets=targets,
             infonce_temp=self.infonce_temp,
