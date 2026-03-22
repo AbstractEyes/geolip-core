@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geolip-core"
+version = "0.1.0"
+description = "Geometric building blocks for deep learning — constellation triangulation, patchwork compartments, and relay layers"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "AbstractPhil"},
+]
+
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+vision = ["torchvision"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Repository = "https://github.com/AbstractEyes/geolip-core"
+HuggingFace = "https://huggingface.co/AbstractPhil"
+Ecosystem = "https://github.com/AbstractEyes/glip-autoencoder"
+
+[tool.setuptools.packages.find]
+include = ["geolip_core*"]
