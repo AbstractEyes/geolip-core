@@ -1,10 +1,15 @@
 """
-Patchwork — round-robin compartmentalized interpretation of triangulation.
-MagnitudeFlow — relay-stack per-compartment magnitude prediction.
+Patchwork — round-robin compartmentalized Curation of triangulation.
+MagnitudeFlow — relay-stack per-compartment magnitude prediction (Mutation).
 AnchorPush — non-gradient anchor repositioning strategies.
 
+In the six-stage paradigm:
+  Patchwork     = Curation (interprets association distances into features)
+  MagnitudeFlow = Mutation (transforms magnitude informed by triangulation)
+  AnchorPush    = external to the paradigm (non-gradient, between epochs)
+
 Usage:
-    from core.patchwork import Patchwork, MagnitudeFlow, AnchorPush
+    from geolip_core.core.patchwork import Patchwork, MagnitudeFlow, AnchorPush
 """
 
 import torch

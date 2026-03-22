@@ -1,11 +1,15 @@
 """
-Constellation Relay — geometric processing without attention.
+Constellation Relay — per-token geometric Mutation.
 
 RelayLayer:         Single vectorized relay. Patches → S^(d-1) → 3-phase SLERP → gated residual.
 ConstellationRelay: Per-token wrapper. O(S) complexity. 99.4% cos fidelity at depth 16.
 
+In the six-stage paradigm, these are Mutations — they transform position
+on the manifold informed by triangulation, without changing what the
+embedding represents.
+
 Usage:
-    from core.constellation_relay import ConstellationRelay, RelayLayer
+    from geolip_core.core.constellation_relay import ConstellationRelay, RelayLayer
 """
 
 import torch
@@ -136,8 +140,17 @@ class ConstellationRelay(nn.Module):
         self.proj = nn.Linear(self.patchwork.output_dim, dim)
         self.gate = nn.Parameter(torch.full((dim,), gate_init))
 
-    def forward(self, x):
-        """x: (B, D) or (B, S, D) → same shape, with geometric residual."""
+    def forward(self, x, return_tri=False):
+        """x: (B, D) or (B, S, D) → same shape, with geometric residual.
+
+        Args:
+            x: input tensor
+            return_tri: if True, also return triangulation profile for routing
+
+        Returns:
+            out: same shape as x
+            tri (optional): (B, S, n_anchors) triangulation distances if return_tri=True
+        """
         squeeze = x.dim() == 2
         if squeeze:
             x = x.unsqueeze(1)
@@ -149,4 +162,12 @@ class ConstellationRelay(nn.Module):
         update = self.proj(self.patchwork(tri)).reshape(B, S, D)
         out = residual + torch.sigmoid(self.gate) * update
 
-        return out.squeeze(1) if squeeze else out
+        if squeeze:
+            out = out.squeeze(1)
+            if return_tri:
+                return out, tri  # (B, D), (B, n_anchors)
+            return out
+
+        if return_tri:
+            return out, tri.reshape(B, S, -1)  # (B, S, D), (B, S, n_anchors)
+        return out

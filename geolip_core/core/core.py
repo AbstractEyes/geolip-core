@@ -2,7 +2,7 @@
 Core utilities — GeometricAutograd, parameter counting, model summary.
 
 Usage:
-    from core.core import GeometricAutograd, param_count, model_summary
+    from geolip_core.core.core import GeometricAutograd, param_count, model_summary
 """
 
 import torch

@@ -1,11 +1,12 @@
 """
-Memory — embedding buffers and state management for constellation training.
+Memory — embedding buffers and state management.
 
-Provides accumulation buffers for anchor push, embedding banks for
-contrastive learning, and state tracking for multi-epoch training.
+Accumulation buffers for AnchorPush, embedding banks for contrastive
+learning, and state tracking across training steps. These support
+the observation loop but are not a stage themselves.
 
 Usage:
-    from core.memory import EmbeddingBuffer
+    from geolip_core.core.memory import EmbeddingBuffer
 """
 
 import torch

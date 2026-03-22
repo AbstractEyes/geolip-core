@@ -1,7 +1,12 @@
 """
-GeoLIP Losses & Regularization
-=================================
-Every loss and metric in the GeoLIP pipeline, with uniform interfaces.
+GeoLIP Losses & Regularization — the Loss stage.
+====================================================
+Standalone loss functions and metrics. Not methods on any class.
+
+In the six-stage paradigm, Loss is the sixth stage — standalone recipes
+composed from individual functions. observer_loss() is the default recipe
+for observer self-organization. Task losses (CE, etc.) are added by the
+encoder or training loop.
 
 All loss functions: (inputs) → scalar tensor (differentiable)
 All metrics: (inputs) → float (non-differentiable, for monitoring)
@@ -19,10 +24,10 @@ Metrics:
   cv_metric, cv_multi_scale, cayley_menger_vol2
 
 Compound:
-  three_domain_loss — the full cooperative loss from InternalConstellationCore
+  three_domain_loss — the full cooperative loss (all 3 domains, legacy)
 
 Usage:
-    from core.losses import cv_loss, cv_metric, nce_loss, three_domain_loss
+    from geolip_core.core.losses import cv_loss, cv_metric, nce_loss, three_domain_loss
 """
 
 import torch
@@ -314,4 +319,90 @@ def three_domain_loss(output, targets, constellation, cv_target=0.22,
     ld['t_assign_nce'] = l_assign_nce.item()
     ld['t_nce_tri'] = l_nce_tri.item()
     ld['t_attract'] = l_attract.item()
+    return loss, ld
+
+
+# ══════════════════════════════════════════════════════════════════
+# OBSERVER LOSS — standalone recipe for any observer's output
+# ══════════════════════════════════════════════════════════════════
+
+def observer_loss(output, anchors, targets=None,
+                  infonce_temp=0.07, assign_temp=0.1, cv_target=0.22,
+                  w_nce_emb=0.5,
+                  w_nce_pw=1.0, w_bridge=1.0,
+                  w_assign=0.5, w_assign_nce=0.25,
+                  w_nce_tri=0.5, w_attract=0.25,
+                  w_cv=0.01, w_spread=0.01,
+                  cv_batched=True):
+    """Observer self-organization loss. No CE. No task loss.
+
+    Standalone recipe — not a method on any class. Takes the observation
+    dict from any observer and computes geometric + internal losses.
+
+    Two domains:
+      GEOMETRIC: patchwork NCE + bridge
+      INTERNAL:  assign BCE + assign NCE + tri NCE + attraction + CV + spread
+
+    Embedding NCE included — it shapes the manifold the observer reads.
+    kNN accuracy computed when targets are provided.
+
+    Args:
+        output: dict from observer.observe_paired() — must contain:
+            embedding, embedding_aug, patchwork1, patchwork1_aug,
+            bridge1, bridge2, assign1, assign2, cos1, tri1, tri2
+        anchors: nn.Parameter — constellation anchors for spread loss
+        targets: (B,) optional class labels for kNN metric
+        infonce_temp: embedding NCE temperature
+        assign_temp: patchwork NCE / assignment NCE temperature
+        cv_target: target CV for pentachoron regularization
+        w_*: per-term loss weights
+        cv_batched: use batched CV computation
+
+    Returns:
+        (loss, loss_dict)
+    """
+    ld = {}
+    emb1, emb2 = output['embedding'], output['embedding_aug']
+
+    # ── EMBEDDING NCE (shapes the manifold) ──
+    l_nce_emb, nce_emb_acc = nce_loss(emb1, emb2, infonce_temp, normalize=False)
+    ld['nce_emb'], ld['nce_emb_acc'] = l_nce_emb, nce_emb_acc
+
+    # ── GEOMETRIC ──
+    l_nce_pw, nce_pw_acc = nce_loss(
+        output['patchwork1'], output['patchwork1_aug'], assign_temp, normalize=True)
+    ld['nce_pw'], ld['nce_pw_acc'] = l_nce_pw, nce_pw_acc
+    l_bridge, bridge_acc = bridge_loss_paired(
+        output['bridge1'], output['bridge2'], output['assign1'], output['assign2'])
+    ld['bridge'], ld['bridge_acc'] = l_bridge, bridge_acc
+
+    # ── INTERNAL ──
+    l_assign, assign_ent = assign_bce_loss(output['assign1'], output['cos1'])
+    ld['assign'], ld['assign_entropy'] = l_assign, assign_ent
+    l_assign_nce, assign_nce_acc = assign_nce_loss(
+        output['assign1'], output['assign2'], assign_temp)
+    ld['assign_nce'], ld['assign_nce_acc'] = l_assign_nce, assign_nce_acc
+    l_nce_tri, nce_tri_acc = nce_loss(output['tri1'], output['tri2'], 0.1, normalize=True)
+    ld['nce_tri'], ld['nce_tri_acc'] = l_nce_tri, nce_tri_acc
+    l_attract, nearest_cos = attraction_loss(output['cos1'])
+    ld['attract'], ld['nearest_cos'] = l_attract, nearest_cos
+    l_cv = cv_loss(emb1, target=cv_target, batched=cv_batched)
+    ld['cv'] = l_cv
+    l_spread = spread_loss(anchors)
+    ld['spread'] = l_spread
+
+    # ── kNN (manifold quality) ──
+    if targets is not None:
+        ld['knn_acc'] = knn_accuracy(emb1, targets)
+
+    # ── TOTAL ──
+    loss_geometric = w_nce_pw * l_nce_pw + w_bridge * l_bridge
+    loss_internal = (w_assign * l_assign + w_assign_nce * l_assign_nce
+                     + w_nce_tri * l_nce_tri + w_attract * l_attract
+                     + w_cv * l_cv + w_spread * l_spread)
+    loss = w_nce_emb * l_nce_emb + loss_geometric + loss_internal
+
+    ld['loss_geometric'] = loss_geometric.item()
+    ld['loss_internal'] = loss_internal.item()
+    ld['total'] = loss
     return loss, ld

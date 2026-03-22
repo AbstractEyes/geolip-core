@@ -18,7 +18,7 @@ But GeoLIP doesn't enforce order. You register stages, you define the
 pipeline in your forward method. GeoLIP holds them and exposes them.
 
 Usage:
-    from geolip_core.core.observer import Input, Mutation, Association, Curation, Distinction, GeoLIP
+    from core.observer import Input, Mutation, Association, Curation, Distinction, GeoLIP
 """
 
 import torch

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "geolip-core"
 version = "0.1.0"
-description = "Geometric building blocks for deep learning — constellation triangulation, patchwork compartments, and relay layers"
+description = "Geometric observer framework for deep learning — six-stage paradigm: Input, Mutation, Association, Curation, Distinction, Loss"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}

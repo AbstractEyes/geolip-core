@@ -1,11 +1,16 @@
 """
-Constellation Route — ODE flow in tangent space.
+Constellation Route — trajectory Mutation on the manifold.
 
-Historical: superseded by ConstellationRelay for most use cases.
-Retained for research and specialized applications.
+FlowAttention: ODE flow in tangent space of S^(d-1).
+Integrates velocity fields conditioned on the triangulation profile.
+The correction is projected back to the tangent plane before normalization.
+
+In the six-stage paradigm, this is a Mutation — it moves an embedding from
+where it is to where it should be along S^(d-1). Superseded by
+ConstellationRelay for most per-token use cases. Kept for research.
 
 Usage:
-    from core.constellation_route import FlowAttention
+    from geolip_core.core.constellation_route import FlowAttention
 """
 
 import math
@@ -16,13 +21,6 @@ import torch.nn.functional as F
 
 class FlowAttention(nn.Module):
     """3-step Euler flow in tangent space of S^(d-1).
-
-    Routes embeddings through an ODE that integrates velocity fields
-    conditioned on the triangulation profile. The correction is projected
-    back to the tangent plane before normalization.
-
-    Superseded by ConstellationRelay for production use (relay is faster,
-    more stable, and achieves better fidelity at depth). Kept for research.
 
     Args:
         dim: embedding dimension

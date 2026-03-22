@@ -2,7 +2,7 @@
 Activation functions for geometric pipelines.
 
 Usage:
-    from core.activation import make_activation, SquaredReLU
+    from geolip_core.core.activation import make_activation, SquaredReLU
 """
 
 import torch
