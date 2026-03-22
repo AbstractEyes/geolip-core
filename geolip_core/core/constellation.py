@@ -125,8 +125,8 @@ class ConstellationAssociation(Association):
     """
 
     def __init__(self, dim=256, n_anchors=128, anchor_drop=0.15,
-                 anchor_init='repulsion', assign_temp=0.1):
-        super().__init__()
+                 anchor_init='repulsion', assign_temp=0.1, **kwargs):
+        super().__init__(**kwargs)
         self.assign_temp = assign_temp
         self.constellation = Constellation(n_anchors, dim, anchor_drop, anchor_init)
 
@@ -184,8 +184,8 @@ class ConstellationCuration(Curation):
     """
 
     def __init__(self, n_anchors=128, dim=256, n_comp=8, d_comp=64,
-                 activation='squared_relu'):
-        super().__init__()
+                 activation='squared_relu', **kwargs):
+        super().__init__(**kwargs)
         self.dim = dim
         self.n_anchors = n_anchors
 

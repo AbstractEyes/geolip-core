@@ -8,13 +8,14 @@ version = "0.1.0"
 description = "Geometric observer framework for deep learning — six-stage paradigm: Input, Mutation, Association, Curation, Distinction, Loss"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 authors = [
     {name = "AbstractPhil"},
 ]
 
 dependencies = [
     "torch>=2.0",
+    "geofractal @ git+https://github.com/AbstractEyes/geofractal.git",
 ]
 
 [project.optional-dependencies]

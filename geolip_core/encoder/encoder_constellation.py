@@ -1,34 +1,24 @@
 """
 Constellation Encoder — Full-Stack GeoLIP Composition
 ========================================================
-Subclasses GeoLIP. Registers constellation stages. Defines the
-canonical observation pipeline using those stages.
+GeoLIP tower with constellation stages attached as named components.
 
-The partial encoders (conv, wavelet, scatter, transformer) are Input
-stages. They produce embeddings on S^(d-1). This module consumes those
-embeddings through the paradigm:
-
-    Association → Mutation → Curation → (recurse or) → Distinction
-
-Every component is a registered stage accessed by name. Swap any stage
-by re-registering. Add tiers by registering additional association/curation
-pairs. The paradigm holds.
-
-ConstellationEncoder:   GeoLIP with constellation stages pre-registered.
-ClassificationHead:     Distinction stage for supervised classification.
-GeoLIPEncoder:          Any Input + ConstellationEncoder composed.
+ConstellationEncoder:  emb on S^(d-1) → mag → observe → distinguish
+ClassificationHead:    Distinction stage for supervised tasks
+GeoLIPEncoder:         Any Input + ConstellationEncoder composed
 
 Usage:
     from geolip_core.encoder import ConstellationEncoder, GeoLIPEncoder, ConvEncoder
 
-    # Full stack from raw embeddings
+    # Full stack — accepts embeddings from any source
     enc = ConstellationEncoder(dim=384, n_anchors=512, num_classes=100)
     out = enc.forward_paired(emb1, emb2, raw_mag1, raw_mag2)
     loss, ld = enc.compute_loss(out, targets)
 
     # Composed with any Input stage
-    model = GeoLIPEncoder(input_stage=ConvEncoder(384), dim=384, num_classes=100)
+    model = GeoLIPEncoder(ConvEncoder(384), dim=384, num_classes=100)
     out = model.forward_paired(view1, view2)
+    loss, ld = model.compute_loss(out, targets)
 """
 
 import torch
@@ -36,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..core.observer import GeoLIP, Distinction
-from ..core.constellation import ConstellationAssociation, ConstellationCuration
+from ..core.constellation import ConstellationObserver
 from ..core.patchwork import MagnitudeFlow
 from ..core.activation import make_activation
 from ..core.core import param_count, model_summary
@@ -48,22 +38,11 @@ from ..core.losses import ce_loss_paired, observer_loss
 # ══════════════════════════════════════════════════════════════════
 
 class ClassificationHead(Distinction):
-    """Distinction stage for supervised classification.
-
-    Reads curated features → logits. This is the only stage that
-    knows about the downstream task (class count).
-
-    Args:
-        feature_dim: input feature dimension (from curation)
-        num_classes: output classes
-        hidden_dim: intermediate MLP dimension
-        activation: activation function name
-        dropout: dropout rate
-    """
+    """Distinction stage for supervised classification."""
 
     def __init__(self, feature_dim, num_classes, hidden_dim=None,
-                 activation='squared_relu', dropout=0.1):
-        super().__init__()
+                 activation='squared_relu', dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
         if hidden_dim is None:
             hidden_dim = feature_dim
         self.num_classes = num_classes
@@ -80,28 +59,25 @@ class ClassificationHead(Distinction):
 
 
 # ══════════════════════════════════════════════════════════════════
-# CONSTELLATION ENCODER — GeoLIP with constellation stages
+# CONSTELLATION ENCODER — GeoLIP tower
 # ══════════════════════════════════════════════════════════════════
 
 class ConstellationEncoder(GeoLIP):
-    """GeoLIP pre-configured with constellation observation stages.
+    """Full geometric pipeline as a GeoLIP tower.
 
-    Registers:
-        mutation 'magnitude':       MagnitudeFlow (relay-stack confidence)
-        association 'constellation': ConstellationAssociation (triangulate)
-        curation 'constellation':   ConstellationCuration (patchwork + bridge)
-        distinction 'classify':     ClassificationHead (optional, if num_classes > 0)
+    Attaches constellation stages as named components:
+        self['mag_flow']  — MagnitudeFlow (relay-stack confidence)
+        self['observer']  — ConstellationObserver (association + curation)
+        self['task_head'] — ClassificationHead (optional)
 
-    The forward implements the canonical pipeline using registered stages.
-    Swap any stage by re-registering with add_*. Add observation tiers
-    by registering additional association/curation pairs.
+    forward() defines the canonical pipeline.
 
     Args:
         dim: embedding dimension on S^(dim-1)
         n_anchors: constellation anchors
         n_comp: patchwork compartments
         d_comp: per-compartment hidden dim
-        num_classes: classification targets (0 = no distinction stage)
+        num_classes: classification targets (0 = observer only)
         anchor_drop: training anchor dropout
         activation: activation function name
         cv_target: CV loss target
@@ -132,37 +108,33 @@ class ConstellationEncoder(GeoLIP):
         mag_min=0.1,
         mag_max=5.0,
     ):
-        super().__init__(dim)
+        super().__init__('constellation_encoder', dim, strict=False)
         self.cv_target = cv_target
         self.infonce_temp = infonce_temp
         self.assign_temp = assign_temp
         self.config = {k: v for k, v in locals().items()
                        if k != 'self' and not k.startswith('_')}
 
-        # ── Register stages through the paradigm ──
-
-        self.add_mutation('magnitude', MagnitudeFlow(
+        # Attach stages as named components
+        self.attach('mag_flow', MagnitudeFlow(
             dim=dim, n_anchors=n_anchors,
             hidden_dim=mag_hidden, n_heads=mag_heads, n_layers=mag_layers,
             mag_min=mag_min, mag_max=mag_max, n_comp=n_comp,
         ))
 
-        self.add_association('constellation', ConstellationAssociation(
+        self.attach('observer', ConstellationObserver(
             dim=dim, n_anchors=n_anchors,
+            n_comp=n_comp, d_comp=d_comp,
             anchor_drop=anchor_drop, assign_temp=assign_temp,
-        ))
-
-        self.add_curation('constellation', ConstellationCuration(
-            n_anchors=n_anchors, dim=dim,
-            n_comp=n_comp, d_comp=d_comp, activation=activation,
+            activation=activation,
         ))
 
         if num_classes > 0:
-            curation = self.curations['constellation']
-            self.add_distinction('classify', ClassificationHead(
-                feature_dim=curation.feature_dim,
+            obs = self['observer']
+            self.attach('task_head', ClassificationHead(
+                feature_dim=obs.feature_dim,
                 num_classes=num_classes,
-                hidden_dim=curation.patchwork.output_dim,
+                hidden_dim=obs.patchwork.output_dim,
                 activation=activation,
             ))
 
@@ -170,138 +142,69 @@ class ConstellationEncoder(GeoLIP):
         self.register_buffer('anchor_classes',
                              torch.zeros(n_anchors, dtype=torch.long))
         self.register_buffer('class_centroids',
-                             torch.zeros(num_classes if num_classes > 0 else 1, dim))
+                             torch.zeros(max(num_classes, 1), dim))
 
-    # ── Stage accessors ──
+    # ── Accessors ──
 
     @property
     def constellation(self):
-        """The anchor primitive."""
-        return self.associations['constellation'].constellation
+        return self['observer'].constellation
 
     @property
     def patchwork(self):
-        return self.curations['constellation'].patchwork
+        return self['observer'].patchwork
 
     @property
     def mag_flow(self):
-        return self.mutations['magnitude']
+        return self['mag_flow']
 
-    # ── Magnitude context ──
+    # ── Magnitude ──
 
     def _compute_magnitude(self, emb, raw_magnitude):
-        """Use the magnitude mutation to produce per-anchor confidence."""
-        mag_flow = self.mutations['magnitude']
+        mag_flow = self['mag_flow']
         anchors_n = F.normalize(self.constellation.anchors, dim=-1)
         tri = emb @ anchors_n.T
         return mag_flow(emb, tri, raw_magnitude)
 
-    # ── Observation pipeline ──
-
-    def _observe(self, emb, mag=None):
-        """Single observation tier: associate → curate."""
-        assoc = self.associations['constellation']
-        curate = self.curations['constellation']
-
-        a_out = assoc(emb, mag=mag)
-        c_out = curate.curate_full(a_out, emb=emb)
-
-        return {
-            'embedding': emb,
-            'features': c_out['features'],
-            'triangulation': a_out['distances'],
-            'cos_to_anchors': a_out['cos_to_anchors'],
-            'nearest': a_out['nearest'],
-            'assignment': a_out['assignment'],
-            'patchwork': c_out['patchwork'],
-            'bridge': c_out['bridge'],
-        }
-
-    def _observe_paired(self, emb1, emb2, mag1=None, mag2=None):
-        """Paired observation: two views through the same stages."""
-        assoc = self.associations['constellation']
-        curate = self.curations['constellation']
-
-        a1 = assoc(emb1, mag=mag1)
-        a2 = assoc(emb2, mag=mag2)
-        c1 = curate.curate_full(a1, emb=emb1)
-        c2 = curate.curate_full(a2, emb=emb2)
-
-        return {
-            'embedding': emb1, 'embedding_aug': emb2,
-            'mag1': mag1, 'mag2': mag2,
-            'features1': c1['features'], 'features2': c2['features'],
-            'cos1': a1['cos_to_anchors'], 'cos2': a2['cos_to_anchors'],
-            'tri1': a1['distances'], 'tri2': a2['distances'],
-            'nearest': a1['nearest'],
-            'assign1': a1['assignment'], 'assign2': a2['assignment'],
-            'patchwork1': c1['patchwork'], 'patchwork1_aug': c2['patchwork'],
-            'bridge1': c1['bridge'], 'bridge2': c2['bridge'],
-        }
-
-    # ── Forward: the canonical pipeline ──
+    # ── Forward: the pipeline ──
 
     def forward(self, emb, raw_magnitude=None):
-        """Single view: emb on S^(d-1) → observation → distinction.
-
-        Args:
-            emb: (B, dim) L2-normalized
-            raw_magnitude: (B, 1) pre-norm magnitude. None → 1.0.
-        """
+        """Single view: emb on S^(d-1) → observation → distinction."""
         if raw_magnitude is None:
             raw_magnitude = torch.ones(emb.shape[0], 1, device=emb.device, dtype=emb.dtype)
 
-        # Mutation: magnitude context
         mag, mag_comp = self._compute_magnitude(emb, raw_magnitude)
-
-        # Association → Curation
-        out = self._observe(emb, mag=mag)
+        out = self['observer'].observe(emb, mag=mag)
         out['mag_comp'] = mag_comp
 
-        # Distinction (if registered)
-        if 'classify' in self.distinctions:
-            out['logits'] = self.distinctions['classify'](out['features'])
+        if self.has('task_head'):
+            out['logits'] = self['task_head'](out['features'])
 
         return out
 
     def forward_paired(self, emb1, emb2, raw_mag1=None, raw_mag2=None):
-        """Two views: paired observation → distinction on both.
-
-        Args:
-            emb1, emb2: (B, dim) L2-normalized
-            raw_mag1, raw_mag2: (B, 1) pre-norm magnitudes
-        """
+        """Two views: paired observation → distinction."""
         ones = lambda e: torch.ones(e.shape[0], 1, device=e.device, dtype=e.dtype)
         if raw_mag1 is None: raw_mag1 = ones(emb1)
         if raw_mag2 is None: raw_mag2 = ones(emb2)
 
-        # Mutation: magnitude context for both views
         mag1, mc1 = self._compute_magnitude(emb1, raw_mag1)
         mag2, mc2 = self._compute_magnitude(emb2, raw_mag2)
 
-        # Paired association → curation
-        out = self._observe_paired(emb1, emb2, mag1=mag1, mag2=mag2)
+        out = self['observer'].observe_paired(emb1, emb2, mag1=mag1, mag2=mag2)
         out['mag_comp1'] = mc1
         out['mag_comp2'] = mc2
 
-        # Distinction on both views
-        if 'classify' in self.distinctions:
-            classify = self.distinctions['classify']
-            out['logits'] = classify(out['features1'])
-            out['logits_aug'] = classify(out['features2'])
+        if self.has('task_head'):
+            out['logits'] = self['task_head'](out['features1'])
+            out['logits_aug'] = self['task_head'](out['features2'])
 
         return out
 
-    # ── Loss: observer + optional task ──
+    # ── Loss ──
 
     def compute_loss(self, output, targets, w_ce=1.0, **loss_kwargs):
-        """Observer self-organization + classification.
-
-        Observer loss owns geometric + internal domains.
-        CE is applied here only if a distinction stage is registered.
-
-        Returns: (total_loss, loss_dict)
-        """
+        """Observer self-organization + optional classification."""
         obs_loss, ld = observer_loss(
             output,
             anchors=self.constellation.anchors,
@@ -312,7 +215,7 @@ class ConstellationEncoder(GeoLIP):
             **loss_kwargs,
         )
 
-        if 'classify' in self.distinctions and 'logits' in output:
+        if self.has('task_head') and 'logits' in output:
             l_ce, acc = ce_loss_paired(output['logits'], output['logits_aug'], targets)
             ld['ce'] = l_ce
             ld['acc'] = acc
@@ -325,21 +228,17 @@ class ConstellationEncoder(GeoLIP):
         ld['total'] = loss
         return loss, ld
 
-    # ── Anchor parameter management ──
+    # ── Anchor management ──
 
     def get_anchor_param_ids(self):
         """Param ids that must have weight_decay=0."""
         ids = set(id(p) for p in self.constellation.parameters())
-        for relay in self.mag_flow.relays:
+        for relay in self['mag_flow'].relays:
             ids.add(id(relay.anchors))
         return ids
 
     def make_optimizer(self, lr=3e-4, weight_decay=0.05, extra_params=None):
-        """AdamW with anchor exclusion from weight decay.
-
-        Args:
-            extra_params: additional params (e.g. from an Input stage)
-        """
+        """AdamW with anchor exclusion from weight decay."""
         anchor_ids = self.get_anchor_param_ids()
         all_params = list(self.parameters())
         if extra_params is not None:
@@ -352,16 +251,10 @@ class ConstellationEncoder(GeoLIP):
         ], lr=lr)
 
     def summary(self):
-        print("ConstellationEncoder Summary")
+        print(f"ConstellationEncoder '{self.name}'")
         print("=" * 50)
-        for cat_name, container in [
-            ('mutations', self.mutations),
-            ('associations', self.associations),
-            ('curations', self.curations),
-            ('distinctions', self.distinctions),
-        ]:
-            for name, stage in container.items():
-                param_count(stage, f"{cat_name}.{name}")
+        for name in self.components:
+            param_count(self[name], name)
         print("-" * 50)
         return model_summary(self)
 
@@ -373,15 +266,11 @@ class ConstellationEncoder(GeoLIP):
 class GeoLIPEncoder(nn.Module):
     """Any Input stage + ConstellationEncoder.
 
-    Composes an Input (pixels/wavelets/tokens → S^(d-1)) with
-    a ConstellationEncoder (observation pipeline → output).
-
-    The Input stage is registered on the ConstellationEncoder's
-    inputs dict, making it accessible through the paradigm.
+    Attaches the Input on the ConstellationEncoder so all parameters
+    are reachable through a single module tree.
 
     Args:
-        input_stage: nn.Module implementing Input interface
-            (must have .dim property, forward() → (emb, magnitude))
+        input_stage: Input implementation (ConvEncoder, etc.)
         **kwargs: forwarded to ConstellationEncoder
     """
 
@@ -389,12 +278,12 @@ class GeoLIPEncoder(nn.Module):
         super().__init__()
         dim = kwargs.pop('dim', input_stage.dim)
         self.enc = ConstellationEncoder(dim=dim, **kwargs)
-        self.enc.add_input('primary', input_stage)
+        self.enc.attach('input', input_stage)
         self._init_input_weights()
 
     @property
     def input_stage(self):
-        return self.enc.inputs['primary']
+        return self.enc['input']
 
     @property
     def config(self):
@@ -424,11 +313,16 @@ class GeoLIPEncoder(nn.Module):
         return self.enc.compute_loss(output, targets, **kwargs)
 
     def make_optimizer(self, lr=3e-4, weight_decay=0.05):
-        return self.enc.make_optimizer(lr=lr, weight_decay=weight_decay)
+        return self.enc.make_optimizer(
+            lr=lr, weight_decay=weight_decay,
+            extra_params=list(self.input_stage.parameters()),
+        )
 
     def summary(self):
-        print("GeoLIPEncoder Summary")
+        print("GeoLIPEncoder")
         print("=" * 50)
-        param_count(self.input_stage, "input_stage")
+        param_count(self.input_stage, "input")
         self.enc.summary()
-        print(f"  Grand total: {sum(p.numel() for p in self.parameters()):,}")
+        total = sum(p.numel() for p in self.parameters())
+        print(f"  Grand total: {total:,}")
+        return total

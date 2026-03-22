@@ -39,8 +39,8 @@ class ConvEncoder(Input):
         output_dim: embedding dimension (default 256)
     """
 
-    def __init__(self, output_dim=256):
-        super().__init__()
+    def __init__(self, output_dim=256, **kwargs):
+        super().__init__(**kwargs)
         self._dim = output_dim
         self.features = nn.Sequential(
             nn.Conv2d(3, 64, 3, padding=1), nn.BatchNorm2d(64), nn.GELU(),

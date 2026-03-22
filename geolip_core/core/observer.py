@@ -1,190 +1,153 @@
 """
-GeoLIP Observer Framework — the six-stage observation paradigm.
+GeoLIP Observer — Six-Stage Geometric Observation Paradigm
+=============================================================
+Built on geofractal's router infrastructure.
 
-Input       → raw signal → embedding on S^(d-1)
-Mutation    → transform position on the manifold
-Association → measure relationships to reference frame
-Curation    → select what matters from associations
-Distinction → task-specific output from curated features
-Loss        → standalone recipes (in losses.py, not here)
-
-GeoLIP is the composition loop. It chains stages, runs them,
-and presents the result. The stages are independently swappable.
+Stages:
+    Input       → raw signal → embedding on S^(d-1)
+    Mutation    → transform position on the manifold
+    Association → measure relationships to reference frame
+    Curation    → select what matters from associations
+    Distinction → task-specific output from curated features
+    Loss        → standalone recipes (in losses.py, not here)
 
 The canonical pipeline:
-  Input → Association → Mutation → Curation → Association → Curation → Distinction
+    Input → Association → Mutation → Curation → Association → Curation → Distinction
 
-But GeoLIP doesn't enforce order. You register stages, you define the
-pipeline in your forward method. GeoLIP holds them and exposes them.
+GeoLIP is the composition — a BaseTower that holds stages as named
+components and defines the observation flow in forward(). The paradigm
+is recursive: Association → Curation can repeat at multiple tiers.
+
+Each stage is a TorchComponent — it has identity, lifecycle hooks,
+device affinity, and works as a standalone nn.Module. GeoLIP
+composition is optional. Use stages directly if you prefer.
 
 Usage:
-    from geolip_core.core.observer import Input, Mutation, Association, Curation, Distinction, GeoLIP
+    from geolip_core.core.observer import Input, Association, Curation, GeoLIP
+
+    # Stages work standalone
+    assoc = MyAssociation('assoc', dim=384)
+    out = assoc(emb)
+
+    # Or compose into a GeoLIP tower
+    lip = GeoLIP('observer', dim=384)
+    lip.attach('assoc', assoc)
+    lip.attach('curate', MyCuration('curate', dim=384))
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from geofractal.router.base_tower import BaseTower
+from geofractal.router.components.torch_component import TorchComponent
+
 
 # ══════════════════════════════════════════════════════════════════
 # STAGE INTERFACES
 # ══════════════════════════════════════════════════════════════════
 
-class Input(nn.Module):
+class Input(TorchComponent):
     """Raw signal → embedding on S^(d-1).
-
-    Consumes whatever the raw input is (pixels, tokens, scattering
-    coefficients, frequency bands) and produces an L2-normalized
-    embedding. The output lives on the manifold. Everything downstream
-    assumes this.
 
     Subclass must implement:
         encode(x) → (B, dim) unnormalized features
-        dim: output embedding dimension
+        dim (property) → int
+
+    forward() auto-handles L2 normalization and magnitude extraction.
     """
+
+    def __init__(self, name=None, **kwargs):
+        super().__init__(name or self.__class__.__name__, **kwargs)
 
     @property
     def dim(self):
-        """Output embedding dimension."""
         raise NotImplementedError
 
     def encode(self, x):
-        """Raw input → unnormalized features. Subclass implements this.
-
-        Returns:
-            (B, dim) features — NOT yet L2-normalized
-        """
+        """Raw input → unnormalized features. Subclass implements this."""
         raise NotImplementedError
 
     def forward(self, x):
-        """Raw input → L2-normalized embedding on S^(d-1).
-
-        Also returns raw magnitude before normalization, since
-        MagnitudeFlow and other transforms may need it.
-
-        Returns:
-            emb: (B, dim) on S^(d-1)
-            magnitude: (B, 1) pre-normalization norm
-        """
+        """Raw input → (emb on S^(d-1), raw magnitude)."""
         feat = self.encode(x)
         magnitude = feat.norm(dim=-1, keepdim=True)
         emb = F.normalize(feat, dim=-1)
         return emb, magnitude
 
 
-class Mutation(nn.Module):
+class Mutation(TorchComponent):
     """Transform position on the manifold. S^(d-1) → S^(d-1).
 
-    Receives an embedding that's already on the sphere and moves it.
-    Flow, relay, projection, correction — anything that changes WHERE
-    the embedding sits without changing what it represents.
-
     Subclass must implement:
-        mutate(emb, **context) → (B, dim) on S^(d-1)
+        mutate(emb, **context) → (B, D) on S^(d-1)
     """
 
+    def __init__(self, name=None, **kwargs):
+        super().__init__(name or self.__class__.__name__, **kwargs)
+
     def mutate(self, emb, **context):
-        """Move embedding on the manifold.
-
-        Args:
-            emb: (B, D) on S^(d-1)
-            **context: additional info (triangulation, magnitude, etc.)
-
-        Returns:
-            (B, D) on S^(d-1)
-        """
         raise NotImplementedError
 
     def forward(self, emb, **context):
         return self.mutate(emb, **context)
 
 
-class Association(nn.Module):
+class Association(TorchComponent):
     """Measure relationships to a reference frame.
 
-    Takes an embedding on S^(d-1) and produces a distance profile,
-    soft assignment, or any relational measurement against a structure
-    (anchors, prototypes, centroids, frequency bands, etc.).
-
-    This is the act of observing — converting position into relationship.
-
     Subclass must implement:
-        associate(emb, **context) → dict with at minimum 'distances' key
-        frame_dim: dimension of the association output (number of reference points)
+        associate(emb, **context) → dict (must contain 'distances')
+        frame_dim (property) → int
     """
+
+    def __init__(self, name=None, **kwargs):
+        super().__init__(name or self.__class__.__name__, **kwargs)
 
     @property
     def frame_dim(self):
-        """Number of reference points in the frame."""
         raise NotImplementedError
 
     def associate(self, emb, **context):
-        """Measure relationships between embedding and reference frame.
-
-        Args:
-            emb: (B, D) on S^(d-1)
-
-        Returns:
-            dict with association outputs. Must contain 'distances'.
-        """
         raise NotImplementedError
 
     def forward(self, emb, **context):
         return self.associate(emb, **context)
 
 
-class Curation(nn.Module):
-    """Select what matters from associations.
-
-    Takes the raw association output (distances, assignments) and
-    produces an interpreted feature vector. Patchwork is one curation.
-    Gram matrices, SVD signatures, channel selection — all curations.
+class Curation(TorchComponent):
+    """Interpret associations into features.
 
     Subclass must implement:
-        curate(association_output, **context) → (B, feature_dim) features
-        feature_dim: output dimension
+        curate(association_output, **context) → (B, feature_dim)
+        feature_dim (property) → int
     """
+
+    def __init__(self, name=None, **kwargs):
+        super().__init__(name or self.__class__.__name__, **kwargs)
 
     @property
     def feature_dim(self):
-        """Output feature dimension."""
         raise NotImplementedError
 
     def curate(self, association_output, **context):
-        """Interpret association output into features.
-
-        Args:
-            association_output: dict from Association.associate()
-
-        Returns:
-            (B, feature_dim) curated features
-        """
         raise NotImplementedError
 
     def forward(self, association_output, **context):
         return self.curate(association_output, **context)
 
 
-class Distinction(nn.Module):
+class Distinction(TorchComponent):
     """Task-specific output from curated features.
-
-    Classification head, generation head, retrieval projection —
-    whatever the task needs. This is the only stage that knows
-    about the downstream task.
 
     Subclass must implement:
         distinguish(features, **context) → task output
     """
 
+    def __init__(self, name=None, **kwargs):
+        super().__init__(name or self.__class__.__name__, **kwargs)
+
     def distinguish(self, features, **context):
-        """Produce task-specific output.
-
-        Args:
-            features: (B, feature_dim) from curation
-
-        Returns:
-            task output (logits, embeddings, etc.)
-        """
         raise NotImplementedError
 
     def forward(self, features, **context):
@@ -192,82 +155,49 @@ class Distinction(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════
-# GEOLIP — the composition loop
+# GEOLIP — observation tower
 # ══════════════════════════════════════════════════════════════════
 
-class GeoLIP(nn.Module):
-    """The observation loop. Binds stages, holds them, presents them.
+class GeoLIP(BaseTower):
+    """Geometric observation tower.
 
-    GeoLIP doesn't enforce pipeline order. It's a container that holds
-    named stages of any type and makes them accessible. Your forward
-    method defines the actual pipeline.
+    A BaseTower configured for the observation paradigm. Stages are
+    attached as named components. Forward defines the pipeline.
 
-    For simple cases, use register methods to add stages and access
-    them by name. For complex multi-tier pipelines, subclass GeoLIP
-    and define your own forward.
+    GeoLIP doesn't enforce a specific pipeline. Attach your stages,
+    define forward(). The six-stage paradigm guides structure — it's
+    the blueprint, not the constraint.
 
-    GeoLIP can also be ignored entirely. Use stages directly.
+    Access patterns (inherited from BaseTower):
+        lip['association']  → named component
+        lip[0]              → stage by index (if using stages)
+        lip.has('curation') → check existence
+        for stage in lip:   → iterate stages
+
+    Storage (inherited from BaseRouter):
+        lip.attach('name', module)   → nn.Module component
+        lip.attach('config', dict)   → non-module object
+        lip.cache_set('key', tensor) → ephemeral tensor
 
     Args:
+        name: tower name
         dim: embedding dimension on S^(dim-1)
     """
 
-    def __init__(self, dim):
-        super().__init__()
+    def __init__(self, name, dim, **kwargs):
+        super().__init__(name, **kwargs)
         self.dim = dim
 
-        # Stage containers — ModuleDict for proper parameter registration
-        self.inputs = nn.ModuleDict()
-        self.mutations = nn.ModuleDict()
-        self.associations = nn.ModuleDict()
-        self.curations = nn.ModuleDict()
-        self.distinctions = nn.ModuleDict()
+    def forward(self, *args, **kwargs):
+        """Subclass defines the observation pipeline.
 
-    def add_input(self, name, stage):
-        """Register an Input stage."""
-        self.inputs[name] = stage
-        return self
-
-    def add_mutation(self, name, stage):
-        """Register a Mutation stage."""
-        self.mutations[name] = stage
-        return self
-
-    def add_association(self, name, stage):
-        """Register an Association stage."""
-        self.associations[name] = stage
-        return self
-
-    def add_curation(self, name, stage):
-        """Register a Curation stage."""
-        self.curations[name] = stage
-        return self
-
-    def add_distinction(self, name, stage):
-        """Register a Distinction stage."""
-        self.distinctions[name] = stage
-        return self
-
-    @property
-    def feature_dim(self):
-        """Sum of all curation feature dimensions."""
-        return sum(c.feature_dim for c in self.curations.values())
-
-    def get_stage(self, category, name):
-        """Retrieve a stage by category and name.
-
-        Args:
-            category: 'input', 'mutation', 'association', 'curation', 'distinction'
-            name: stage name
-
-        Returns:
-            the stage module
+        Typical pattern:
+            emb → self['association'](emb)
+                → self['mutation'](emb, ...)
+                → self['curation'](assoc_out, ...)
+                → self['distinction'](features)
         """
-        containers = {
-            'input': self.inputs,
-            'mutation': self.mutations,
-            'association': self.associations,
-            'curation': self.curations,
-            'distinction': self.distinctions,
-        }
-        return containers[category][name]
+        raise NotImplementedError(
+            "GeoLIP.forward() must be defined by the subclass or composition. "
+            "Attach stages with self.attach() and define the pipeline in forward()."
+        )
