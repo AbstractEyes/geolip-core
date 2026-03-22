@@ -227,12 +227,68 @@ geofractal (git+https://github.com/AbstractEyes/geofractal.git)
 
 ## Ecosystem
 
-- [geofractal](https://github.com/AbstractEyes/geofractal) — Router infrastructure (BaseTower, WideRouter, TorchComponent)
-- [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) — Full GeoLIP package (PyPI: `geolip`)
-- [geolip-constellation-core](https://huggingface.co/AbstractPhil/geolip-constellation-core) — HuggingFace model + documentation
-- [geolip-bertenstein](https://huggingface.co/AbstractPhil/geolip-bertenstein) — Multi-expert geometric fusion
-- [procrustes-analysis](https://huggingface.co/AbstractPhil/procrustes-analysis) — Cross-model alignment study
+### Infrastructure
+
+| Repository | Description |
+|---|---|
+| [geofractal](https://github.com/AbstractEyes/geofractal) | Router infrastructure — BaseTower, WideRouter, TorchComponent. The foundation this repo builds on. |
+| [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) | Full GeoLIP package (PyPI: `geolip`). The parent ecosystem repo. |
+
+### Constellation Models & Experiments
+
+| Repository | Description |
+|---|---|
+| [geolip-constellation-core](https://huggingface.co/AbstractPhil/geolip-constellation-core) | HuggingFace model hub — constellation architecture documentation and pretrained checkpoints |
+| [geolip-captionbert-8192](https://huggingface.co/AbstractPhil/geolip-captionbert-8192) | CaptionBERT — geometric caption encoder with Procrustes consensus distillation, 8192 anchors. Feature extraction pipeline with pentachoron structure. |
+| [geolip-bertenstein](https://huggingface.co/AbstractPhil/geolip-bertenstein) | Multi-expert geometric fusion transformer — BERT-large hub with frozen expert encoders (DINOv2, Whisper, ESM-2, CodeBERT) |
+
+### CV & Geometric Analysis
+
+| Repository | Description |
+|---|---|
+| [geolip-cv-experiments](https://huggingface.co/AbstractPhil/geolip-cv-experiments) | CV loss sweep — batched 141x speedup validation, weight/target/dimension sweeps |
+| [geolip-cv-noise-analysis](https://huggingface.co/AbstractPhil/geolip-cv-noise-analysis) | Constellation relay preservation analysis — established attention weakness (cycle 1 to cycle N), validated relay geometric fidelity |
+| [geolip-hypersphere-experiments](https://huggingface.co/AbstractPhil/geolip-hypersphere-experiments) | Spectral encoder test manifest — wavelet scattering (Mallat), Gabor filter banks, Radon/curvelet transforms as inputs to the constellation pipeline. Origin of the avg-pool spatial collapse finding. |
+| [geolip-constellation-activations](https://huggingface.co/AbstractPhil/geolip-constellation-activations) | Cross-token relay sequence prototyping and routing optimization — benchmarking constellation relay across token interactions |
+
+### Vision Architectures
+
+| Repository | Description |
+|---|---|
+| [geolip-vit-dual-stream](https://huggingface.co/AbstractPhil/geolip-vit-dual-stream) | Dual-stream ViT — 11+ run research log. Dual InfoNCE, shared attention, mastery queue, BCE stream. Established that with cross-attention enabled, the geometric structure alone classifies the entire thing. |
+| [geolip-vit-tri-stream](https://huggingface.co/AbstractPhil/geolip-vit-tri-stream) | Tri-stream ViT — evolution of dual-stream. Three processing paths: Stream A (CE), Stream B (BCE+NCE), GAL (geometric arbitration layer with KSimplex features + Procrustes anchor rotation). |
+| [geolip-vit-zana](https://huggingface.co/AbstractPhil/geolip-vit-zana) | Zana ViT — PentaViT refactored into the GeoLIP paradigm. Custom automodel functional. Geometric constellation structure intact as standalone prototype, evolved from penta-vit-experiments. |
+| [geolip-vit-x34](https://huggingface.co/AbstractPhil/geolip-vit-x34) | x34 ViT — 34-model soup with Procrustes alignment to constellation patchwork. Early attempt at multi-model geometric alignment, identified that Procrustes data was too premature for direct ViT training. |
+
+### CLIP Geometric Distillation
+
+| Repository | Description |
+|---|---|
+| [geolip-clip-vit-bigG-patch14-ctx576-seq77](https://huggingface.co/AbstractPhil/geolip-clip-vit-bigG-patch14-ctx576-seq77) | Memory-augmented CLIP ViT-bigG distillation — ModernBERT + Procrustes + pentachoron structure, 576 context / 77 sequence, for long-context text encoding targeting SDXL |
+| [geolip-clip-vit-large-patch14-ctx576-seq77](https://huggingface.co/AbstractPhil/geolip-clip-vit-large-patch14-ctx576-seq77) | Memory-augmented CLIP ViT-L/14 distillation — 576 context / 77 sequence variant |
+| [geolip-clip-vit-large-patch14-ctx576](https://huggingface.co/AbstractPhil/geolip-clip-vit-large-patch14-ctx576) | Memory-augmented CLIP ViT-L/14 distillation — 576 context variant |
+
+### Diffusion & Generation
+
+| Repository | Description |
+|---|---|
+| [geolip-spherical-diffusion-proto](https://huggingface.co/AbstractPhil/geolip-spherical-diffusion-proto) | Spherical flow-matching diffusion — geometric loss on S^(d-1), constellation-anchored generation on CIFAR-10 |
+| [geolip-diffusion-proto](https://huggingface.co/AbstractPhil/geolip-diffusion-proto) | Flow-match relay diffusion — constellation relay integrated into diffusion pipeline. Geometric structure contributes ~6-7% to output. Automodel available. |
+
+### Cross-Model Analysis
+
+| Repository | Description |
+|---|---|
+| [procrustes-analysis](https://huggingface.co/AbstractPhil/procrustes-analysis) | Procrustes alignment study — 17 models profiled (T5 family, BERT, CLIP, DINOv2, UNets, VAEs). Cross-modal QK eigenvalue lock at 0.500, VAE weights 70-76% alignable. |
+| [geolip-procrustes](https://huggingface.co/AbstractPhil/geolip-procrustes) | GeoLIP-specific Procrustes data and alignment experiments (part of GEOLIP Research Concepts collection) |
+
+### Evolutionary & Experimental
+
+| Repository | Description |
+|---|---|
+| [geolip-genetic-inheritance](https://huggingface.co/AbstractPhil/geolip-genetic-inheritance) | Genetic inheritance experiment — anchor vectors heritable across generations, CV converges from ~1.7 (Gen 0) to ~0.33 (Gen 4), genetic diversity beats pure fitness selection |
+| [geometric-experiment-history](https://huggingface.co/AbstractPhil/geometric-experiment-history) | **The complete project catalog** — 33 projects across 9 research areas: pentachoron mathematics, geometric vocabulary, classification architectures, language models, diffusion, feature extraction, consciousness research, scaling architecture, infrastructure |
 
 ---
 
-*Research by [AbstractPhil](https://huggingface.co/AbstractPhil).*
+*Research by [AbstractPhil](https://huggingface.co/AbstractPhil). Complete experiment history and project catalog at [geometric-experiment-history](https://huggingface.co/AbstractPhil/geometric-experiment-history).*
