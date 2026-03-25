@@ -1,6 +1,10 @@
 # geolip-core
 
-Geometric observer framework for deep learning. Built on [geofractal](https://github.com/AbstractEyes/geofractal)'s router infrastructure.
+A geometric support system for deep learning models.
+
+Models train blind. They receive a loss signal that says "you were wrong" and a gradient that says "go this direction." They have no structural self-awareness — they can't see that their representations are collapsing, that their features are redundant, or that half their capacity is dead.
+
+This package gives them that. Not by adding losses that punish problems after they happen, but by architecturally making those problems observable, measurable, and correctable in real time.
 
 Part of the [GeoLIP](https://github.com/AbstractEyes/glip-autoencoder) ecosystem.
 
@@ -10,285 +14,177 @@ Part of the [GeoLIP](https://github.com/AbstractEyes/glip-autoencoder) ecosystem
 pip install "git+https://github.com/AbstractEyes/geolip-core.git"
 ```
 
-## The Six-Stage Paradigm
+Triton is optional — fused SVD kernels activate automatically if installed. Everything falls back to PyTorch without it.
 
-Every GeoLIP pipeline decomposes into six stages:
+## What This Does
 
-| Stage | What it does | Interface |
-|---|---|---|
-| **Input** | Raw signal → embedding on S^(d-1) | `encode(x) → features` |
-| **Mutation** | Transform position on the manifold | `mutate(emb) → emb` |
-| **Association** | Measure relationships to reference frame | `associate(emb) → dict` |
-| **Curation** | Select what matters from associations | `curate(assoc) → features` |
-| **Distinction** | Task-specific output | `distinguish(features) → output` |
-| **Loss** | Standalone recipes | functions in `losses.py` |
+The geometric substrate attaches to any backbone (conv, transformer, hybrid) and provides:
 
-The canonical pipeline is recursive:
+- **Structural observation** — SVD decomposition of feature maps reveals energy distribution, rotation patterns, and novelty. Detached from the backward pass, zero interference with training.
+- **Geometric association** — Constellation anchors on S^(d-1) triangulate embeddings against a stable reference frame. The anchors define the coordinate system.
+- **Quality-aware curation** — Cayley-Menger validity gates measure whether each anchor forms a well-conditioned simplex with the input. Simplex volume IS the attention score. Invalid geometry gets suppressed before it reaches the interpreter.
+- **Targeted modulation** — Patchwork compartments interpret curated associations. Channel modulation adjusts backbone features based on geometric health. Local intervention, not global perturbation.
 
-```
-Input → Association → Mutation → Curation → Association → Curation → Distinction
-```
+Empirically validated: +3 accuracy points on CIFAR-100 across both convolutional and transformer backbones, from 150K additional parameters.
 
-Each stage is a `TorchComponent` with identity (name, uuid), lifecycle hooks, and device affinity — inherited from geofractal's component system. Stages work standalone as regular `nn.Module`s or composed into a `GeoLIP` tower.
-
-`GeoLIP` is a `BaseTower`. Stages are attached as named components via `attach()` and accessed through `self['name']`. Forward defines the observation pipeline. The paradigm guides structure — it doesn't force ceremony.
-
-## Constellation Implementations
-
-The constellation is one concrete set of stage implementations:
-
-| Class | Stage | Description |
-|---|---|---|
-| `ConvEncoder` | Input | 8-layer conv → S^(d-1) |
-| `ConstellationRelay` | Mutation | Per-token triangulation + gated residual, O(S) |
-| `FlowAttention` | Mutation | ODE flow in tangent space (historical) |
-| `MagnitudeFlow` | Mutation | Relay-stack per-compartment magnitude prediction |
-| `ConstellationAssociation` | Association | Triangulate against learned anchors |
-| `Patchwork` | Curation | Round-robin compartmentalized interpretation |
-| `ConstellationCuration` | Curation | Patchwork + bridge over association output |
-| `ClassificationHead` | Distinction | MLP classification head |
-| `observer_loss` | Loss | Standalone geometric + internal self-organization recipe |
-
-`ConstellationObserver` composes `ConstellationAssociation` + `ConstellationCuration` with `observe()` and `observe_paired()`.
-
-`ConstellationEncoder` is a `GeoLIP` tower with constellation stages pre-attached — the full-stack geometric pipeline, modality-agnostic.
-
-## Quick Start
-
-### Individual stages
-
-```python
-from geolip_core.core import ConstellationAssociation, ConstellationCuration
-import torch, torch.nn.functional as F
-
-assoc = ConstellationAssociation(dim=128, n_anchors=64)
-curate = ConstellationCuration(n_anchors=64, dim=128)
-
-emb = F.normalize(torch.randn(32, 128), dim=-1)
-a_out = assoc(emb)                         # Association → distances, assignment, etc.
-features = curate(a_out, emb=emb)          # Curation → (32, feature_dim)
-```
-
-### Composed observer
-
-```python
-from geolip_core.core import ConstellationObserver, observer_loss
-
-obs = ConstellationObserver(dim=128, n_anchors=64)
-out = obs.observe_paired(emb1, emb2)
-
-# Standalone loss recipe (no CE, pure geometric self-organization)
-loss, ld = observer_loss(out, obs.constellation.anchors, targets=labels)
-```
-
-### Full classification pipeline (new paradigm)
-
-```python
-from geolip_core.encoder import ConstellationEncoder, GeoLIPEncoder, ConvEncoder
-
-# ConstellationEncoder — modality-agnostic, accepts any embedding on S^(d-1)
-enc = ConstellationEncoder(dim=384, n_anchors=512, num_classes=100)
-out = enc.forward_paired(emb1, emb2, raw_mag1, raw_mag2)
-loss, ld = enc.compute_loss(out, targets)
-
-# GeoLIPEncoder — any Input stage + ConstellationEncoder composed
-model = GeoLIPEncoder(ConvEncoder(384), num_classes=100, n_anchors=512)
-out = model.forward_paired(view1, view2)
-loss, ld = model.compute_loss(out, targets)
-
-# Optimizer with proper anchor weight-decay exclusion
-optimizer = model.make_optimizer(lr=3e-4, weight_decay=0.05)
-```
-
-### Legacy pipeline (pre-paradigm, still works)
-
-```python
-from geolip_core.encoder import GeoLIPConvEncoder
-
-model = GeoLIPConvEncoder(num_classes=100, output_dim=384, n_anchors=512)
-out = model.forward_paired(view1, view2)
-loss, ld = model.compute_loss(out, targets)
-```
-
-## Building New Stages
-
-Implement the stage interfaces. Each stage is a `TorchComponent` — it has identity, lifecycle hooks, and works as a standalone `nn.Module`. Existing loss functions and downstream heads work with any implementation that follows the interface contracts.
-
-```python
-from geolip_core.core import Input, Association, Curation
-
-class MyEncoder(Input):
-    """Custom Input stage. encode() returns unnormalized features.
-    forward() (inherited) handles L2 normalization + magnitude extraction."""
-    def __init__(self, dim, **kwargs):
-        super().__init__(**kwargs)
-        self._dim = dim
-        self.net = ...  # your backbone
-
-    @property
-    def dim(self): return self._dim
-
-    def encode(self, x): return self.net(x)
-
-
-class MyAssociation(Association):
-    """Custom Association. Must return dict with 'distances' key."""
-    def __init__(self, frame_size, **kwargs):
-        super().__init__(**kwargs)
-        self._frame_dim = frame_size
-
-    @property
-    def frame_dim(self): return self._frame_dim
-
-    def associate(self, emb, **ctx):
-        return {'distances': my_distance_fn(emb), 'cos_to_anchors': ...}
-
-
-class MyCuration(Curation):
-    """Custom Curation. Interprets association output into features."""
-    def __init__(self, out_dim, **kwargs):
-        super().__init__(**kwargs)
-        self._feature_dim = out_dim
-        self.mlp = ...
-
-    @property
-    def feature_dim(self): return self._feature_dim
-
-    def curate(self, assoc_out, **ctx):
-        return self.mlp(assoc_out['distances'])
-```
-
-### Composing into a GeoLIP tower
-
-`GeoLIP` is a `BaseTower` from geofractal. Attach stages, define forward:
-
-```python
-from geolip_core.core import GeoLIP
-
-class MyObserver(GeoLIP):
-    def __init__(self, dim):
-        super().__init__('my_observer', dim, strict=False)
-        self.attach('assoc', MyAssociation(frame_size=64))
-        self.attach('curate', MyCuration(out_dim=128))
-
-    def forward(self, emb):
-        a_out = self['assoc'](emb)
-        features = self['curate'](a_out, emb=emb)
-        return features
-```
-
-Access patterns inherited from `BaseTower`:
-
-```python
-obs['assoc']           # Named component
-obs.has('curate')      # Check existence
-obs.cache_set(k, v)    # Ephemeral tensor storage
-obs.cache_clear()      # Clear after forward
-```
-
-## Architecture
+## Package Structure
 
 ```
 geolip_core/
-├── core/
-│   ├── observer.py              # Stage interfaces (TorchComponent) + GeoLIP (BaseTower)
-│   ├── constellation.py         # Constellation, ConstellationAssociation, ConstellationCuration, ConstellationObserver
-│   ├── patchwork.py             # Patchwork, MagnitudeFlow, AnchorPush
-│   ├── constellation_relay.py   # RelayLayer, ConstellationRelay
-│   ├── constellation_route.py   # FlowAttention (historical)
-│   ├── losses.py                # All losses + metrics (batched CV, NCE, bridge, etc.)
-│   ├── activation.py            # SquaredReLU, StarReLU, make_activation
-│   ├── memory.py                # EmbeddingBuffer
-│   └── core.py                  # GeometricAutograd, param_count, model_summary
-├── encoder/
-│   ├── encoder_constellation.py # ConstellationEncoder (GeoLIP tower), ClassificationHead, GeoLIPEncoder
-│   ├── encoder_conv.py          # ConvEncoder (Input stage), GeoLIPConvEncoder (legacy)
-│   ├── encoder_scatterpoint.py  # (future)
-│   ├── encoder_wavelet.py       # (future)
-│   ├── encoder_transformer.py   # (future)
-│   └── encoder_sha.py           # (future)
-└── distillation/                # (future: alignment, bank, expert)
+├── core/               Geometric behaviors (the five stages)
+│   ├── input/              Data-type ingestion and observation
+│   ├── associate/          Measure relationships to reference frame
+│   ├── curate/             Select what matters from associations
+│   ├── align/              How spaces relate to each other
+│   └── distinguish/        Task-specific output and training signal
+│
+├── pipeline/           Composed geometric substrates
+│   ├── observer.py         Stage interfaces (Input, Association, Curation, ...)
+│   ├── layer.py            ConstellationLayer — one depth of observation
+│   └── backbone.py         GeometricBackbone — multi-depth stack
+│
+├── example/            Working models built with the pipeline
+├── analysis/           Diagnostic tools
+└── utils/              Engineering infrastructure (Triton kernels, linalg)
 ```
 
-## Key Empirical Constants
+### The Five Stages
 
-- **CV pentachoron band**: 0.20–0.23 in trained models (natural basin ~0.24 on pure noise at d=128)
-- **Binding/separation boundary**: 0.29154 / 0.70846 radians
-- **Effective geometric dimension**: ~16 (S^15)
-- **Relay fidelity**: 99.4% cosine preservation through 16 stacked layers
-- **CV floor**: ~0.11 (hard geometric limit, cannot be pushed lower by any loss weight)
+Every component lives in the directory matching its primary purpose.
+
+| Stage | Directory | Purpose |
+|---|---|---|
+| **Input** | `core/input/` | Ingest and decompose external signals into geometric primitives |
+| **Associate** | `core/associate/` | Measure relationships to a reference frame |
+| **Curate** | `core/curate/` | Select what matters from those measurements |
+| **Align** | `core/align/` | Relate two geometric spaces to each other |
+| **Distinguish** | `core/distinguish/` | Task-specific output |
+
+A component may perform hundreds of internal steps. It is classified by what it exists to accomplish, not by what it computes along the way.
+
+### Design Principle: Architecture Before Loss
+
+The geometric substrate is structural, not supervisory. When a problem arises:
+
+1. First ask: can the architecture prevent this?
+2. If yes: structural fix — gate, projection, initialization, detach boundary.
+3. If no: then introduce a loss, minimal and targeted.
+
+The CM gate doesn't need a "simplex validity loss" to penalize degenerate anchors. It architecturally suppresses them. Subspace-preserving Procrustes doesn't need an "alignment loss." The rotation is mathematically exact by construction. Repulsion-initialized anchors don't need a spread loss if the gate prevents collapse.
+
+## Quick Start
+
+```python
+# Individual behaviors
+from geolip_core.core import Constellation, Patchwork, AnchorGate, SVDObserver
+
+# Composed pipeline
+from geolip_core.pipeline import ConstellationLayer, GeometricBackbone
+
+# Engineering utilities
+from geolip_core.utils import gram_eigh_svd, batched_procrustes
+```
+
+### Attach to a Backbone
+
+```python
+from geolip_core.pipeline import GeometricBackbone
+
+# Define depth specs: (channels, spatial_size) at each stage
+geo = GeometricBackbone(
+    stages=[(64, 32), (128, 16), (256, 8), (384, 4)],
+    n_anchors=32, svd_rank=24, gate_strategy='cm_gate',
+)
+
+# In your forward pass:
+features = [stage(h) for stage, h in zip(conv_stages, intermediates)]
+modulated, geo_state, observations = geo(features)
+# modulated features replace originals; geo_state feeds your classifier
+```
+
+### Use Individual Components
+
+```python
+from geolip_core.core import SVDObserver, AnchorGate, Patchwork
+
+# Observe structure
+svd = SVDObserver(in_channels=384, svd_rank=24)
+S, Vh, features, novelty = svd(conv_features)
+
+# Gate by geometric validity
+gate = AnchorGate(n_anchors=32, dim=256, strategy='cm_gate')
+gate_values, assignment, info = gate(embedding, anchors, triangulation)
+
+# Interpret curated associations
+pw = Patchwork(n_anchors=32, n_comp=8, d_comp=64)
+interpreted = pw(triangulation * gate_values)
+```
+
+### Align Two Spaces
+
+```python
+from geolip_core.core import ProcrustesAlignment
+
+aligner = ProcrustesAlignment(dim=384, rank=24)
+aligned, info = aligner(source_embeddings, target_embeddings)
+# info['method'] = 'subspace' for dim > 32, 'full' otherwise
+# 1.000 nearest-neighbor agreement with full Procrustes
+```
+
+## Key Components
+
+### SVD Kernel (`utils/kernel.py`)
+
+Fused Triton kernels for batched thin SVD. 5,000× faster than `torch.linalg.svd` for small N.
+
+| N | Time | vs torch |
+|---|---|---|
+| 2 | 0.021ms | 3,850× |
+| 3 | 0.022ms | 5,488× |
+| 8 | 0.290ms | 584× |
+| 32 | 0.781ms | 388× |
+
+Auto-dispatches: Triton for N≤3, Gram+eigh for N=4-32. AMP-safe (disables autocast around linalg). See the [engineering article](https://huggingface.co/blog/AbstractPhil/svd-triton-kernel-optimization) for the full specification.
+
+### CM Validity Gate (`core/curate/gate.py`)
+
+Cayley-Menger determinant as geometric attention. For each anchor, forms a simplex with the embedding and its neighbors. The simplex volume is the relevance score — fat simplex means the anchor provides genuine geometric information. Sliver simplex means it's redundant.
+
+Strategies: `round_robin` (baseline), `cm_gate` (soft sigmoid), `top_k` (hard selection), `top_p` (nucleus).
+
+### Subspace Procrustes (`core/align/procrustes.py`)
+
+For N > 32, projects to rank-24, aligns in the projected space, lifts back preserving the orthogonal complement exactly. Validated: 1.000 nearest-neighbor agreement with full Procrustes across all tested configurations (N=32-128, k=8-64). Three matmuls, sub-millisecond.
+
+### Constellation (`core/associate/constellation.py`)
+
+Learned anchors on S^(d-1). The primary state — the reference frame that everything else measures against. Repulsion-initialized for maximal coverage. Detached from task gradients; positioned by geometric structure only.
+
+## Empirical Constants
+
+| Constant | Value | Observed across |
+|---|---|---|
+| CV pentachoron band | 0.20–0.23 | 17+ architectures, all modalities |
+| Binding/separation boundary | 0.29154 / 0.70846 | MinimalShunts, CLIP, T5, alpha convergence |
+| Effective geometric dimension | 16 (S^15) | Validated in patchwork and anchor experiments |
+| Irreducible CV minimum | 0.125 | Theoretical lower bound on sphere |
 
 ## Requirements
 
 ```
 torch >= 2.0
-geofractal (git+https://github.com/AbstractEyes/geofractal.git)
 ```
+
+Optional: `triton >= 2.1` (fused SVD kernels), `geofractal` (tower composition), `kymatio` (scattering).
 
 ## Ecosystem
 
-### Infrastructure
-
-| Repository | Description |
-|---|---|
-| [geofractal](https://github.com/AbstractEyes/geofractal) | Router infrastructure — BaseTower, WideRouter, TorchComponent. The foundation this repo builds on. |
-| [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) | Full GeoLIP package (PyPI: `geolip`). The parent ecosystem repo. |
-
-### Constellation Models & Experiments
-
-| Repository | Description |
-|---|---|
-| [geolip-constellation-core](https://huggingface.co/AbstractPhil/geolip-constellation-core) | HuggingFace model hub — constellation architecture documentation and pretrained checkpoints |
-| [geolip-captionbert-8192](https://huggingface.co/AbstractPhil/geolip-captionbert-8192) | CaptionBERT — geometric caption encoder with Procrustes consensus distillation, 8192 anchors. Feature extraction pipeline with pentachoron structure. |
-| [geolip-bertenstein](https://huggingface.co/AbstractPhil/geolip-bertenstein) | Multi-expert geometric fusion transformer — BERT-large hub with frozen expert encoders (DINOv2, Whisper, ESM-2, CodeBERT) |
-
-### CV & Geometric Analysis
-
-| Repository | Description |
-|---|---|
-| [geolip-cv-experiments](https://huggingface.co/AbstractPhil/geolip-cv-experiments) | CV loss sweep — batched 141x speedup validation, weight/target/dimension sweeps |
-| [geolip-cv-noise-analysis](https://huggingface.co/AbstractPhil/geolip-cv-noise-analysis) | Constellation relay preservation analysis — established attention weakness (cycle 1 to cycle N), validated relay geometric fidelity |
-| [geolip-hypersphere-experiments](https://huggingface.co/AbstractPhil/geolip-hypersphere-experiments) | Spectral encoder test manifest — wavelet scattering (Mallat), Gabor filter banks, Radon/curvelet transforms as inputs to the constellation pipeline. Origin of the avg-pool spatial collapse finding. |
-| [geolip-constellation-activations](https://huggingface.co/AbstractPhil/geolip-constellation-activations) | Cross-token relay sequence prototyping and routing optimization — benchmarking constellation relay across token interactions |
-
-### Vision Architectures
-
-| Repository | Description |
-|---|---|
-| [geolip-vit-dual-stream](https://huggingface.co/AbstractPhil/geolip-vit-dual-stream) | Dual-stream ViT — 11+ run research log. Dual InfoNCE, shared attention, mastery queue, BCE stream. Established that with cross-attention enabled, the geometric structure alone classifies the entire thing. |
-| [geolip-vit-tri-stream](https://huggingface.co/AbstractPhil/geolip-vit-tri-stream) | Tri-stream ViT — evolution of dual-stream. Three processing paths: Stream A (CE), Stream B (BCE+NCE), GAL (geometric arbitration layer with KSimplex features + Procrustes anchor rotation). |
-| [geolip-vit-zana](https://huggingface.co/AbstractPhil/geolip-vit-zana) | Zana ViT — PentaViT refactored into the GeoLIP paradigm. Custom automodel functional. Geometric constellation structure intact as standalone prototype, evolved from penta-vit-experiments. |
-| [geolip-vit-x34](https://huggingface.co/AbstractPhil/geolip-vit-x34) | x34 ViT — 34-model soup with Procrustes alignment to constellation patchwork. Early attempt at multi-model geometric alignment, identified that Procrustes data was too premature for direct ViT training. |
-
-### CLIP Geometric Distillation
-
-| Repository | Description |
-|---|---|
-| [geolip-clip-vit-bigG-patch14-ctx576-seq77](https://huggingface.co/AbstractPhil/geolip-clip-vit-bigG-patch14-ctx576-seq77) | Memory-augmented CLIP ViT-bigG distillation — ModernBERT + Procrustes + pentachoron structure, 576 context / 77 sequence, for long-context text encoding targeting SDXL |
-| [geolip-clip-vit-large-patch14-ctx576-seq77](https://huggingface.co/AbstractPhil/geolip-clip-vit-large-patch14-ctx576-seq77) | Memory-augmented CLIP ViT-L/14 distillation — 576 context / 77 sequence variant |
-| [geolip-clip-vit-large-patch14-ctx576](https://huggingface.co/AbstractPhil/geolip-clip-vit-large-patch14-ctx576) | Memory-augmented CLIP ViT-L/14 distillation — 576 context variant |
-
-### Diffusion & Generation
-
-| Repository | Description |
-|---|---|
-| [geolip-spherical-diffusion-proto](https://huggingface.co/AbstractPhil/geolip-spherical-diffusion-proto) | Spherical flow-matching diffusion — geometric loss on S^(d-1), constellation-anchored generation on CIFAR-10 |
-| [geolip-diffusion-proto](https://huggingface.co/AbstractPhil/geolip-diffusion-proto) | Flow-match relay diffusion — constellation relay integrated into diffusion pipeline. Geometric structure contributes ~6-7% to output. Automodel available. |
-
-### Cross-Model Analysis
-
-| Repository | Description |
-|---|---|
-| [procrustes-analysis](https://huggingface.co/AbstractPhil/procrustes-analysis) | Procrustes alignment study — 17 models profiled (T5 family, BERT, CLIP, DINOv2, UNets, VAEs). Cross-modal QK eigenvalue lock at 0.500, VAE weights 70-76% alignable. |
-| [geolip-procrustes](https://huggingface.co/AbstractPhil/geolip-procrustes) | GeoLIP-specific Procrustes data and alignment experiments (part of GEOLIP Research Concepts collection) |
-
-### Evolutionary & Experimental
-
-| Repository | Description |
-|---|---|
-| [geolip-genetic-inheritance](https://huggingface.co/AbstractPhil/geolip-genetic-inheritance) | Genetic inheritance experiment — anchor vectors heritable across generations, CV converges from ~1.7 (Gen 0) to ~0.33 (Gen 4), genetic diversity beats pure fitness selection |
-| [geometric-experiment-history](https://huggingface.co/AbstractPhil/geometric-experiment-history) | **The complete project catalog** — 33 projects across 9 research areas: pentachoron mathematics, geometric vocabulary, classification architectures, language models, diffusion, feature extraction, consciousness research, scaling architecture, infrastructure |
+- [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) — Full GeoLIP package (PyPI: `geolip`)
+- [SVD Kernel Article](https://huggingface.co/blog/AbstractPhil/svd-triton-kernel-optimization) — Engineering specification
+- [SVD Experiment Journey](https://huggingface.co/blog/AbstractPhil/svd-experiment-journey) — Development map with every wrong turn documented
+- [geolip-bertenstein](https://huggingface.co/AbstractPhil/geolip-bertenstein) — Multi-expert geometric fusion
+- [procrustes-analysis](https://huggingface.co/AbstractPhil/procrustes-analysis) — Cross-model alignment study
 
 ---
 
-*Research by [AbstractPhil](https://huggingface.co/AbstractPhil). Complete experiment history and project catalog at [geometric-experiment-history](https://huggingface.co/AbstractPhil/geometric-experiment-history).*
+*Research by [AbstractPhil](https://huggingface.co/AbstractPhil). Apache 2.0.*
