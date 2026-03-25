@@ -1,16 +1,17 @@
 """
-geolip_core — Geometric Observer Framework for Deep Learning
-===============================================================
+geolip_core — Geometric observer framework for deep learning.
 
-Six-stage paradigm: Input, Mutation, Association, Curation, Distinction, Loss.
-GeoLIP composes stages. Constellation is one concrete set of implementations.
-
-Part of the GeoLIP ecosystem: https://github.com/AbstractEyes/glip-autoencoder
+Structure:
+    core/       Geometric behaviors (input, associate, curate, align, distinguish)
+    pipeline/   Composed geometric substrates (layer, backbone, GeoLIP)
+    example/    Working models built with the pipeline
+    analysis/   Diagnostic tools
+    utils/      Engineering infrastructure (kernels, linalg, memory)
 
 Quick start:
-    from geolip_core.core import GeoLIP, ConstellationObserver
-    from geolip_core.core import Input, Association, Curation, Mutation, Distinction
-    from geolip_core.encoder import GeoLIPConvEncoder
+    from geolip_core.core import Constellation, Patchwork, SVDObserver
+    from geolip_core.pipeline import Input, GeoLIP
+    from geolip_core.utils import gram_eigh_svd, batched_procrustes
 """
 
 __version__ = "0.1.0"

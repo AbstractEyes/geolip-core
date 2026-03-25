@@ -1,41 +1,52 @@
 """
-core — GeoLIP geometric observer framework.
+core — GeoLIP geometric behavior package.
 
-Six-stage paradigm: Input, Mutation, Association, Curation, Distinction, Loss.
-GeoLIP composes stages. Constellation is one concrete set of implementations.
+Five stages, five directories:
+    input/       Data-type ingestion and observation
+    associate/   Measure relationships to reference frame
+    curate/      Select what matters from associations
+    align/       How spaces relate to each other
+    distinguish/ Task-specific output and training signal
+
+Usage:
+    from geolip_core.core import Constellation, Patchwork, AnchorGate
+    from geolip_core.core import cv_loss, ce_loss, knn_accuracy
+    from geolip_core.core import SVDObserver, ProcrustesAlignment
+    from geolip_core.core import make_activation, param_count
 """
 
-# Stage interfaces + GeoLIP loop
-from .observer import Input, Mutation, Association, Curation, Distinction, GeoLIP
+# ── Shared utilities ──
+from .util import (
+    SquaredReLU, StarReLU, make_activation, ACTIVATIONS,
+    GeometricAutograd, param_count, model_summary,
+    CV_PENTACHORON_BAND, BINDING_BOUNDARY, SEPARATION_COMPLEMENT,
+    EFFECTIVE_GEO_DIM, IRREDUCIBLE_CV_MIN,
+)
 
-# Constellation implementations
-from .constellation import (
+# ── Input: data-type ingestion ──
+from .input.svd import SVDObserver
+
+# ── Associate: measure relationships ──
+from .associate import (
     Constellation, ConstellationAssociation, ConstellationCuration,
     ConstellationObserver,
     init_anchors_xavier, init_anchors_orthogonal,
     init_anchors_repulsion, INIT_METHODS,
+    RelayLayer, ConstellationRelay,
+    FlowAttention,
 )
 
-# Activation
-from .activation import SquaredReLU, StarReLU, make_activation, ACTIVATIONS
+# ── Curate: select what matters ──
+from .curate import (
+    AnchorGate, GatedPatchwork, cayley_menger_det, cm_validity_score,
+    Patchwork, MagnitudeFlow, AnchorPush,
+)
 
-# Patchwork + Magnitude + Push
-from .patchwork import Patchwork, MagnitudeFlow, AnchorPush
+# ── Align: how spaces relate ──
+from .align import ProcrustesAlignment
 
-# Relay
-from .constellation_relay import RelayLayer, ConstellationRelay
-
-# Route
-from .constellation_route import FlowAttention
-
-# Core utilities
-from .core import GeometricAutograd, param_count, model_summary
-
-# Memory
-from .memory import EmbeddingBuffer
-
-# Losses
-from .losses import (
+# ── Distinguish: task output + losses ──
+from .distinguish import (
     cv_loss, cv_metric, cv_multi_scale, cayley_menger_vol2,
     nce_loss, ce_loss, ce_loss_paired,
     bridge_loss, bridge_loss_paired,
@@ -43,34 +54,3 @@ from .losses import (
     attraction_loss, spread_loss, knn_accuracy,
     three_domain_loss, observer_loss,
 )
-
-__all__ = [
-    # Stage interfaces
-    'Input', 'Mutation', 'Association', 'Curation', 'Distinction',
-    # Composition
-    'GeoLIP',
-    # Constellation
-    'Constellation', 'ConstellationAssociation', 'ConstellationCuration',
-    'ConstellationObserver',
-    'init_anchors_xavier', 'init_anchors_orthogonal',
-    'init_anchors_repulsion', 'INIT_METHODS',
-    # Activation
-    'SquaredReLU', 'StarReLU', 'make_activation', 'ACTIVATIONS',
-    # Patchwork + Magnitude + Push
-    'Patchwork', 'MagnitudeFlow', 'AnchorPush',
-    # Relay
-    'RelayLayer', 'ConstellationRelay',
-    # Route
-    'FlowAttention',
-    # Core utilities
-    'GeometricAutograd', 'param_count', 'model_summary',
-    # Memory
-    'EmbeddingBuffer',
-    # Losses
-    'cv_loss', 'cv_metric', 'cv_multi_scale', 'cayley_menger_vol2',
-    'nce_loss', 'ce_loss', 'ce_loss_paired',
-    'bridge_loss', 'bridge_loss_paired',
-    'assign_bce_loss', 'assign_nce_loss',
-    'attraction_loss', 'spread_loss', 'knn_accuracy',
-    'three_domain_loss', 'observer_loss',
-]
