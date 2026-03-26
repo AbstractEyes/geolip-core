@@ -163,6 +163,11 @@ class AnchorGate(nn.Module):
             nn.GELU(),
             nn.Linear(16, 1),
         )
+        # Initialize gate bias positive → sigmoid(+2) ≈ 0.88
+        # Gates start OPEN. Training closes the ones that should be closed.
+        # This is architecture-before-loss: don't learn to open, learn to close.
+        nn.init.zeros_(self.gate_proj[2].weight)
+        nn.init.constant_(self.gate_proj[2].bias, 2.0)
 
         # Compartment assignment for multi_select
         if strategy == 'multi_select':
