@@ -330,9 +330,9 @@ class ESM2GeometricPipeline(BaseTower):
         if not has_pos:
             import warnings
             warnings.warn(
-                f"ESM-2 loaded WITHOUT position_embeddings. "
-                f"This likely means transformers>=5.0 removed them. "
-                f"Install 'transformers<5.0' for correct ESM-2 behavior.",
+                f"ESM-2 loaded WITHOUT position_embeddings — the model has no "
+                f"positional information. Install 'transformers<=4.49' for "
+                f"correct ESM-2 behavior. Current: {__import__('transformers').__version__}",
                 UserWarning)
 
         n_layers = config.num_hidden_layers
@@ -675,6 +675,53 @@ class ESM2GeometricPipeline(BaseTower):
 
         embed_energy = eigvals_p.flip(0)[:embed_dim].sum() / eigvals_p.sum()
         print(f"    Embed proj: energy captured={embed_energy:.4f}")
+
+        # ── Reinitialize constellation anchors from actual embeddings ──
+        # After projection init, run calibration data through the full path
+        # and place anchors where the data actually lands on S^(d-1)
+        embed_proj = self['embed_proj']
+        with torch.no_grad():
+            pooled_device = pooled.to(embed_proj[0].weight.device)
+            cal_emb = F.normalize(embed_proj(pooled_device), dim=-1)  # (N, embed_dim)
+
+        assoc = self['associate']
+        n_anchors = assoc.constellation.n_anchors
+
+        if cal_emb.shape[0] >= n_anchors:
+            # K-means-style init: pick diverse starting points via farthest-point sampling
+            anchors_new = torch.zeros(n_anchors, embed_dim, device=cal_emb.device)
+            # Start from the embedding with highest norm variance
+            idx = torch.randint(0, cal_emb.shape[0], (1,)).item()
+            anchors_new[0] = cal_emb[idx]
+
+            for k in range(1, n_anchors):
+                # Distance from each point to nearest existing anchor
+                dists = 1.0 - cal_emb @ anchors_new[:k].T  # (N, k)
+                min_dists = dists.min(dim=1).values  # (N,)
+                # Pick the farthest point
+                idx = min_dists.argmax().item()
+                anchors_new[k] = cal_emb[idx]
+
+            # Repulsion polish on the selected points
+            anchors_new = F.normalize(anchors_new, dim=-1)
+            for _ in range(100):
+                sim = anchors_new @ anchors_new.T
+                sim.fill_diagonal_(-2.0)
+                anchors_new = F.normalize(
+                    anchors_new - 0.05 * anchors_new[sim.argmax(dim=1)], dim=-1)
+
+            assoc.constellation.anchors.copy_(anchors_new)
+
+            # Report coverage
+            cos_to_anchors = cal_emb @ anchors_new.T
+            nearest_cos = cos_to_anchors.max(dim=1).values
+            coverage = nearest_cos.mean().item()
+            min_cos = nearest_cos.min().item()
+            print(f"    Anchors reinitialized: {n_anchors} from {cal_emb.shape[0]} embeddings")
+            print(f"    Coverage: mean_cos={coverage:.4f}  min_cos={min_cos:.4f}")
+        else:
+            print(f"    ⚠️  Not enough samples ({cal_emb.shape[0]}) to reinit "
+                  f"{n_anchors} anchors — keeping repulsion init")
 
         print("  Geometric init complete.\n")
 
