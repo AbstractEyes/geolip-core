@@ -90,7 +90,7 @@ class ESM2TapSystem(TorchComponent):
         """Install forward hooks on target layers."""
         self._remove_hooks()
         for layer_idx in self.tap_layers:
-            layer = self.esm.encoder.layer[layer_idx]
+            layer = self.esm.esm.encoder.layer[layer_idx]
 
             def make_hook(idx):
                 def hook(module, input, output):
