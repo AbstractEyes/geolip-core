@@ -2,55 +2,88 @@
 
 A geometric support system for deep learning models.
 
-Models train blind. They receive a loss signal that says "you were wrong" and a gradient that says "go this direction." They have no structural self-awareness — they can't see that their representations are collapsing, that their features are redundant, or that half their capacity is dead.
+Models train blind. They get a loss signal and a gradient. They have no structural self-awareness — they can't see their representations collapsing, their features going redundant, or their capacity dying.
 
-This package gives them that. Not by adding losses that punish problems after they happen, but by architecturally making those problems observable, measurable, and correctable in real time.
+This package gives them that. Not by adding losses that punish problems after they happen, but by architecturally making those problems observable, measurable, and correctable in real time. A model hospital — diagnostics, monitoring, intervention, and support for models that can't diagnose themselves.
 
-Part of the [GeoLIP](https://github.com/AbstractEyes/glip-autoencoder) ecosystem.
+Built on the [geofractal](https://github.com/AbstractEyes/geofractal) router system. Part of the [GeoLIP](https://github.com/AbstractEyes/glip-autoencoder) ecosystem.
 
 ## Install
 
 ```bash
+pip install "git+https://github.com/AbstractEyes/geofractal.git"
 pip install "git+https://github.com/AbstractEyes/geolip-core.git"
 ```
 
 Triton is optional — fused SVD kernels activate automatically if installed. Everything falls back to PyTorch without it.
 
-## What This Does
+## Architecture
 
-The geometric substrate attaches to any backbone (conv, transformer, hybrid) and provides:
+Three layers, zero drift between them:
 
-- **Structural observation** — SVD decomposition of feature maps reveals energy distribution, rotation patterns, and novelty. Detached from the backward pass, zero interference with training.
-- **Geometric association** — Constellation anchors on S^(d-1) triangulate embeddings against a stable reference frame. The anchors define the coordinate system.
-- **Quality-aware curation** — Cayley-Menger validity gates measure whether each anchor forms a well-conditioned simplex with the input. Simplex volume IS the attention score. Invalid geometry gets suppressed before it reaches the interpreter.
-- **Targeted modulation** — Patchwork compartments interpret curated associations. Channel modulation adjusts backbone features based on geometric health. Local intervention, not global perturbation.
+```
+core/                         THE GEOMETRY (nn.Module)
+  Standalone modules. No framework dependency beyond PyTorch.
+  These do the math.
 
-Empirically validated: +3 accuracy points on CIFAR-100 across both convolutional and transformer backbones, from 150K additional parameters.
+pipeline/components/          THE CACHE ADAPTERS (TorchComponent)
+  Thin wrappers around core modules. Each owns self.inner,
+  reads from parent cache, delegates to inner, writes results.
+  These wire the bus.
+
+pipeline/                     THE COMPOSITIONS (BaseTower)
+  Orchestrate component execution order via forward().
+  These define the flow.
+```
+
+A model is what you build FROM a pipeline. The pipeline composes behaviors. The behaviors live in core.
 
 ## Package Structure
 
 ```
 geolip_core/
-├── core/               Geometric behaviors (the five stages)
-│   ├── input/              Data-type ingestion and observation
-│   ├── associate/          Measure relationships to reference frame
-│   ├── curate/             Select what matters from associations
-│   ├── align/              How spaces relate to each other
-│   └── distinguish/        Task-specific output and training signal
+├── core/                          Geometric behaviors (five stages)
+│   ├── input/                         Data-type ingestion and observation
+│   │   └── svd.py                         SVDObserver, SVDTokenObserver
+│   ├── associate/                     Measure relationships to reference frame
+│   │   ├── constellation.py               Constellation, ConstellationAssociation
+│   │   ├── relay.py                       ConstellationRelay (O(S) mutation)
+│   │   └── route.py                       FlowAttention (ODE mutation)
+│   ├── curate/                        Select what matters
+│   │   ├── gate.py                        AnchorGate, GatedPatchwork (CM validity)
+│   │   └── patchwork.py                   Patchwork, MagnitudeFlow
+│   ├── align/                         How spaces relate
+│   │   └── procrustes.py                  ProcrustesAlignment (subspace-preserving)
+│   ├── distinguish/                   Task-specific output
+│   │   └── losses.py                      CE, CV, spread, observer_loss
+│   └── util.py                        Activations, autograd, constants
 │
-├── pipeline/           Composed geometric substrates
-│   ├── observer.py         Stage interfaces (Input, Association, Curation, ...)
-│   ├── layer.py            ConstellationLayer — one depth of observation
-│   └── backbone.py         GeometricBackbone — multi-depth stack
+├── pipeline/                      Composed geometric substrates
+│   ├── components/                    TorchComponent wrappers (cache adapters)
+│   │   ├── observe_svd.py                 ObserveSVD, ObserveSVDTokens
+│   │   ├── associate_constellation.py     AssociateConstellation
+│   │   ├── mutate_relay.py                MutateRelay
+│   │   ├── mutate_flow.py                 MutateFlow
+│   │   ├── curate_gate.py                 CurateCMGate
+│   │   ├── curate_patchwork.py            CuratePatchwork, CurateGatedPatchwork
+│   │   ├── curate_magnitude.py            CurateMagnitude
+│   │   ├── align_procrustes.py            AlignProcrustes
+│   │   └── fuse.py                        FuseGeometric
+│   ├── observer.py                    Stage interfaces (Input, Association, ...)
+│   ├── arbitrary_feature.py           GeometricPipeline (token → geo feature)
+│   ├── layer.py                       ConstellationLayer (one depth)
+│   └── backbone.py                    GeometricBackbone (multi-depth)
 │
-├── example/            Working models built with the pipeline
-├── analysis/           Diagnostic tools
-└── utils/              Engineering infrastructure (Triton kernels, linalg)
+├── example/                       Working models built with the pipeline
+├── analysis/                      Diagnostic tools
+└── utils/                         Engineering infrastructure
+    ├── kernel.py                      Triton SVD, gram_eigh, Procrustes math
+    └── memory.py                      EmbeddingBuffer
 ```
 
 ### The Five Stages
 
-Every component lives in the directory matching its primary purpose.
+Every component in `core/` lives in the directory matching its primary purpose. A component may perform hundreds of internal steps. It is classified by what it exists to accomplish, not by what it computes along the way.
 
 | Stage | Directory | Purpose |
 |---|---|---|
@@ -60,82 +93,101 @@ Every component lives in the directory matching its primary purpose.
 | **Align** | `core/align/` | Relate two geometric spaces to each other |
 | **Distinguish** | `core/distinguish/` | Task-specific output |
 
-A component may perform hundreds of internal steps. It is classified by what it exists to accomplish, not by what it computes along the way.
-
 ### Design Principle: Architecture Before Loss
 
-The geometric substrate is structural, not supervisory. When a problem arises:
+When a problem arises:
 
 1. First ask: can the architecture prevent this?
 2. If yes: structural fix — gate, projection, initialization, detach boundary.
 3. If no: then introduce a loss, minimal and targeted.
 
-The CM gate doesn't need a "simplex validity loss" to penalize degenerate anchors. It architecturally suppresses them. Subspace-preserving Procrustes doesn't need an "alignment loss." The rotation is mathematically exact by construction. Repulsion-initialized anchors don't need a spread loss if the gate prevents collapse.
+The CM gate doesn't need a validity loss. It architecturally suppresses degenerate anchors. Subspace Procrustes doesn't need an alignment loss. The rotation is exact by construction.
 
 ## Quick Start
 
+### Composable Pipeline (geofractal router)
+
 ```python
-# Individual behaviors
-from geolip_core.core import Constellation, Patchwork, AnchorGate, SVDObserver
+from geolip_core.pipeline.arbitrary_feature import GeometricPipeline
+from geolip_core.pipeline.components import CurateCMGate
 
-# Composed pipeline
-from geolip_core.pipeline import ConstellationLayer, GeometricBackbone
+# Build pipeline: (B, 5, 512) → (B, feature_dim)
+pipe = GeometricPipeline('geo', seq_len=5, input_dim=512, n_anchors=32)
+features = pipe(x)
 
-# Engineering utilities
-from geolip_core.utils import gram_eigh_svd, batched_procrustes
+# Inspect intermediates via cache
+diag = pipe.get_diagnostics()
+print(diag['gate_info'])    # CM validity stats
+print(diag['svd_S'])        # singular values
+pipe.cache_clear()          # managed lifecycle
+
+# Swap a stage at runtime
+pipe.detach('curate_gate')
+pipe.attach('curate_gate', CurateCMGate('curate_gate', 32, 256, strategy='top_k'))
 ```
 
-### Attach to a Backbone
+### Individual Components
 
 ```python
-from geolip_core.pipeline import GeometricBackbone
-
-# Define depth specs: (channels, spatial_size) at each stage
-geo = GeometricBackbone(
-    stages=[(64, 32), (128, 16), (256, 8), (384, 4)],
-    n_anchors=32, svd_rank=24, gate_strategy='cm_gate',
+from geolip_core.pipeline.components import (
+    ObserveSVDTokens, AssociateConstellation,
+    CurateCMGate, CuratePatchwork, AlignProcrustes,
 )
 
-# In your forward pass:
-features = [stage(h) for stage, h in zip(conv_stages, intermediates)]
-modulated, geo_state, observations = geo(features)
-# modulated features replace originals; geo_state feeds your classifier
+# Each wraps a core module + provides cache wiring
+observe = ObserveSVDTokens('obs', seq_len=5)
+assoc = AssociateConstellation('assoc', dim=256, n_anchors=32)
+gate = CurateCMGate('gate', n_anchors=32, embed_dim=256, strategy='cm_gate')
 ```
 
-### Use Individual Components
+### Core Modules Directly
 
 ```python
-from geolip_core.core import SVDObserver, AnchorGate, Patchwork
+from geolip_core.core import SVDObserver, SVDTokenObserver, Constellation, AnchorGate, Patchwork
 
-# Observe structure
+# No router, no cache — just PyTorch modules
 svd = SVDObserver(in_channels=384, svd_rank=24)
 S, Vh, features, novelty = svd(conv_features)
 
-# Gate by geometric validity
 gate = AnchorGate(n_anchors=32, dim=256, strategy='cm_gate')
 gate_values, assignment, info = gate(embedding, anchors, triangulation)
-
-# Interpret curated associations
-pw = Patchwork(n_anchors=32, n_comp=8, d_comp=64)
-interpreted = pw(triangulation * gate_values)
 ```
 
-### Align Two Spaces
+### Engineering Utilities
 
 ```python
-from geolip_core.core import ProcrustesAlignment
+from geolip_core.utils import gram_eigh_svd, batched_procrustes
 
-aligner = ProcrustesAlignment(dim=384, rank=24)
-aligned, info = aligner(source_embeddings, target_embeddings)
-# info['method'] = 'subspace' for dim > 32, 'full' otherwise
-# 1.000 nearest-neighbor agreement with full Procrustes
+# 5000× faster than torch.linalg.svd for small N
+U, S, Vh = gram_eigh_svd(features)
+
+# Subspace-preserving alignment
+aligned, info = batched_procrustes(source, target, rank=24)
 ```
 
-## Key Components
+## Component Catalog
 
-### SVD Kernel (`utils/kernel.py`)
+### Pipeline Components (TorchComponent wrappers)
 
-Fused Triton kernels for batched thin SVD. 5,000× faster than `torch.linalg.svd` for small N.
+Each reads from and writes to the parent router's cache. Core modules do the math.
+
+| Component | Wraps | Stage | Cache writes |
+|---|---|---|---|
+| `ObserveSVD` | `SVDObserver` | Input | `svd_S`, `svd_Vh`, `svd_features`, `svd_novelty` |
+| `ObserveSVDTokens` | `SVDTokenObserver` | Input | same |
+| `AssociateConstellation` | `ConstellationAssociation` | Associate | `embedding`, `anchors_n`, `cos`, `tri`, `nearest`, `assignment` |
+| `MutateRelay` | `ConstellationRelay` | Mutation | `relay_output`, `relay_tri` |
+| `MutateFlow` | `FlowAttention` | Mutation | `flow_output` |
+| `CurateCMGate` | `AnchorGate` | Curate | `gate_values`, `gate_info`, `tri_gated` |
+| `CuratePatchwork` | `Patchwork` | Curate | `patchwork` |
+| `CurateGatedPatchwork` | `GatedPatchwork` | Curate | `patchwork`, `gate_info` |
+| `CurateMagnitude` | `MagnitudeFlow` | Curate | `mag_anchors`, `mag_comp` |
+| `AlignProcrustes` | `ProcrustesAlignment` | Align | `aligned`, `alignment_info` |
+| `FuseGeometric` | (pipeline-specific) | Fuse | `svd_context`, `geo_features` |
+
+### Key Core Modules
+
+**SVD Kernel** (`utils/kernel.py`) — Fused Triton kernels for batched thin SVD:
 
 | N | Time | vs torch |
 |---|---|---|
@@ -144,21 +196,11 @@ Fused Triton kernels for batched thin SVD. 5,000× faster than `torch.linalg.svd
 | 8 | 0.290ms | 584× |
 | 32 | 0.781ms | 388× |
 
-Auto-dispatches: Triton for N≤3, Gram+eigh for N=4-32. AMP-safe (disables autocast around linalg). See the [engineering article](https://huggingface.co/blog/AbstractPhil/svd-triton-kernel-optimization) for the full specification.
+**CM Validity Gate** (`core/curate/gate.py`) — Cayley-Menger determinant as geometric attention. Simplex volume is the relevance score. Strategies: `round_robin`, `cm_gate`, `top_k`, `top_p`.
 
-### CM Validity Gate (`core/curate/gate.py`)
+**Subspace Procrustes** (`core/align/procrustes.py`) — For N > 32, projects to rank-24, aligns, lifts back preserving orthogonal complement exactly. 1.000 NN agreement.
 
-Cayley-Menger determinant as geometric attention. For each anchor, forms a simplex with the embedding and its neighbors. The simplex volume is the relevance score — fat simplex means the anchor provides genuine geometric information. Sliver simplex means it's redundant.
-
-Strategies: `round_robin` (baseline), `cm_gate` (soft sigmoid), `top_k` (hard selection), `top_p` (nucleus).
-
-### Subspace Procrustes (`core/align/procrustes.py`)
-
-For N > 32, projects to rank-24, aligns in the projected space, lifts back preserving the orthogonal complement exactly. Validated: 1.000 nearest-neighbor agreement with full Procrustes across all tested configurations (N=32-128, k=8-64). Three matmuls, sub-millisecond.
-
-### Constellation (`core/associate/constellation.py`)
-
-Learned anchors on S^(d-1). The primary state — the reference frame that everything else measures against. Repulsion-initialized for maximal coverage. Detached from task gradients; positioned by geometric structure only.
+**Constellation** (`core/associate/constellation.py`) — Learned anchors on S^(d-1). The primary state. Repulsion-initialized, detached from task gradients.
 
 ## Empirical Constants
 
@@ -173,15 +215,17 @@ Learned anchors on S^(d-1). The primary state — the reference frame that every
 
 ```
 torch >= 2.0
+geofractal @ git+https://github.com/AbstractEyes/geofractal.git
 ```
 
-Optional: `triton >= 2.1` (fused SVD kernels), `geofractal` (tower composition), `kymatio` (scattering).
+Optional: `triton >= 2.1` (fused SVD kernels), `kymatio` (scattering).
 
 ## Ecosystem
 
-- [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) — Full GeoLIP package (PyPI: `geolip`)
+- [geofractal](https://github.com/AbstractEyes/geofractal) — Router/tower/component composition framework
+- [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) — Full GeoLIP package
 - [SVD Kernel Article](https://huggingface.co/blog/AbstractPhil/svd-triton-kernel-optimization) — Engineering specification
-- [SVD Experiment Journey](https://huggingface.co/blog/AbstractPhil/svd-experiment-journey) — Development map with every wrong turn documented
+- [SVD Experiment Journey](https://huggingface.co/blog/AbstractPhil/svd-experiment-journey) — Development map
 - [geolip-bertenstein](https://huggingface.co/AbstractPhil/geolip-bertenstein) — Multi-expert geometric fusion
 - [procrustes-analysis](https://huggingface.co/AbstractPhil/procrustes-analysis) — Cross-model alignment study
 
