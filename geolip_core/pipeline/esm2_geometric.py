@@ -325,6 +325,16 @@ class ESM2GeometricPipeline(BaseTower):
         esm_model = AutoModelForMaskedLM.from_pretrained(
             esm_model_name, config=config)
 
+        # Verify position embeddings survived loading
+        has_pos = hasattr(esm_model.esm.embeddings, 'position_embeddings')
+        if not has_pos:
+            import warnings
+            warnings.warn(
+                f"ESM-2 loaded WITHOUT position_embeddings. "
+                f"This likely means transformers>=5.0 removed them. "
+                f"Install 'transformers<5.0' for correct ESM-2 behavior.",
+                UserWarning)
+
         n_layers = config.num_hidden_layers
         esm_dim = config.hidden_size
         vocab_size = config.vocab_size
@@ -490,6 +500,183 @@ class ESM2GeometricPipeline(BaseTower):
             'patchwork': self.cache_get('patchwork'),
             'distill_loss': self.cache_get('distill_loss'),
         }
+
+    @torch.no_grad()
+    def init_from_data(self, input_ids, attention_mask=None, n_samples=256):
+        """Initialize projections from actual ESM-2 hidden states.
+
+        Runs calibration data through frozen ESM-2, collects hidden states,
+        and sets tap projections to the optimal SVD subspace. Then
+        Procrustes-aligns consecutive taps for geometric coherence and
+        Newton-Schulz whitens the projected space.
+
+        Call BEFORE creating the optimizer. This overwrites tap_proj weights.
+
+        Args:
+            input_ids: (N, L) calibration token ids (N >= n_samples)
+            attention_mask: (N, L) optional
+            n_samples: how many samples to use for calibration
+        """
+        from geolip_core.utils.kernel import gram_eigh_svd, newton_schulz_invsqrt
+
+        taps = self['taps']
+        tap_dim = taps.tap_dim
+        esm_dim = taps.esm_dim
+        device = next(taps.esm.parameters()).device
+
+        # Truncate to n_samples
+        if input_ids.shape[0] > n_samples:
+            input_ids = input_ids[:n_samples]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:n_samples]
+
+        input_ids = input_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        print(f"  Geometric init: {input_ids.shape[0]} samples, "
+              f"{len(taps.tap_layers)} taps, {esm_dim}→{tap_dim}")
+
+        # ── Collect hidden states ──
+        taps._install_hooks()
+
+        # Forward in chunks to manage memory
+        chunk_size = 32
+        all_hiddens = {l: [] for l in taps.tap_layers}
+
+        for start in range(0, input_ids.shape[0], chunk_size):
+            end = min(start + chunk_size, input_ids.shape[0])
+            ids_chunk = input_ids[start:end]
+            mask_chunk = attention_mask[start:end] if attention_mask is not None else None
+
+            taps.esm(ids_chunk, attention_mask=mask_chunk)
+
+            for layer_idx in taps.tap_layers:
+                h = taps._tap_cache[layer_idx]  # (B, L, esm_dim)
+                if mask_chunk is not None:
+                    m = mask_chunk.unsqueeze(-1).float()
+                    pooled = (h * m).sum(1) / m.sum(1).clamp(min=1)
+                else:
+                    pooled = h.mean(1)
+                all_hiddens[layer_idx].append(pooled.float())
+
+        taps._remove_hooks()
+
+        # Stack: (N, esm_dim) per tap
+        for l in taps.tap_layers:
+            all_hiddens[l] = torch.cat(all_hiddens[l], dim=0)
+
+        # ── SVD → optimal projection per tap ──
+        for i, layer_idx in enumerate(taps.tap_layers):
+            H = all_hiddens[layer_idx]  # (N, esm_dim)
+
+            # Center
+            H_centered = H - H.mean(0, keepdim=True)
+
+            # SVD of (N, esm_dim) → top tap_dim right singular vectors
+            # These are the directions that capture most variance
+            _, S, Vh = gram_eigh_svd(H_centered.unsqueeze(0))  # (1, N, esm_dim)
+            # Vh: (1, k, k) where k = min(N, esm_dim)
+            # We need the right singular vectors of H, which are the rows of Vh
+            # For gram_eigh_svd on (1, N, D): returns Vh of shape (1, D, D) if D < N
+            # Actually: gram_eigh works on A^T A which is (D, D), eigenvectors are (D, D)
+
+            # Direct approach: covariance → eigh
+            cov = (H_centered.T @ H_centered) / (H_centered.shape[0] - 1)  # (D, D)
+            eigvals, eigvecs = torch.linalg.eigh(cov)
+            # eigh returns ascending order — flip for descending
+            eigvecs = eigvecs.flip(-1)[:, :tap_dim]  # (esm_dim, tap_dim)
+
+            # Set projection weight: Linear(esm_dim, tap_dim).weight is (tap_dim, esm_dim)
+            proj_weight = eigvecs.T.contiguous()  # (tap_dim, esm_dim)
+
+            # Newton-Schulz whiten the projected data to verify
+            H_proj = H_centered @ eigvecs  # (N, tap_dim)
+            G = (H_proj.T @ H_proj) / (H_proj.shape[0] - 1)  # (tap_dim, tap_dim)
+            G = G.unsqueeze(0)  # (1, tap_dim, tap_dim)
+            G_inv_sqrt = newton_schulz_invsqrt(G).squeeze(0)  # (tap_dim, tap_dim)
+
+            # Whitened projection: W_white = G^{-1/2} @ V^T
+            proj_weight = (G_inv_sqrt @ proj_weight).contiguous()
+
+            # Write to tap_proj Linear weight
+            linear = taps.tap_projs[i][0]  # nn.Linear is first in Sequential
+            linear.weight.copy_(proj_weight)
+            linear.bias.zero_()
+
+            energy = eigvals.flip(0)[:tap_dim].sum() / eigvals.sum()
+            print(f"    Tap {layer_idx:>2d}: energy captured={energy:.4f}  "
+                  f"top_sv={eigvals.flip(0)[0]:.2f}")
+
+        # ── Procrustes-align consecutive taps ──
+        # After SVD init, each tap lives in its own basis.
+        # Align tap[i+1] → tap[i] so the geometric pipeline sees
+        # coherent rotation between layers, not arbitrary basis flips.
+        # Direct Procrustes: R = V @ U^T from SVD(H_tgt^T @ H_src)
+
+        for i in range(len(taps.tap_layers) - 1):
+            l_src = taps.tap_layers[i + 1]
+            l_tgt = taps.tap_layers[i]
+
+            # Project through current (whitened) tap projections
+            lin_src = taps.tap_projs[i + 1][0]
+            lin_tgt = taps.tap_projs[i][0]
+            H_src = all_hiddens[l_src].to(lin_src.weight.device) @ lin_src.weight.T
+            H_tgt = all_hiddens[l_tgt].to(lin_tgt.weight.device) @ lin_tgt.weight.T
+
+            # Center
+            H_src = H_src - H_src.mean(0, keepdim=True)
+            H_tgt = H_tgt - H_tgt.mean(0, keepdim=True)
+
+            # Procrustes: SVD(H_tgt^T @ H_src) → R = V @ U^T
+            M = H_tgt.T @ H_src  # (tap_dim, tap_dim)
+            U, _, Vt = torch.linalg.svd(M)
+            R = U @ Vt  # (tap_dim, tap_dim) orthogonal rotation
+
+            # Correct reflection if det < 0
+            if torch.linalg.det(R) < 0:
+                U[:, -1] *= -1
+                R = U @ Vt
+
+            # Apply rotation to source projection
+            new_weight = (R @ lin_src.weight).contiguous()
+            lin_src.weight.copy_(new_weight)
+
+            # Measure alignment quality
+            H_aligned = H_src @ R.T
+            cos_after = F.cosine_similarity(
+                H_aligned.reshape(1, -1), H_tgt.reshape(1, -1)).item()
+            print(f"    Align tap {taps.tap_layers[i+1]:>2d}→{taps.tap_layers[i]:>2d}: "
+                  f"cos_after={cos_after:.4f}")
+
+        # ── Initialize embed_proj from aligned tap statistics ──
+        # Collect projected tap means for embed_proj init
+        tap_outputs = []
+        for i, layer_idx in enumerate(taps.tap_layers):
+            linear = taps.tap_projs[i][0]
+            H_proj = all_hiddens[layer_idx].to(linear.weight.device) @ linear.weight.T
+            tap_outputs.append(H_proj)
+
+        # Stack and mean-pool: (N, n_taps, tap_dim) → (N, tap_dim)
+        stacked = torch.stack(tap_outputs, dim=1)
+        pooled = stacked.mean(dim=1)  # (N, tap_dim)
+
+        # SVD of pooled → embed_proj initialization
+        embed_proj_linear = self['embed_proj'][0]  # nn.Linear
+        embed_dim = embed_proj_linear.weight.shape[0]
+
+        pooled_centered = pooled - pooled.mean(0, keepdim=True)
+        cov_p = (pooled_centered.T @ pooled_centered) / (pooled.shape[0] - 1)
+        eigvals_p, eigvecs_p = torch.linalg.eigh(cov_p)
+        eigvecs_p = eigvecs_p.flip(-1)[:, :embed_dim]
+
+        embed_proj_linear.weight.copy_(eigvecs_p.T.contiguous())
+        embed_proj_linear.bias.zero_()
+
+        embed_energy = eigvals_p.flip(0)[:embed_dim].sum() / eigvals_p.sum()
+        print(f"    Embed proj: energy captured={embed_energy:.4f}")
+
+        print("  Geometric init complete.\n")
 
     def trainable_params(self):
         """Iterator over only the trainable (non-frozen) parameters."""
