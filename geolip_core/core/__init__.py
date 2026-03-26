@@ -24,7 +24,7 @@ from .util import (
 )
 
 # ── Input: data-type ingestion ──
-from .input.svd import SVDObserver
+from .input.svd import SVDObserver, SVDTokenObserver
 
 # ── Associate: measure relationships ──
 from .associate import (
