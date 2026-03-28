@@ -310,15 +310,36 @@ class CayleyOrthogonal(TorchComponent):
 
 
 def quaternion_multiply(q1, q2):
-    """Hamilton product. q = (w, x, y, z) along dim=1."""
-    w1, x1, y1, z1 = q1.unbind(-1)
-    w2, x2, y2, z2 = q2.unbind(-1)
+    """Hamilton product. q = (w, x, y, z) along dim=-2.
+
+    Supports batched: (..., 4, D) × (..., 4, D) → (..., 4, D)
+    Or scalar:        (..., 4) × (..., 4) → (..., 4)
+    """
+    w1, x1, y1, z1 = q1.unbind(-2) if q1.dim() >= 2 and q1.shape[-2] == 4 else q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-2) if q2.dim() >= 2 and q2.shape[-2] == 4 else q2.unbind(-1)
+    stack_dim = -2 if q1.dim() >= 2 and q1.shape[-2] == 4 else -1
     return torch.stack([
         w1*w2 - x1*x2 - y1*y2 - z1*z2,
         w1*x2 + x1*w2 + y1*z2 - z1*y2,
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
         w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ], dim=-1)
+    ], dim=stack_dim)
+
+
+def quaternion_multiply_batched(q1, q2):
+    """Hamilton product on (B, 4, D) tensors. Fully vectorized, no loops.
+
+    Each of the 4 slices along dim=1 is one quaternion component.
+    The D dimension is batched — all D quaternions multiplied in parallel.
+    """
+    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dim=1)  # (B, 4, D)
 
 
 class QuaternionCompose(TorchComponent):
@@ -327,6 +348,8 @@ class QuaternionCompose(TorchComponent):
     The algebra forces cross-term interactions between arms.
     Arms cannot independently memorize — the non-commutative
     product couples their outputs as structural regularizer.
+
+    Fully vectorized: single batched Hamilton product, no Python loops.
     """
     def __init__(self, name, input_dim, quat_dim=64):
         super().__init__(name)
@@ -350,16 +373,21 @@ class QuaternionCompose(TorchComponent):
             arm_w = arm_w.reshape(-1, D); arm_i = arm_i.reshape(-1, D)
             arm_j = arm_j.reshape(-1, D); arm_k = arm_k.reshape(-1, D)
 
+        # q: (N, 4, quat_dim) — stack 4 projected arms as quaternion components
         q = torch.stack([self.proj_w(arm_w), self.proj_i(arm_i),
                          self.proj_j(arm_j), self.proj_k(arm_k)], dim=1)
         q = q / (q.norm(dim=1, keepdim=True) + 1e-8)
+
+        # r: (N, 4, quat_dim) — broadcast learned rotation
         r = self.rotation.expand(q.shape[0], -1, -1)
         r = r / (r.norm(dim=1, keepdim=True) + 1e-8)
 
-        composed = torch.stack([
-            quaternion_multiply(r[:, :, d], q[:, :, d])
-            for d in range(self.quat_dim)
-        ], dim=-1).reshape(q.shape[0], -1)
+        # Single batched Hamilton product over all quat_dim simultaneously
+        # (N, 4, quat_dim) × (N, 4, quat_dim) → (N, 4, quat_dim)
+        composed = quaternion_multiply_batched(r, q)
+
+        # Flatten 4 × quat_dim → 4*quat_dim
+        composed = composed.reshape(q.shape[0], -1)
 
         if flat:
             composed = composed.reshape(*shape, -1)
@@ -757,13 +785,14 @@ class GeometricTransformer(BaseTower):
 
     def param_report(self):
         total = 0
-        print(f"\n  {self._tower_name} — parameter report")
+        name = getattr(self, '_tower_name', getattr(self, 'name', self.__class__.__name__))
+        print(f"\n  {name} — parameter report")
         print(f"  {'Component':<35s}  {'Params':>12s}")
         print(f"  {'─'*35}  {'─'*12}")
-        for name in sorted(self._components.keys()):
-            n = sum(p.numel() for p in self._components[name].parameters())
+        for cname, module in self.named_children():
+            n = sum(p.numel() for p in module.parameters())
             total += n
-            print(f"  {name:<35s}  {n:>12,}")
+            print(f"  {cname:<35s}  {n:>12,}")
         print(f"  {'─'*35}  {'─'*12}")
         print(f"  {'TOTAL':<35s}  {total:>12,}")
         return total
@@ -838,7 +867,11 @@ if __name__ == '__main__':
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = geo_transformer_small('test', n_layers=2).to(device)
+    model = geo_transformer_small('test', n_layers=2)
+    if hasattr(model, 'network_to'):
+        model.network_to(device=device, strict=False)
+    else:
+        model = model.to(device)
     total = model.param_report()
 
     B, L, D = 2, 32, 256
@@ -858,15 +891,19 @@ if __name__ == '__main__':
             print(f"    {k:<18s}: {shape}")
 
     # Verify rotations
-    for name in sorted(model._components.keys()):
-        if isinstance(model._components[name], CayleyOrthogonal):
-            R = model._components[name].get_rotation()
+    for name, module in model.named_modules():
+        if isinstance(module, CayleyOrthogonal):
+            R = module.get_rotation()
             I = torch.eye(R.shape[0], device=R.device)
             print(f"  {name}: ‖RRᵀ-I‖={((R@R.T)-I).norm():.8f}  det={torch.det(R):.4f}")
 
     # ESM-2 scale overhead
     print(f"\n  ESM-2 scale:")
-    esm = geo_transformer_esm2('esm2', n_layers=6).to(device)
+    esm = geo_transformer_esm2('esm2', n_layers=6)
+    if hasattr(esm, 'network_to'):
+        esm.network_to(device=device, strict=False)
+    else:
+        esm = esm.to(device)
     n = esm.param_report()
     print(f"  Overhead on 650M base: {n/1e6:.1f}M ({n/650e6*100:.1f}%)")
 
