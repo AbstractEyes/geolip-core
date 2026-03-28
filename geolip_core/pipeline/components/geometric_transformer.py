@@ -289,20 +289,48 @@ class CayleyOrthogonal(TorchComponent):
 
     Q = (I - A)(I + A)^(-1) where A is skew-symmetric.
     det(Q) = 1 always. ‖R-I‖ ≈ 4.1 at convergence in SO(256).
+
+    Caches the rotation matrix — only recomputes when A_upper changes
+    (i.e. after optimizer.step()). The solve is input-independent.
     """
     def __init__(self, name, dim):
         super().__init__(name)
         self.dim = dim
         self.A_upper = nn.Parameter(torch.zeros(dim * (dim - 1) // 2) * 0.01)
+        self._cached_R = None
+        self._cached_A_version = None
+
+    def _param_version(self):
+        """Track parameter changes via data_ptr + requires_grad state."""
+        return self.A_upper.data_ptr(), self.A_upper._version
 
     def get_rotation(self):
+        # During training: always recompute (autograd graph needed fresh)
+        # During eval: cache the rotation (params don't change)
+        if self.training:
+            self._cached_R = None
+
+        version = self._param_version()
+        if self._cached_R is not None and self._cached_A_version == version:
+            return self._cached_R
+
         d = self.dim
         A = torch.zeros(d, d, device=self.A_upper.device, dtype=self.A_upper.dtype)
         idx = torch.triu_indices(d, d, offset=1, device=A.device)
         A[idx[0], idx[1]] = self.A_upper
         A = A - A.T
         I = torch.eye(d, device=A.device, dtype=A.dtype)
-        return torch.linalg.solve(I + A, I - A)
+        R = torch.linalg.solve(I + A, I - A)
+
+        if not self.training:
+            self._cached_R = R
+            self._cached_A_version = version
+        return R
+
+    def invalidate_cache(self):
+        """Call after optimizer.step() if needed."""
+        self._cached_R = None
+        self._cached_A_version = None
 
     def forward(self, x):
         """(..., dim) → (..., dim) rotated."""
