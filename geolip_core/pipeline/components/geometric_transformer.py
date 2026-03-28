@@ -426,17 +426,21 @@ class ManifoldProjection(TorchComponent):
 
 
 class PositionGeometricContext(TorchComponent):
-    """Curation stage: constellation observation → FiLM context vector.
+    """Curation stage: constellation observation + geometric history → FiLM context.
 
-    Takes the full observation dict from ConstellationObserver and fuses
-    it into a per-position conditioning vector for FiLM layers.
+    Three streams:
+        anchor:     cos_to_anchors + assignment + triangulation — WHERE on the manifold
+        structural: patchwork + embedding — WHAT the local geometry looks like
+        history:    geo_residual from previous layers — WHAT prior layers observed
 
-    Processes: cos_to_anchors, assignment, patchwork, embedding.
-    These are the same features the GeoQuat head used — validated on
-    ProteinGym across 84 unseen proteins.
+    First layer receives zero history. Each subsequent layer reads accumulated
+    geometric context from all prior constellations.
     """
     def __init__(self, name, n_anchors, pw_dim, manifold_dim, context_dim):
         super().__init__(name)
+        self.context_dim = context_dim
+        self.pw_dim = pw_dim
+
         # Anchor features: cos + assignment + triangulation = 3 * n_anchors
         self.anchor_mlp = nn.Sequential(
             nn.Linear(n_anchors * 3, context_dim),
@@ -449,24 +453,27 @@ class PositionGeometricContext(TorchComponent):
             nn.GELU(),
             nn.LayerNorm(context_dim),
         )
-        # Fuse anchor + structural
+        # History features: accumulated geo_residual from prior layers
+        self.history_mlp = nn.Sequential(
+            nn.Linear(pw_dim, context_dim),
+            nn.GELU(),
+            nn.LayerNorm(context_dim),
+        )
+        # Fuse anchor + structural + history
         self.fuse = nn.Sequential(
-            nn.Linear(context_dim * 2, context_dim),
+            nn.Linear(context_dim * 3, context_dim),
             nn.GELU(),
             nn.LayerNorm(context_dim),
         )
 
-    def forward(self, obs_dict):
+    def forward(self, obs_dict, geo_residual=None):
         """
         Args:
-            obs_dict: from ConstellationObserver.observe(), keys:
-                cos_to_anchors: (B*L, A)
-                assignment: (B*L, A)
-                triangulation: (B*L, A)
-                patchwork: (B*L, pw_dim)
-                embedding: (B*L, manifold_dim)
+            obs_dict: from ConstellationObserver.observe()
+            geo_residual: (B*L, pw_dim) accumulated geometric context,
+                          or None for first layer (uses zeros)
         Returns:
-            (B*L, context_dim) geometric context
+            (B*L, context_dim) geometric context for FiLM
         """
         anchor_feats = torch.cat([
             obs_dict['cos_to_anchors'],
@@ -481,7 +488,14 @@ class PositionGeometricContext(TorchComponent):
 
         a = self.anchor_mlp(anchor_feats)
         s = self.struct_mlp(struct_feats)
-        return self.fuse(torch.cat([a, s], dim=-1))
+
+        # History — zeros on first layer
+        if geo_residual is not None:
+            h = self.history_mlp(geo_residual)
+        else:
+            h = torch.zeros_like(a)
+
+        return self.fuse(torch.cat([a, s, h], dim=-1))
 
 
 class GeometricAttention(TorchComponent):
@@ -640,25 +654,28 @@ class GeometricTransformerLayer(BaseTower):
         self.attach('gate', nn.Sequential(
             nn.Linear(d_model * 2, d_model), nn.Sigmoid()))
 
-    def forward(self, x, attn_mask=None, key_padding_mask=None):
+        # 9. Geometric residual stream — accumulates across layers
+        #    geo_gate: learned scalar gate per dimension, init near-zero (sigmoid(-3) ≈ 0.05)
+        #    geo_proj: project patchwork into residual space
+        self._pw_dim = pw_dim
+        self.attach('geo_proj', nn.Sequential(
+            nn.Linear(pw_dim, pw_dim), nn.LayerNorm(pw_dim)))
+        self.attach('geo_gate_proj', nn.Linear(pw_dim, pw_dim))
+        # Init gate bias to -3 so sigmoid starts near zero (minimal contribution at init)
+        nn.init.zeros_(self['geo_gate_proj'].weight)
+        nn.init.constant_(self['geo_gate_proj'].bias, -3.0)
+
+    def forward(self, x, geo_residual=None, attn_mask=None, key_padding_mask=None):
         """
         Args:
             x: (B, L, D) input hidden states
+            geo_residual: (B, L, pw_dim) accumulated geometric context from prior layers,
+                          or None for the first layer (initialized to zeros)
 
         Returns:
             x_out: (B, L, D) transformed hidden states
-            geo_state: dict with full geometric residual:
-                'embedding':      (B, L, manifold_dim)  position on S^(d-1)
-                'geo_ctx':        (B, L, context_dim)   compressed FiLM context
-                'triangulation':  (B, L, A)             cosine distances to anchors
-                'cos_to_anchors': (B, L, A)             raw cosine similarities
-                'assignment':     (B, L, A)             soft assignment
-                'nearest':        (B, L)                nearest anchor index
-                'patchwork':      (B, L, pw_dim)        compartment features
-                'bridge':         (B, L, A)             patchwork's assignment estimate
-                'content':        (B, L, D)             Stream A output
-                'geometric':      (B, L, D)             Stream B output (pre-rotation)
-                'composed':       (B, L, 4*quat_dim)    raw quaternion composition
+            geo_residual_out: (B, L, pw_dim) updated geometric residual
+            geo_state: dict with full geometric state (11 fields)
         """
         B, L, D = x.shape
 
@@ -669,8 +686,12 @@ class GeometricTransformerLayer(BaseTower):
         emb_flat = emb.reshape(B * L, -1)
         obs = self['observer'].observe(emb_flat)
 
-        # 3. Build FiLM context
-        geo_ctx_flat = self['context'](obs)  # (B*L, context_dim)
+        # 3. Build FiLM context WITH geometric history
+        geo_res_flat = None
+        if geo_residual is not None:
+            geo_res_flat = geo_residual.reshape(B * L, -1)
+
+        geo_ctx_flat = self['context'](obs, geo_residual=geo_res_flat)
         geo_ctx = geo_ctx_flat.reshape(B, L, -1)  # (B, L, context_dim)
 
         # 4. Stream A: content attention
@@ -685,10 +706,6 @@ class GeometricTransformerLayer(BaseTower):
         b_aligned = self['rotation'](b_out)
 
         # 7. Quaternion composition
-        #    w = content (what does standard attention think?)
-        #    i = aligned geometry (what does geometric attention think?)
-        #    j = disagreement (where do they diverge? — the surprise signal)
-        #    k = agreement (where do they converge? — the confidence signal)
         composed = self['compose'](
             arm_w=a_out, arm_i=b_aligned,
             arm_j=a_out - b_aligned, arm_k=a_out * b_aligned)
@@ -698,27 +715,40 @@ class GeometricTransformerLayer(BaseTower):
         g = self['gate'](torch.cat([x, decoded], dim=-1))
         x_out = g * decoded + (1 - g) * x
 
-        # 9. Build full geometric state — reshape everything back to (B, L, ...)
+        # 9. Update geometric residual stream
+        #    Patchwork features carry the constellation's interpretation.
+        #    Gated accumulation lets each layer contribute without overwriting.
+        pw_unflat = obs['patchwork'].reshape(B, L, -1)  # (B, L, pw_dim)
+        geo_update = self['geo_proj'](pw_unflat)
+        geo_gate = torch.sigmoid(self['geo_gate_proj'](pw_unflat))
+
+        if geo_residual is None:
+            geo_residual_out = geo_gate * geo_update
+        else:
+            geo_residual_out = geo_residual + geo_gate * geo_update
+
+        # 10. Build full geometric state
         def unflatten(t):
             if t is None: return None
-            if t.dim() == 1: return t.reshape(B, L)        # (B*L,) → (B, L)
-            return t.reshape(B, L, *t.shape[1:])            # (B*L, ...) → (B, L, ...)
+            if t.dim() == 1: return t.reshape(B, L)
+            return t.reshape(B, L, *t.shape[1:])
 
         geo_state = {
-            'embedding':      emb,                          # already (B, L, manifold_dim)
-            'geo_ctx':        geo_ctx,                      # already (B, L, context_dim)
+            'embedding':      emb,
+            'geo_ctx':        geo_ctx,
             'triangulation':  unflatten(obs['triangulation']),
             'cos_to_anchors': unflatten(obs['cos_to_anchors']),
             'assignment':     unflatten(obs['assignment']),
             'nearest':        unflatten(obs['nearest']),
             'patchwork':      unflatten(obs['patchwork']),
             'bridge':         unflatten(obs['bridge']),
-            'content':        a_out,                        # (B, L, D)
-            'geometric':      b_out,                        # (B, L, D) pre-rotation
-            'composed':       composed,                     # (B, L, 4*quat_dim)
+            'content':        a_out,
+            'geometric':      b_out,
+            'composed':       composed,
+            'geo_residual':   geo_residual_out,
         }
 
-        return x_out, geo_state
+        return x_out, geo_residual_out, geo_state
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -816,7 +846,7 @@ class GeometricTransformer(BaseTower):
             geo_states: list of per-layer geo_state dicts (if return_geo_state)
                 Each dict contains: embedding, geo_ctx, triangulation,
                 cos_to_anchors, assignment, nearest, patchwork, bridge,
-                content, geometric, composed
+                content, geometric, composed, geo_residual
         """
         if self.has('embed') and x.dtype in (torch.long, torch.int32, torch.int64):
             pos = torch.arange(x.shape[1], device=x.device)
@@ -824,14 +854,21 @@ class GeometricTransformer(BaseTower):
 
         geo_states = []
         has_xrot = self.has('cross_rot_0')
+        geo_residual = None  # First layer establishes the stream
 
         for i in range(self.n_layers):
-            x, geo_state = self[f'layer_{i}'](
-                x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+            x, geo_residual, geo_state = self[f'layer_{i}'](
+                x, geo_residual=geo_residual,
+                attn_mask=attn_mask, key_padding_mask=key_padding_mask)
             if return_geo_state:
                 geo_states.append(geo_state)
             if has_xrot and i < self.n_layers - 1:
                 x = self[f'cross_rot_{i}'](x)
+                # Note: geo_residual is NOT rotated by cross_rot.
+                # It lives in its own space — the patchwork interpretation
+                # space — which is independent of the hidden state basis.
+                # This is intentional: the geometric residual carries
+                # constellation observations, not hidden state features.
 
         x = self['final_norm'](x)
         if self.has('head'):
@@ -896,6 +933,17 @@ if __name__ == '__main__':
         if v is not None:
             shape = v.shape if hasattr(v, 'shape') else type(v).__name__
             print(f"    {k:<18s}: {shape}")
+
+    # Verify geo_residual stream continuity
+    assert 'geo_residual' in geos[0], "geo_residual missing from layer 0"
+    assert 'geo_residual' in geos[1], "geo_residual missing from layer 1"
+    gr0 = geos[0]['geo_residual']
+    gr1 = geos[1]['geo_residual']
+    print(f"\n  Geo residual stream:")
+    print(f"    Layer 0: {gr0.shape}  norm={gr0.norm(dim=-1).mean():.4f}")
+    print(f"    Layer 1: {gr1.shape}  norm={gr1.norm(dim=-1).mean():.4f}")
+    # Layer 1 should have accumulated from layer 0 — norms should differ
+    print(f"    Accumulated: {'YES' if gr1.norm() > gr0.norm() * 0.5 else 'NO (gate closed)'}")
 
     # Verify rotations
     for name, module in model.named_modules():
