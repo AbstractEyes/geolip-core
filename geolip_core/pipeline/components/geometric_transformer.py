@@ -290,42 +290,26 @@ class CayleyOrthogonal(TorchComponent):
     Q = (I - A)(I + A)^(-1) where A is skew-symmetric.
     det(Q) = 1 always. ‖R-I‖ ≈ 4.1 at convergence in SO(256).
 
-    Uses the parent router's cache system for rotation storage.
-    CompileRouter traces through cleanly — no Python-level guards.
+    Always computes fresh — no caching, no graph-lifetime issues,
+    clean trace for CompileRouter.
     """
     def __init__(self, name, dim):
         super().__init__(name)
         self.dim = dim
         self.A_upper = nn.Parameter(torch.zeros(dim * (dim - 1) // 2) * 0.01)
-        # Pre-compute index tensors as buffers for device tracking
+        # Static index tensors as buffers for device tracking
         idx = torch.triu_indices(dim, dim, offset=1)
         self.register_buffer('_triu_row', idx[0], persistent=False)
         self.register_buffer('_triu_col', idx[1], persistent=False)
         self.register_buffer('_eye', torch.eye(dim), persistent=False)
 
-    def _cache_key(self):
-        return f'{self.name}_rotation'
-
-    def compute_rotation(self):
+    def get_rotation(self):
         """Build SO(d) rotation from skew-symmetric parameters."""
         d = self.dim
         A = torch.zeros(d, d, device=self.A_upper.device, dtype=self.A_upper.dtype)
         A[self._triu_row, self._triu_col] = self.A_upper
         A = A - A.T
         return torch.linalg.solve(self._eye + A, self._eye - A)
-
-    def get_rotation(self):
-        """Get rotation, using parent router cache when available."""
-        # Check parent cache (managed by router lifecycle)
-        if hasattr(self, 'parent') and self.parent is not None:
-            key = self._cache_key()
-            cached = self.parent.cache_get(key)
-            if cached is not None:
-                return cached
-            R = self.compute_rotation()
-            self.parent.cache_set(key, R)
-            return R
-        return self.compute_rotation()
 
     def forward(self, x):
         """(..., dim) → (..., dim) rotated."""
