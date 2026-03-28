@@ -290,47 +290,42 @@ class CayleyOrthogonal(TorchComponent):
     Q = (I - A)(I + A)^(-1) where A is skew-symmetric.
     det(Q) = 1 always. ‖R-I‖ ≈ 4.1 at convergence in SO(256).
 
-    Caches the rotation matrix — only recomputes when A_upper changes
-    (i.e. after optimizer.step()). The solve is input-independent.
+    Uses the parent router's cache system for rotation storage.
+    CompileRouter traces through cleanly — no Python-level guards.
     """
     def __init__(self, name, dim):
         super().__init__(name)
         self.dim = dim
         self.A_upper = nn.Parameter(torch.zeros(dim * (dim - 1) // 2) * 0.01)
-        self._cached_R = None
-        self._cached_A_version = None
+        # Pre-compute index tensors as buffers for device tracking
+        idx = torch.triu_indices(dim, dim, offset=1)
+        self.register_buffer('_triu_row', idx[0], persistent=False)
+        self.register_buffer('_triu_col', idx[1], persistent=False)
+        self.register_buffer('_eye', torch.eye(dim), persistent=False)
 
-    def _param_version(self):
-        """Track parameter changes via data_ptr + requires_grad state."""
-        return self.A_upper.data_ptr(), self.A_upper._version
+    def _cache_key(self):
+        return f'{self.name}_rotation'
 
-    def get_rotation(self):
-        # During training: always recompute (autograd graph needed fresh)
-        # During eval: cache the rotation (params don't change)
-        if self.training:
-            self._cached_R = None
-
-        version = self._param_version()
-        if self._cached_R is not None and self._cached_A_version == version:
-            return self._cached_R
-
+    def compute_rotation(self):
+        """Build SO(d) rotation from skew-symmetric parameters."""
         d = self.dim
         A = torch.zeros(d, d, device=self.A_upper.device, dtype=self.A_upper.dtype)
-        idx = torch.triu_indices(d, d, offset=1, device=A.device)
-        A[idx[0], idx[1]] = self.A_upper
+        A[self._triu_row, self._triu_col] = self.A_upper
         A = A - A.T
-        I = torch.eye(d, device=A.device, dtype=A.dtype)
-        R = torch.linalg.solve(I + A, I - A)
+        return torch.linalg.solve(self._eye + A, self._eye - A)
 
-        if not self.training:
-            self._cached_R = R
-            self._cached_A_version = version
-        return R
-
-    def invalidate_cache(self):
-        """Call after optimizer.step() if needed."""
-        self._cached_R = None
-        self._cached_A_version = None
+    def get_rotation(self):
+        """Get rotation, using parent router cache when available."""
+        # Check parent cache (managed by router lifecycle)
+        if hasattr(self, 'parent') and self.parent is not None:
+            key = self._cache_key()
+            cached = self.parent.cache_get(key)
+            if cached is not None:
+                return cached
+            R = self.compute_rotation()
+            self.parent.cache_set(key, R)
+            return R
+        return self.compute_rotation()
 
     def forward(self, x):
         """(..., dim) → (..., dim) rotated."""
