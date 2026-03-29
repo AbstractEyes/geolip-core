@@ -291,7 +291,9 @@ def anchor_neighborhood_cm(anchors, n_neighbors=3):
     """
     A, D = anchors.shape
     dists = torch.cdist(anchors.unsqueeze(0), anchors.unsqueeze(0)).squeeze(0)
-    dists.fill_diagonal_(float('inf'))
+    # Mask self-distances without in-place mutation (compile-safe)
+    self_mask = torch.eye(A, device=anchors.device, dtype=anchors.dtype) * 1e12
+    dists = dists + self_mask
     _, nn_idx = dists.topk(n_neighbors, largest=False)  # (A, n_neighbors)
 
     # Build simplices: [anchor_a, neighbor_1, ..., neighbor_k] per anchor
@@ -382,11 +384,11 @@ class CMValidatedGate(nn.Module):
 
         gate_values = torch.sigmoid(self.gate_proj(features).squeeze(-1))
 
-        # ── Diagnostics ──
+        # ── Diagnostics (no .item() — compile-safe) ──
         with torch.no_grad():
-            active = (gate_values > 0.5).float().sum(-1).mean().item()
-            cm_positive_frac = (anchor_cm > 0).float().mean().item()
-            gate_mean = gate_values.mean().item()
+            active = (gate_values > 0.5).float().sum(-1).mean()
+            cm_positive_frac = (anchor_cm > 0).float().mean()
+            gate_mean = gate_values.mean()
 
         gate_info = {
             'active': active,
@@ -1077,9 +1079,9 @@ if __name__ == '__main__':
         cm_q = gs['cm_quality']
         gv = gs['gate_values']
         print(f"\n  Layer {i} CM gate:")
-        print(f"    active anchors:   {gi['active']:.1f} / {model.n_anchors}")
-        print(f"    gate mean:        {gi['gate_mean']:.4f}")
-        print(f"    cm_positive_frac: {gi['cm_positive_frac']:.3f}")
+        print(f"    active anchors:   {gi['active'].item():.1f} / {model.n_anchors}")
+        print(f"    gate mean:        {gi['gate_mean'].item():.4f}")
+        print(f"    cm_positive_frac: {gi['cm_positive_frac'].item():.3f}")
         print(f"    gate_values:      {gv.shape}  range=[{gv.min():.3f}, {gv.max():.3f}]")
         print(f"    cm_quality:       {cm_q.shape}  mean={cm_q.mean():.4f}")
 
