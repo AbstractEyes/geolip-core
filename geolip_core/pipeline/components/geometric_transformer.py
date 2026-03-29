@@ -1,10 +1,10 @@
 """
-Geometric Transformer v2 — CM-Validated Pipeline
+Geometric Transformer — CM-Validated Pipeline
 ==================================================
 Dual-stream transformer with CM-gated constellation observation,
 quaternion composition, and per-layer Cayley alignment.
 
-v2 changes from v1:
+CM-validated pipeline changes:
     - CM validity gate between association and curation (AnchorGate)
     - 4-stream PositionGeometricContext: anchor + structural + history + quality
     - CM-conditioned geometric residual accumulation (replaces blind learned gate)
@@ -647,7 +647,7 @@ class ContentAttention(TorchComponent):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GeometricTransformerLayer(BaseTower):
-    """One layer of the geometric transformer (v2 — CM validated).
+    """One layer of the geometric transformer (CM validated).
 
     Pipeline per layer:
         1. ManifoldProjection: h → emb on S^(d-1)
@@ -841,7 +841,7 @@ class GeometricTransformerLayer(BaseTower):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GeometricTransformer(BaseTower):
-    """Geometric Transformer v2 — CM-validated dual-stream.
+    """Geometric Transformer — CM-validated dual-stream.
 
     Stack of GeometricTransformerLayers with:
         - CM-gated observation at every layer
@@ -975,7 +975,7 @@ class GeometricTransformer(BaseTower):
     def param_report(self):
         total = 0
         name = getattr(self, '_tower_name', self.__class__.__name__)
-        print(f"\n  {name} — parameter report (v2 CM-validated)")
+        print(f"\n  {name} — parameter report (CM-validated)")
         print(f"  {'Component':<35s}  {'Params':>12s}")
         print(f"  {'─'*35}  {'─'*12}")
         for cname, module in self.named_children():
@@ -1046,14 +1046,14 @@ def geo_transformer_vision(name='geo_vit', n_layers=4, **kw):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    print("Geometric Transformer v2 — CM Validated — Self-Test")
+    print("Geometric Transformer — CM Validated — Self-Test")
     print(f"  geolip_core available: {_HAS_GEOLIP}")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ── Build small model ──
-    model = geo_transformer_small('test_v2', n_layers=2)
+    model = geo_transformer_small('test_cm', n_layers=2)
     if hasattr(model, 'network_to'):
         model.network_to(device=device, strict=False)
     else:
@@ -1146,5 +1146,5 @@ if __name__ == '__main__':
     print(f"    total:      {total_loss.item():.4f}")
 
     print(f"\n{'='*60}")
-    print(f"  PASSED — v2 CM-validated pipeline operational")
+    print(f"  PASSED — CM-validated pipeline operational")
     print(f"{'='*60}")
