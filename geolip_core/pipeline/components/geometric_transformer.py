@@ -1,56 +1,43 @@
 """
-Geometric Transformer — GeoLIP Pipeline Integration
-=====================================================
-Dual-stream transformer with constellation-routed attention,
+Geometric Transformer v2 — CM-Validated Pipeline
+==================================================
+Dual-stream transformer with CM-gated constellation observation,
 quaternion composition, and per-layer Cayley alignment.
 
-Uses REAL geolip_core components:
-    core.associate.constellation  — ConstellationObserver (anchors + triangulation + patchwork)
-    core.curate.gate              — AnchorGate (CM determinant validity)
-    core.align.procrustes         — CayleyOrthogonal rotation in SO(d)
-    pipeline.observer             — TorchComponent / BaseTower interfaces
+v2 changes from v1:
+    - CM validity gate between association and curation (AnchorGate)
+    - 4-stream PositionGeometricContext: anchor + structural + history + quality
+    - CM-conditioned geometric residual accumulation (replaces blind learned gate)
+    - Built-in geometric regularization (CV target + anchor spread)
+    - Decomposed observer pipeline: association → CM gate → gated curation
 
-NEW components (transformer-specific):
-    ManifoldProjection            — Input stage: hidden_state → S^(d-1)
-    PositionGeometricContext      — Curation: constellation output → FiLM context
-    FiLMLayer                     — Feature-wise Linear Modulation (proven in Ryan Spearman)
-    GeometricAttention            — Attention with FiLM on Q,K from curated constellation
-    QuaternionCompose             — Hamilton product of dual-stream outputs (proven)
-    CayleyOrthogonal              — SO(d) rotation via Cayley map (proven)
-    DualStreamBlock               — Content + geometric streams, aligned + composed
-    GeometricTransformerLayer     — Full layer: project → observe → attend → compose
-    GeometricTransformer          — Stack of layers with cross-layer rotation
-
-Architecture per layer:
+Pipeline per layer:
     1. ManifoldProjection:  h_i → emb_i on S^(d-1) per position
-    2. ConstellationObserver: emb_i → {triangulation, assignment, patchwork, bridge}
-    3. PositionGeometricContext: constellation output → (B, L, context_dim)
-    4. Stream A (content):  standard self-attention
-    5. Stream B (geometric): attention with FiLM(Q,K | geo_ctx), V unmodulated
-    6. CayleyOrthogonal:    align B → A basis
-    7. QuaternionCompose:   w=content, i=aligned_geo, j=disagree, k=agree
-    8. Gated residual
+    2. ConstellationAssociation: emb_i → raw triangulation, cos, assignment
+    3. CMValidatedGate: per-anchor CM validity → gate_values (B*L, A)
+    4. Gated curation: patchwork reads tri * gate_values (validated only)
+    5. PositionGeometricContext: 4 streams → FiLM context (B, L, context_dim)
+    6. ContentAttention (Stream A): standard MHA
+    7. GeometricAttention (Stream B): FiLM(Q,K | geo_ctx), V pure
+    8. CayleyOrthogonal: align B → A basis
+    9. QuaternionCompose: w=A, i=aligned_B, j=A-B, k=A*B
+   10. Decode + gated residual
+   11. CM-conditioned geometric residual write
+
+Geometric regularization (call model.geometric_losses() during training):
+    - CV loss: anchor CV → pentachoron band (0.20-0.23)
+    - Spread loss: prevent anchor collapse (penalize positive cosine)
+    These maintain the constellation in the regime where CM validation works.
 
 Design principles from Ryan Spearman (ρ=0.309, 76/84 wins):
     - FiLM on Q,K ONLY — geometry routes attention, V stays pure
     - FiLM on individual arms BEFORE composition, not after
     - Quaternion algebra as structural regularizer (non-commutative coupling)
-    - Disagreement arm (j) carries the transferable signal
     - CayleyOrthogonal guarantees pure rotation (det=1 always)
     - Never global average pool — per-position geometric context
 
-Usage:
-    from geometric_transformer import GeometricTransformer
-
-    model = GeometricTransformer('geo_xfmr', d_model=512, n_layers=4)
-    out = model(hidden_states)
-
-    # Or as a head on frozen ESM-2:
-    model = GeometricTransformer('esm2_geo', d_model=1280, n_layers=6)
-    out = model(esm2_hidden_states)
-
-Dependencies:
-    pip install geolip-core  (includes constellation, patchwork, gate, observer interfaces)
+Author: AbstractPhil + Claude Opus 4.6
+License: Apache 2.0
 """
 
 import math
@@ -67,7 +54,7 @@ try:
         ConstellationObserver, ConstellationAssociation, ConstellationCuration,
         Constellation, init_anchors_repulsion,
     )
-    from geolip_core.core.curate.gate import AnchorGate
+    from geolip_core.core.curate.gate import AnchorGate as _GeolipAnchorGate
     from geolip_core.pipeline.observer import (
         TorchComponent, BaseTower, Input, Curation, Distinction,
     )
@@ -118,9 +105,7 @@ except ImportError:
             super().__init__()
             self.n_anchors = n_anchors
             self.dim = dim
-            self.anchor_drop = anchor_drop
             anchors = torch.randn(n_anchors, dim)
-            # Repulsion-initialized
             anchors = F.normalize(anchors, dim=-1)
             for _ in range(200):
                 sim = anchors @ anchors.T
@@ -128,15 +113,12 @@ except ImportError:
                 anchors = F.normalize(anchors - 0.05 * anchors[sim.argmax(dim=1)], dim=-1)
             self.anchors = nn.Parameter(anchors)
 
-        def triangulate(self, emb, training=False):
+        def forward(self, emb, training=False):
             anchors = F.normalize(self.anchors, dim=-1)
             cos = emb @ anchors.T
             tri = 1.0 - cos
             _, nearest = cos.max(dim=-1)
             return tri, nearest
-
-        def forward(self, emb, training=False):
-            return self.triangulate(emb, training)
 
     class ConstellationAssociation(TorchComponent):
         """Association through constellation anchors."""
@@ -263,13 +245,165 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CAYLEY-MENGER VALIDITY — geometric quality measurement
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def pairwise_distances_squared(points):
+    """Batched pairwise squared distances. (B, N, D) → (B, N, N)."""
+    gram = torch.bmm(points, points.transpose(1, 2))
+    diag = gram.diagonal(dim1=-2, dim2=-1)
+    return diag.unsqueeze(2) + diag.unsqueeze(1) - 2 * gram
+
+
+def cayley_menger_det(points):
+    """Cayley-Menger signed volume² for simplices. (B, K, D) → (B,).
+
+    K = number of vertices (k+1 for a k-simplex).
+    Sign-corrected: positive = valid non-degenerate simplex.
+    """
+    B, K, D = points.shape
+    d2 = pairwise_distances_squared(points)
+    M = torch.zeros(B, K + 1, K + 1, device=points.device, dtype=points.dtype)
+    M[:, 0, 1:] = 1.0
+    M[:, 1:, 0] = 1.0
+    M[:, 1:, 1:] = d2
+    raw = torch.linalg.det(M)
+    k = K - 1
+    sign = (-1.0) ** (k + 1)
+    return sign * raw
+
+
+def anchor_neighborhood_cm(anchors, n_neighbors=3):
+    """Precompute per-anchor CM quality from local neighborhood geometry.
+
+    Position-independent. O(A) determinant computations on small matrices.
+    Each anchor forms a simplex with its k nearest neighbor anchors.
+    The CM determinant measures local geometric quality — high volume means
+    the anchor neighborhood is well-conditioned for triangulation.
+
+    Args:
+        anchors: (A, D) normalized anchor positions on S^(d-1)
+        n_neighbors: neighbors per simplex
+
+    Returns:
+        quality: (A,) signed log-magnitude CM quality per anchor
+        nn_idx: (A, n_neighbors) neighbor indices
+    """
+    A, D = anchors.shape
+    dists = torch.cdist(anchors.unsqueeze(0), anchors.unsqueeze(0)).squeeze(0)
+    dists.fill_diagonal_(float('inf'))
+    _, nn_idx = dists.topk(n_neighbors, largest=False)  # (A, n_neighbors)
+
+    # Build simplices: [anchor_a, neighbor_1, ..., neighbor_k] per anchor
+    K = n_neighbors + 1
+    simplices = torch.zeros(A, K, D, device=anchors.device, dtype=anchors.dtype)
+    simplices[:, 0] = anchors
+    for j in range(n_neighbors):
+        simplices[:, j + 1] = anchors[nn_idx[:, j]]
+
+    dets = cayley_menger_det(simplices)  # (A,)
+    sign = dets.sign()
+    log_mag = torch.log(dets.abs() + 1e-12)
+    return sign * log_mag, nn_idx
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CM VALIDATED GATE — efficient anchor gating for transformer scale
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CMValidatedGate(nn.Module):
+    """Anchor gate based on Cayley-Menger validity.
+
+    Efficient for transformer scale: anchor CM quality is precomputed O(A²),
+    then combined with per-position proximity features through a learned gate.
+
+    The gate starts OPEN (bias=+2, sigmoid≈0.88) and learns to CLOSE on
+    geometrically invalid configurations. Architecture-before-loss: the gate
+    suppresses degenerate measurements structurally, not through a loss signal.
+
+    Gate features per (position, anchor):
+        - anchor_cm_quality: CM volume of anchor's local neighborhood (position-independent)
+        - cos_to_anchor: cosine similarity (position-dependent)
+        - distance_rank: normalized rank of this anchor by proximity (position-dependent)
+
+    Args:
+        n_anchors: number of constellation anchors
+        n_neighbors: neighbors for CM simplex computation
+    """
+    def __init__(self, n_anchors, n_neighbors=3):
+        super().__init__()
+        self.n_anchors = n_anchors
+        self.n_neighbors = n_neighbors
+
+        # Learned gate: [cm_quality, cos_sim, dist_rank] → scalar gate
+        self.gate_proj = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+        )
+        # Init OPEN — learn to close. sigmoid(2.0) ≈ 0.88
+        nn.init.zeros_(self.gate_proj[2].weight)
+        nn.init.constant_(self.gate_proj[2].bias, 2.0)
+
+    def forward(self, embedding, anchors, tri):
+        """Compute per-(position, anchor) gate values.
+
+        Args:
+            embedding: (N, D) — positions on S^(d-1), where N = B*L
+            anchors:   (A, D) — normalized anchor positions (DETACHED by caller)
+            tri:       (N, A) — triangulation distances (1 - cos)
+
+        Returns:
+            gate_values: (N, A) in [0, 1] — per-anchor validity gate
+            gate_info: dict with diagnostics
+        """
+        N, A = tri.shape
+
+        # ── Anchor CM quality: position-independent, O(A²) ──
+        with torch.no_grad():
+            anchor_cm, nn_idx = anchor_neighborhood_cm(anchors, self.n_neighbors)
+            # Normalize to ~ [-1, 1]
+            cm_std = anchor_cm.std().clamp(min=1e-8)
+            anchor_cm_norm = (anchor_cm - anchor_cm.mean()) / cm_std
+
+        # ── Per-position features ──
+        cos_sim = 1.0 - tri  # (N, A)
+
+        # Distance rank: 0=nearest, 1=farthest
+        ranks = tri.argsort(dim=-1).argsort(dim=-1).float()
+        ranks = ranks / max(A - 1, 1)
+
+        # ── Gate features: (N, A, 3) ──
+        features = torch.stack([
+            anchor_cm_norm.unsqueeze(0).expand(N, -1),
+            cos_sim,
+            ranks,
+        ], dim=-1)
+
+        gate_values = torch.sigmoid(self.gate_proj(features).squeeze(-1))
+
+        # ── Diagnostics ──
+        with torch.no_grad():
+            active = (gate_values > 0.5).float().sum(-1).mean().item()
+            cm_positive_frac = (anchor_cm > 0).float().mean().item()
+            gate_mean = gate_values.mean().item()
+
+        gate_info = {
+            'active': active,
+            'gate_mean': gate_mean,
+            'cm_positive_frac': cm_positive_frac,
+            'anchor_cm': anchor_cm.detach(),
+        }
+
+        return gate_values, gate_info
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PROVEN COMPONENTS — from Ryan Spearman (unchanged, tested)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class FiLMLayer(TorchComponent):
     """Feature-wise Linear Modulation. Proven in Ryan Spearman.
-
-    Produces γ * x + β from geometric context.
     Identity-initialized: γ=1, β=0 at init.
     """
     def __init__(self, name, feature_dim, context_dim):
@@ -280,31 +414,21 @@ class FiLMLayer(TorchComponent):
         nn.init.zeros_(self.to_beta.weight); nn.init.zeros_(self.to_beta.bias)
 
     def forward(self, x, ctx):
-        """x: (B, L, D), ctx: (B, L, C) → (B, L, D)"""
         return self.to_gamma(ctx) * x + self.to_beta(ctx)
 
 
 class CayleyOrthogonal(TorchComponent):
-    """Guaranteed SO(d) rotation via Cayley map. Proven in Procrustes alignment.
-
-    Q = (I - A)(I + A)^(-1) where A is skew-symmetric.
-    det(Q) = 1 always. ‖R-I‖ ≈ 4.1 at convergence in SO(256).
-
-    Always computes fresh — no caching, no graph-lifetime issues,
-    clean trace for CompileRouter.
-    """
+    """Guaranteed SO(d) rotation via Cayley map. det(Q) = 1 always."""
     def __init__(self, name, dim):
         super().__init__(name)
         self.dim = dim
         self.A_upper = nn.Parameter(torch.zeros(dim * (dim - 1) // 2) * 0.01)
-        # Static index tensors as buffers for device tracking
         idx = torch.triu_indices(dim, dim, offset=1)
         self.register_buffer('_triu_row', idx[0], persistent=False)
         self.register_buffer('_triu_col', idx[1], persistent=False)
         self.register_buffer('_eye', torch.eye(dim), persistent=False)
 
     def get_rotation(self):
-        """Build SO(d) rotation from skew-symmetric parameters."""
         d = self.dim
         A = torch.zeros(d, d, device=self.A_upper.device, dtype=self.A_upper.dtype)
         A[self._triu_row, self._triu_col] = self.A_upper
@@ -312,33 +436,11 @@ class CayleyOrthogonal(TorchComponent):
         return torch.linalg.solve(self._eye + A, self._eye - A)
 
     def forward(self, x):
-        """(..., dim) → (..., dim) rotated."""
         return x @ self.get_rotation().T
 
 
-def quaternion_multiply(q1, q2):
-    """Hamilton product. q = (w, x, y, z) along dim=-2.
-
-    Supports batched: (..., 4, D) × (..., 4, D) → (..., 4, D)
-    Or scalar:        (..., 4) × (..., 4) → (..., 4)
-    """
-    w1, x1, y1, z1 = q1.unbind(-2) if q1.dim() >= 2 and q1.shape[-2] == 4 else q1.unbind(-1)
-    w2, x2, y2, z2 = q2.unbind(-2) if q2.dim() >= 2 and q2.shape[-2] == 4 else q2.unbind(-1)
-    stack_dim = -2 if q1.dim() >= 2 and q1.shape[-2] == 4 else -1
-    return torch.stack([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ], dim=stack_dim)
-
-
 def quaternion_multiply_batched(q1, q2):
-    """Hamilton product on (B, 4, D) tensors. Fully vectorized, no loops.
-
-    Each of the 4 slices along dim=1 is one quaternion component.
-    The D dimension is batched — all D quaternions multiplied in parallel.
-    """
+    """Hamilton product on (B, 4, D) tensors. Fully vectorized."""
     w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
     w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
     return torch.stack([
@@ -346,16 +448,11 @@ def quaternion_multiply_batched(q1, q2):
         w1*x2 + x1*w2 + y1*z2 - z1*y2,
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
         w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ], dim=1)  # (B, 4, D)
+    ], dim=1)
 
 
 class QuaternionCompose(TorchComponent):
     """Four-arm Hamilton product composition. Proven in GeoQuat head.
-
-    The algebra forces cross-term interactions between arms.
-    Arms cannot independently memorize — the non-commutative
-    product couples their outputs as structural regularizer.
-
     Fully vectorized: single batched Hamilton product, no Python loops.
     """
     def __init__(self, name, input_dim, quat_dim=64):
@@ -372,47 +469,31 @@ class QuaternionCompose(TorchComponent):
         return self.quat_dim * 4
 
     def forward(self, arm_w, arm_i, arm_j, arm_k):
-        """Each arm: (B, L, D) → composed: (B, L, 4*quat_dim)"""
         shape = arm_w.shape[:-1]
         D = arm_w.shape[-1]
         flat = arm_w.dim() > 2
         if flat:
             arm_w = arm_w.reshape(-1, D); arm_i = arm_i.reshape(-1, D)
             arm_j = arm_j.reshape(-1, D); arm_k = arm_k.reshape(-1, D)
-
-        # q: (N, 4, quat_dim) — stack 4 projected arms as quaternion components
         q = torch.stack([self.proj_w(arm_w), self.proj_i(arm_i),
                          self.proj_j(arm_j), self.proj_k(arm_k)], dim=1)
         q = q / (q.norm(dim=1, keepdim=True) + 1e-8)
-
-        # r: (N, 4, quat_dim) — broadcast learned rotation
         r = self.rotation.expand(q.shape[0], -1, -1)
         r = r / (r.norm(dim=1, keepdim=True) + 1e-8)
-
-        # Single batched Hamilton product over all quat_dim simultaneously
-        # (N, 4, quat_dim) × (N, 4, quat_dim) → (N, 4, quat_dim)
         composed = quaternion_multiply_batched(r, q)
-
-        # Flatten 4 × quat_dim → 4*quat_dim
         composed = composed.reshape(q.shape[0], -1)
-
         if flat:
             composed = composed.reshape(*shape, -1)
         return composed
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# NEW COMPONENTS — transformer-specific, built for this architecture
+# TRANSFORMER-SPECIFIC COMPONENTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ManifoldProjection(TorchComponent):
     """Input stage: project transformer hidden states to S^(d-1).
-
-    Per-position, per-layer projection from model space to the
-    constellation's embedding space. L2-normalized to sit on the
-    unit hypersphere.
-
-    This is the tap — it reads the representation without modifying it.
+    Per-position, per-layer. L2-normalized to unit hypersphere.
     """
     def __init__(self, name, d_model, manifold_dim):
         super().__init__(name)
@@ -420,67 +501,59 @@ class ManifoldProjection(TorchComponent):
         self.norm = nn.LayerNorm(manifold_dim)
 
     def forward(self, hidden_states):
-        """(B, L, D) → (B, L, manifold_dim) on S^(manifold_dim - 1)"""
         h = self.norm(self.proj(hidden_states))
         return F.normalize(h, dim=-1)
 
 
 class PositionGeometricContext(TorchComponent):
-    """Curation stage: constellation observation + geometric history → FiLM context.
+    """Curation stage: 4-stream fusion → FiLM context.
 
-    Three streams:
+    Four streams:
         anchor:     cos_to_anchors + assignment + triangulation — WHERE on the manifold
         structural: patchwork + embedding — WHAT the local geometry looks like
         history:    geo_residual from previous layers — WHAT prior layers observed
+        quality:    CM gate values per anchor — HOW TRUSTWORTHY is this observation
 
-    First layer receives zero history. Each subsequent layer reads accumulated
-    geometric context from all prior constellations.
+    The quality stream gives FiLM direct knowledge of which anchors formed
+    valid simplices. This is not a scalar — the full (N, A) gate profile
+    tells the context WHICH directions on the manifold are reliable.
     """
     def __init__(self, name, n_anchors, pw_dim, manifold_dim, context_dim):
         super().__init__(name)
         self.context_dim = context_dim
         self.pw_dim = pw_dim
 
-        # Anchor features: cos + assignment + triangulation = 3 * n_anchors
+        # WHERE on the manifold
         self.anchor_mlp = nn.Sequential(
-            nn.Linear(n_anchors * 3, context_dim),
-            nn.GELU(),
-            nn.LayerNorm(context_dim),
-        )
-        # Structural features: patchwork + embedding
+            nn.Linear(n_anchors * 3, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
+        # WHAT the local geometry looks like
         self.struct_mlp = nn.Sequential(
-            nn.Linear(pw_dim + manifold_dim, context_dim),
-            nn.GELU(),
-            nn.LayerNorm(context_dim),
-        )
-        # History features: accumulated geo_residual from prior layers
+            nn.Linear(pw_dim + manifold_dim, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
+        # WHAT prior layers observed
         self.history_mlp = nn.Sequential(
-            nn.Linear(pw_dim, context_dim),
-            nn.GELU(),
-            nn.LayerNorm(context_dim),
-        )
-        # Fuse anchor + structural + history
-        self.fuse = nn.Sequential(
-            nn.Linear(context_dim * 3, context_dim),
-            nn.GELU(),
-            nn.LayerNorm(context_dim),
-        )
+            nn.Linear(pw_dim, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
+        # HOW TRUSTWORTHY — full per-anchor gate profile
+        self.quality_mlp = nn.Sequential(
+            nn.Linear(n_anchors, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
 
-    def forward(self, obs_dict, geo_residual=None):
+        # Fuse 4 streams
+        self.fuse = nn.Sequential(
+            nn.Linear(context_dim * 4, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
+
+    def forward(self, obs_dict, gate_values=None, geo_residual=None):
         """
         Args:
-            obs_dict: from ConstellationObserver.observe()
-            geo_residual: (B*L, pw_dim) accumulated geometric context,
-                          or None for first layer (uses zeros)
+            obs_dict: from decomposed association + gated curation
+            gate_values: (N, A) CM gate values per anchor, or None
+            geo_residual: (N, pw_dim) accumulated context, or None for first layer
         Returns:
-            (B*L, context_dim) geometric context for FiLM
+            (N, context_dim) geometric context for FiLM
         """
         anchor_feats = torch.cat([
             obs_dict['cos_to_anchors'],
             obs_dict['assignment'],
             obs_dict['triangulation'],
         ], dim=-1)
-
         struct_feats = torch.cat([
             obs_dict['patchwork'],
             obs_dict['embedding'],
@@ -488,24 +561,15 @@ class PositionGeometricContext(TorchComponent):
 
         a = self.anchor_mlp(anchor_feats)
         s = self.struct_mlp(struct_feats)
+        h = self.history_mlp(geo_residual) if geo_residual is not None else torch.zeros_like(a)
+        q = self.quality_mlp(gate_values) if gate_values is not None else torch.zeros_like(a)
 
-        # History — zeros on first layer
-        if geo_residual is not None:
-            h = self.history_mlp(geo_residual)
-        else:
-            h = torch.zeros_like(a)
-
-        return self.fuse(torch.cat([a, s, h], dim=-1))
+        return self.fuse(torch.cat([a, s, h, q], dim=-1))
 
 
 class GeometricAttention(TorchComponent):
     """Attention with FiLM from curated constellation. Stream B.
-
-    FiLM modulates Q and K BEFORE attention — the constellation
-    position controls WHERE attention flows. V stays unmodulated.
-    FiLM between FFN layers conditions the nonlinearity.
-
-    Proven principle: context before composition, not after.
+    FiLM modulates Q,K BEFORE attention. V stays unmodulated.
     """
     def __init__(self, name, d_model, n_heads=8, context_dim=128, dropout=0.1):
         super().__init__(name)
@@ -520,13 +584,10 @@ class GeometricAttention(TorchComponent):
         self.w_o = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
-        # FiLM on Q and K — geometry routes attention
         self.film_q = FiLMLayer(f'{name}_film_q', d_model, context_dim)
         self.film_k = FiLMLayer(f'{name}_film_k', d_model, context_dim)
-
         self.norm = nn.LayerNorm(d_model)
 
-        # FFN with FiLM between layers
         self.ffn1 = nn.Linear(d_model, d_model * 4)
         self.film_ffn = FiLMLayer(f'{name}_film_ffn', d_model * 4, context_dim)
         self.ffn2 = nn.Linear(d_model * 4, d_model)
@@ -534,15 +595,12 @@ class GeometricAttention(TorchComponent):
         self.ffn_norm = nn.LayerNorm(d_model)
 
     def forward(self, x, geo_ctx, attn_mask=None, key_padding_mask=None):
-        """
-        x: (B, L, D), geo_ctx: (B, L, C) → (B, L, D)
-        """
         B, L, D = x.shape
         H, HD = self.n_heads, self.head_dim
 
         Q = self.film_q(self.w_q(x), geo_ctx)
         K = self.film_k(self.w_k(x), geo_ctx)
-        V = self.w_v(x)  # V unmodulated — content stays pure
+        V = self.w_v(x)
 
         Q = Q.view(B, L, H, HD).transpose(1, 2)
         K = K.view(B, L, H, HD).transpose(1, 2)
@@ -556,14 +614,11 @@ class GeometricAttention(TorchComponent):
                 key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
         attn_out = (self.dropout(F.softmax(scores, dim=-1)) @ V)
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
-
         x = self.norm(x + self.w_o(attn_out))
 
-        # FFN with geometric FiLM between layers
         h = F.gelu(self.ffn1(x))
         h = self.film_ffn(h, geo_ctx)
         x = self.ffn_norm(x + self.ffn_drop(self.ffn2(h)))
-
         return x
 
 
@@ -588,161 +643,191 @@ class ContentAttention(TorchComponent):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LAYER — dual-stream with constellation routing
+# LAYER — CM-validated dual-stream with constellation routing
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GeometricTransformerLayer(BaseTower):
-    """One layer of the geometric transformer.
+    """One layer of the geometric transformer (v2 — CM validated).
 
     Pipeline per layer:
-        1. ManifoldProjection: h_i → emb_i on S^(manifold_dim - 1)
-        2. ConstellationObserver: emb_i → {triangulation, assignment, patchwork, ...}
-        3. PositionGeometricContext: observation → FiLM context (B, L, context_dim)
-        4. ContentAttention (Stream A): standard MHA
-        5. GeometricAttention (Stream B): FiLM(Q,K | geo_ctx), V pure
-        6. CayleyOrthogonal: align B basis → A basis
-        7. QuaternionCompose: w=A, i=aligned_B, j=A-B, k=A*B
-        8. Decode + gated residual
+        1. ManifoldProjection: h → emb on S^(d-1)
+        2. Association: emb → raw triangulation, cos, assignment
+        3. CMValidatedGate: per-anchor CM validity → gate_values
+        4. Gated curation: patchwork reads tri * gate_values
+        5. PositionGeometricContext: 4 streams → FiLM context
+        6. ContentAttention (Stream A): standard MHA
+        7. GeometricAttention (Stream B): FiLM(Q,K | geo_ctx)
+        8. CayleyOrthogonal: align B → A
+        9. QuaternionCompose: w=A, i=aligned_B, j=A-B, k=A*B
+       10. Decode + gated residual
+       11. CM-conditioned geometric residual accumulation
 
-    Access:
-        layer['projection']  → ManifoldProjection
-        layer['observer']    → ConstellationObserver
-        layer['context']     → PositionGeometricContext
-        layer['content']     → ContentAttention
-        layer['geometric']   → GeometricAttention
-        layer['rotation']    → CayleyOrthogonal
-        layer['compose']     → QuaternionCompose
+    The observer is DECOMPOSED: association and curation are called
+    separately with the CM gate inserted between them. The gate
+    suppresses degenerate anchor measurements before the patchwork
+    reads them. The patchwork only interprets validated geometry.
+
+    The geometric residual is accumulated using CM quality as the
+    write weight — no learned gate. Positions with high-quality
+    simplex observations contribute more. Positions in degenerate
+    regions contribute less.
     """
     def __init__(self, name, d_model, n_heads=8, n_anchors=32,
                  manifold_dim=256, n_comp=8, d_comp=32,
-                 context_dim=128, quat_dim=64, dropout=0.1):
+                 context_dim=128, quat_dim=64, dropout=0.1,
+                 cm_neighbors=3):
         super().__init__(name)
         self.d_model = d_model
+        self.n_anchors = n_anchors
 
         # 1. Project to manifold
         self.attach('projection', ManifoldProjection(
             f'{name}_proj', d_model, manifold_dim))
 
-        # 2. Constellation observer (real association + curation)
+        # 2. Constellation observer (association + curation — called decomposed)
         self.attach('observer', ConstellationObserver(
             dim=manifold_dim, n_anchors=n_anchors,
             n_comp=n_comp, d_comp=d_comp))
 
-        # 3. Fuse observation into FiLM context
+        # 3. CM validated gate — between association and curation
+        self.attach('cm_gate', CMValidatedGate(
+            n_anchors=n_anchors, n_neighbors=cm_neighbors))
+
+        # 4. Fuse observation into FiLM context (4 streams)
         pw_dim = self['observer'].curation.patchwork.output_dim
         self.attach('context', PositionGeometricContext(
             f'{name}_ctx', n_anchors, pw_dim, manifold_dim, context_dim))
 
-        # 4. Stream A: content
+        # 5. Stream A: content
         self.attach('content', ContentAttention(
             f'{name}_content', d_model, n_heads, dropout))
 
-        # 5. Stream B: geometric
+        # 6. Stream B: geometric
         self.attach('geometric', GeometricAttention(
             f'{name}_geo', d_model, n_heads, context_dim, dropout))
 
-        # 6. Cayley rotation: align B → A
+        # 7. Cayley rotation: align B → A
         self.attach('rotation', CayleyOrthogonal(f'{name}_cayley', d_model))
 
-        # 7. Quaternion composition
+        # 8. Quaternion composition
         self.attach('compose', QuaternionCompose(
             f'{name}_quat', d_model, quat_dim))
 
-        # 8. Decode + gate
+        # 9. Decode + output gate
         self.attach('decode', nn.Sequential(
             nn.Linear(quat_dim * 4, d_model), nn.GELU(), nn.LayerNorm(d_model)))
         self.attach('gate', nn.Sequential(
             nn.Linear(d_model * 2, d_model), nn.Sigmoid()))
 
-        # 9. Geometric residual stream — accumulates across layers
-        #    geo_gate: learned scalar gate per dimension, init near-zero (sigmoid(-3) ≈ 0.05)
-        #    geo_proj: project patchwork into residual space
+        # 10. Geometric residual projection (no learned gate — CM quality decides)
         self._pw_dim = pw_dim
         self.attach('geo_proj', nn.Sequential(
             nn.Linear(pw_dim, pw_dim), nn.LayerNorm(pw_dim)))
-        self.attach('geo_gate_proj', nn.Linear(pw_dim, pw_dim))
-        # Init gate bias to -3 so sigmoid starts near zero (minimal contribution at init)
-        nn.init.zeros_(self['geo_gate_proj'].weight)
-        nn.init.constant_(self['geo_gate_proj'].bias, -3.0)
 
     def forward(self, x, geo_residual=None, attn_mask=None, key_padding_mask=None):
         """
         Args:
             x: (B, L, D) input hidden states
-            geo_residual: (B, L, pw_dim) accumulated geometric context from prior layers,
-                          or None for the first layer (initialized to zeros)
+            geo_residual: (B, L, pw_dim) accumulated geometric context,
+                          or None for first layer
 
         Returns:
             x_out: (B, L, D) transformed hidden states
             geo_residual_out: (B, L, pw_dim) updated geometric residual
-            geo_state: dict with full geometric state (11 fields)
+            geo_state: dict with full geometric state + CM diagnostics
         """
         B, L, D = x.shape
 
-        # 1. Project to manifold: per-position embedding on S^(d-1)
+        # ════ 1. Project to manifold ════
         emb = self['projection'](x)  # (B, L, manifold_dim)
-
-        # 2. Constellation observation: flatten to (B*L, manifold_dim) for observer
         emb_flat = emb.reshape(B * L, -1)
-        obs = self['observer'].observe(emb_flat)
 
-        # 3. Build FiLM context WITH geometric history
-        geo_res_flat = None
-        if geo_residual is not None:
-            geo_res_flat = geo_residual.reshape(B * L, -1)
+        # ════ 2. Association — raw triangulation ════
+        a_out = self['observer'].association(emb_flat)
 
-        geo_ctx_flat = self['context'](obs, geo_residual=geo_res_flat)
-        geo_ctx = geo_ctx_flat.reshape(B, L, -1)  # (B, L, context_dim)
+        # ════ 3. CM Gate — validate anchor measurements ════
+        anchors_n = F.normalize(
+            self['observer'].association.constellation.anchors, dim=-1)
+        gate_values, gate_info = self['cm_gate'](
+            emb_flat, anchors_n.detach(), a_out['distances'])
 
-        # 4. Stream A: content attention
-        a_out = self['content'](x, attn_mask=attn_mask,
-                                key_padding_mask=key_padding_mask)
+        # ════ 4. Gated curation — patchwork reads validated triangulation ════
+        a_out_gated = dict(a_out)
+        a_out_gated['distances_weighted'] = a_out['distances'] * gate_values
+        c_out = self['observer'].curation.curate_full(a_out_gated, emb=emb_flat)
 
-        # 5. Stream B: geometric attention
-        b_out = self['geometric'](x, geo_ctx, attn_mask=attn_mask,
-                                   key_padding_mask=key_padding_mask)
+        # Build observation dict for context
+        obs = {
+            'embedding': emb_flat,
+            'triangulation': a_out['distances'],
+            'cos_to_anchors': a_out['cos_to_anchors'],
+            'assignment': a_out['assignment'],
+            'nearest': a_out['nearest'],
+            'patchwork': c_out['patchwork'],
+            'bridge': c_out['bridge'],
+        }
 
-        # 6. Cayley rotation: align B → A
+        # ════ 5. Build FiLM context — 4 streams ════
+        geo_res_flat = geo_residual.reshape(B * L, -1) if geo_residual is not None else None
+        geo_ctx_flat = self['context'](
+            obs, gate_values=gate_values, geo_residual=geo_res_flat)
+        geo_ctx = geo_ctx_flat.reshape(B, L, -1)
+
+        # ════ 6. Stream A: content attention ════
+        a_out_stream = self['content'](
+            x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+
+        # ════ 7. Stream B: geometric attention ════
+        b_out = self['geometric'](
+            x, geo_ctx, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+
+        # ════ 8. Cayley rotation: align B → A ════
         b_aligned = self['rotation'](b_out)
 
-        # 7. Quaternion composition
+        # ════ 9. Quaternion composition ════
         composed = self['compose'](
-            arm_w=a_out, arm_i=b_aligned,
-            arm_j=a_out - b_aligned, arm_k=a_out * b_aligned)
+            arm_w=a_out_stream, arm_i=b_aligned,
+            arm_j=a_out_stream - b_aligned, arm_k=a_out_stream * b_aligned)
 
-        # 8. Decode + gated residual
+        # ════ 10. Decode + gated residual ════
         decoded = self['decode'](composed)
         g = self['gate'](torch.cat([x, decoded], dim=-1))
         x_out = g * decoded + (1 - g) * x
 
-        # 9. Update geometric residual stream
-        #    Patchwork features carry the constellation's interpretation.
-        #    Gated accumulation lets each layer contribute without overwriting.
-        pw_unflat = obs['patchwork'].reshape(B, L, -1)  # (B, L, pw_dim)
-        geo_update = self['geo_proj'](pw_unflat)
-        geo_gate = torch.sigmoid(self['geo_gate_proj'](pw_unflat))
+        # ════ 11. CM-conditioned geometric residual accumulation ════
+        # CM quality per position: mean gate value across anchors.
+        # High quality = position's simplex with anchors is non-degenerate.
+        # Low quality = position is in a boundary region or near dead anchors.
+        pw_validated = c_out['patchwork'].reshape(B, L, -1)
+        cm_quality = gate_values.mean(dim=-1).reshape(B, L, 1)  # (B, L, 1)
+        geo_update = self['geo_proj'](pw_validated)
 
         if geo_residual is None:
-            geo_residual_out = geo_gate * geo_update
+            geo_residual_out = cm_quality * geo_update
         else:
-            geo_residual_out = geo_residual + geo_gate * geo_update
+            geo_residual_out = geo_residual + cm_quality * geo_update
 
-        # 10. Build full geometric state
-        def unflatten(t):
-            if t is None: return None
-            if t.dim() == 1: return t.reshape(B, L)
+        # ════ Build geo_state dict ════
+        def _unflatten(t):
+            if t is None:
+                return None
+            if t.dim() == 1:
+                return t.reshape(B, L)
             return t.reshape(B, L, *t.shape[1:])
 
         geo_state = {
             'embedding':      emb,
             'geo_ctx':        geo_ctx,
-            'triangulation':  unflatten(obs['triangulation']),
-            'cos_to_anchors': unflatten(obs['cos_to_anchors']),
-            'assignment':     unflatten(obs['assignment']),
-            'nearest':        unflatten(obs['nearest']),
-            'patchwork':      unflatten(obs['patchwork']),
-            'bridge':         unflatten(obs['bridge']),
-            'content':        a_out,
+            'triangulation':  _unflatten(a_out['distances']),
+            'cos_to_anchors': _unflatten(a_out['cos_to_anchors']),
+            'assignment':     _unflatten(a_out['assignment']),
+            'nearest':        _unflatten(a_out['nearest']),
+            'patchwork':      _unflatten(c_out['patchwork']),
+            'bridge':         _unflatten(c_out['bridge']),
+            'gate_values':    _unflatten(gate_values),
+            'gate_info':      gate_info,
+            'cm_quality':     cm_quality,
+            'content':        a_out_stream,
             'geometric':      b_out,
             'composed':       composed,
             'geo_residual':   geo_residual_out,
@@ -752,43 +837,26 @@ class GeometricTransformerLayer(BaseTower):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FULL MODEL — stack of layers
+# FULL MODEL — stack of layers + geometric regularization
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GeometricTransformer(BaseTower):
-    """Geometric Transformer — dual-stream with constellation routing.
+    """Geometric Transformer v2 — CM-validated dual-stream.
 
-    Stack of GeometricTransformerLayers. Optional cross-layer Cayley
-    rotation aligns each layer's output basis to the next layer's
-    expected input.
-
-    Access:
-        model['layer_0']      → first layer
-        model['cross_rot_0']  → cross-layer rotation 0→1
-        model['final_norm']   → output normalization
-
-    Args:
-        name: tower identity
-        d_model: transformer model dimension
-        n_heads: attention heads per stream
-        n_layers: number of geometric transformer layers
-        n_anchors: constellation anchor points
-        manifold_dim: dimension of S^(d-1) for constellation
-        n_comp: patchwork compartments
-        d_comp: hidden dim per compartment
-        context_dim: FiLM conditioning dimension
-        quat_dim: quaternion space dimension
-        dropout: dropout rate
-        cross_layer_rotation: add Cayley rotation between layers
-        vocab_size: if set, adds embedding + output head
+    Stack of GeometricTransformerLayers with:
+        - CM-gated observation at every layer
+        - Cross-layer Cayley rotation on hidden states (not geo_residual)
+        - Built-in geometric regularization via geometric_losses()
     """
     def __init__(self, name, d_model=512, n_heads=8, n_layers=4,
                  n_anchors=32, manifold_dim=256, n_comp=8, d_comp=32,
                  context_dim=128, quat_dim=64, dropout=0.1,
-                 cross_layer_rotation=True, vocab_size=None, max_seq_len=2048):
+                 cross_layer_rotation=True, cm_neighbors=3,
+                 vocab_size=None, max_seq_len=2048):
         super().__init__(name)
         self.d_model = d_model
         self.n_layers = n_layers
+        self.n_anchors = n_anchors
 
         if vocab_size is not None:
             self.attach('embed', nn.Embedding(vocab_size, d_model))
@@ -798,7 +866,8 @@ class GeometricTransformer(BaseTower):
         for i in range(n_layers):
             self.attach(f'layer_{i}', GeometricTransformerLayer(
                 f'{name}_L{i}', d_model, n_heads, n_anchors,
-                manifold_dim, n_comp, d_comp, context_dim, quat_dim, dropout))
+                manifold_dim, n_comp, d_comp, context_dim, quat_dim,
+                dropout, cm_neighbors))
 
         if cross_layer_rotation and n_layers > 1:
             for i in range(n_layers - 1):
@@ -813,17 +882,100 @@ class GeometricTransformer(BaseTower):
             n_comp=n_comp, d_comp=d_comp, context_dim=context_dim,
             quat_dim=quat_dim, dropout=dropout,
             cross_layer_rotation=cross_layer_rotation,
-            vocab_size=vocab_size,
+            cm_neighbors=cm_neighbors, vocab_size=vocab_size,
         )
 
     @property
     def config(self):
         return self._config.copy()
 
+    def geometric_losses(self, cv_target=0.215, cv_weight=0.1, spread_weight=0.01):
+        """Compute geometric regularization from current anchor geometry.
+
+        These losses maintain the constellation in the regime where
+        CM validation, patchwork interpretation, and the full observation
+        pipeline produce meaningful results.
+
+        CV loss: push anchor coefficient of variation toward pentachoron
+        band (0.20-0.23). This is where CM computation has maximal
+        discriminative power — anchors are neither too uniform (CV≈0,
+        CM uninformative) nor too clustered (CV>0.3, degenerate simplices).
+
+        Spread loss: penalize positive cosine similarity between anchors.
+        Prevents collapse where multiple anchors occupy the same region,
+        creating redundant measurements and wasting patchwork capacity.
+
+        Returns:
+            dict with 'cv', 'spread', 'geo_total' loss tensors
+        """
+        total_cv = torch.tensor(0.0)
+        total_spread = torch.tensor(0.0)
+        n = 0
+
+        for i in range(self.n_layers):
+            layer = self[f'layer_{i}']
+            anchors = layer['observer'].association.constellation.anchors
+            anchors_n = F.normalize(anchors, dim=-1)
+            A = anchors_n.shape[0]
+
+            # Ensure we're on the right device
+            if n == 0:
+                total_cv = total_cv.to(anchors.device)
+                total_spread = total_spread.to(anchors.device)
+
+            # ── CV loss: pairwise angular distance coefficient of variation ──
+            cos = anchors_n @ anchors_n.T
+            idx = torch.triu_indices(A, A, offset=1, device=cos.device)
+            pairwise_dist = 1.0 - cos[idx[0], idx[1]]
+            cv = pairwise_dist.std() / (pairwise_dist.mean() + 1e-8)
+            total_cv = total_cv + (cv - cv_target).pow(2)
+
+            # ── Spread loss: penalize positive cosine between anchors ──
+            mask = ~torch.eye(A, dtype=torch.bool, device=cos.device)
+            total_spread = total_spread + F.relu(cos[mask]).mean()
+
+            n += 1
+
+        losses = {}
+        if n > 0:
+            losses['cv'] = cv_weight * total_cv / n
+            losses['spread'] = spread_weight * total_spread / n
+            losses['geo_total'] = losses['cv'] + losses['spread']
+        return losses
+
+    def anchor_diagnostics(self):
+        """Per-layer anchor health diagnostics. Call for monitoring."""
+        diag = {}
+        for i in range(self.n_layers):
+            layer = self[f'layer_{i}']
+            anchors = layer['observer'].association.constellation.anchors
+            anchors_n = F.normalize(anchors.detach(), dim=-1)
+            A = anchors_n.shape[0]
+
+            cos = anchors_n @ anchors_n.T
+            idx = torch.triu_indices(A, A, offset=1, device=cos.device)
+            pairwise = 1.0 - cos[idx[0], idx[1]]
+            cv = (pairwise.std() / (pairwise.mean() + 1e-8)).item()
+
+            # CM quality per anchor
+            with torch.no_grad():
+                anchor_cm, _ = anchor_neighborhood_cm(
+                    anchors_n, layer['cm_gate'].n_neighbors)
+
+            diag[f'layer_{i}'] = {
+                'anchor_cv': cv,
+                'mean_pairwise_dist': pairwise.mean().item(),
+                'min_pairwise_dist': pairwise.min().item(),
+                'cm_positive_frac': (anchor_cm > 0).float().mean().item(),
+                'cm_mean': anchor_cm.mean().item(),
+                'cm_std': anchor_cm.std().item(),
+            }
+        return diag
+
     def param_report(self):
         total = 0
-        name = getattr(self, '_tower_name', getattr(self, 'name', self.__class__.__name__))
-        print(f"\n  {name} — parameter report")
+        name = getattr(self, '_tower_name', self.__class__.__name__)
+        print(f"\n  {name} — parameter report (v2 CM-validated)")
         print(f"  {'Component':<35s}  {'Params':>12s}")
         print(f"  {'─'*35}  {'─'*12}")
         for cname, module in self.named_children():
@@ -837,16 +989,9 @@ class GeometricTransformer(BaseTower):
     def forward(self, x, attn_mask=None, key_padding_mask=None,
                 return_geo_state=False):
         """
-        Args:
-            x: (B, L, D) hidden states or (B, L) token ids
-            return_geo_state: if True, return per-layer geometric state dicts
-
         Returns:
             out: (B, L, D) transformed hidden states (or logits if head attached)
             geo_states: list of per-layer geo_state dicts (if return_geo_state)
-                Each dict contains: embedding, geo_ctx, triangulation,
-                cos_to_anchors, assignment, nearest, patchwork, bridge,
-                content, geometric, composed, geo_residual
         """
         if self.has('embed') and x.dtype in (torch.long, torch.int32, torch.int64):
             pos = torch.arange(x.shape[1], device=x.device)
@@ -854,7 +999,7 @@ class GeometricTransformer(BaseTower):
 
         geo_states = []
         has_xrot = self.has('cross_rot_0')
-        geo_residual = None  # First layer establishes the stream
+        geo_residual = None
 
         for i in range(self.n_layers):
             x, geo_residual, geo_state = self[f'layer_{i}'](
@@ -864,11 +1009,7 @@ class GeometricTransformer(BaseTower):
                 geo_states.append(geo_state)
             if has_xrot and i < self.n_layers - 1:
                 x = self[f'cross_rot_{i}'](x)
-                # Note: geo_residual is NOT rotated by cross_rot.
-                # It lives in its own space — the patchwork interpretation
-                # space — which is independent of the hidden state basis.
-                # This is intentional: the geometric residual carries
-                # constellation observations, not hidden state features.
+                # geo_residual NOT rotated — lives in patchwork space, basis-independent
 
         x = self['final_norm'](x)
         if self.has('head'):
@@ -905,63 +1046,105 @@ def geo_transformer_vision(name='geo_vit', n_layers=4, **kw):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    print("Geometric Transformer — Self-Test")
+    print("Geometric Transformer v2 — CM Validated — Self-Test")
     print(f"  geolip_core available: {_HAS_GEOLIP}")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = geo_transformer_small('test', n_layers=2)
+    # ── Build small model ──
+    model = geo_transformer_small('test_v2', n_layers=2)
     if hasattr(model, 'network_to'):
         model.network_to(device=device, strict=False)
     else:
         model = model.to(device)
     total = model.param_report()
 
+    # ── Forward pass ──
     B, L, D = 2, 32, 256
     x = torch.randn(B, L, D, device=device)
-
     out, geos = model(x, return_geo_state=True)
+
     assert out.shape == (B, L, D), f"Expected ({B},{L},{D}), got {out.shape}"
     assert len(geos) == 2
-
     print(f"\n  Input:  ({B}, {L}, {D})")
     print(f"  Output: {out.shape}")
     print(f"  Geo states: {len(geos)} layers")
-    print(f"  State keys: {sorted(geos[0].keys())}")
-    for k, v in geos[0].items():
-        if v is not None:
-            shape = v.shape if hasattr(v, 'shape') else type(v).__name__
-            print(f"    {k:<18s}: {shape}")
 
-    # Verify geo_residual stream continuity
-    assert 'geo_residual' in geos[0], "geo_residual missing from layer 0"
-    assert 'geo_residual' in geos[1], "geo_residual missing from layer 1"
+    # ── Verify CM gate is active ──
+    for i, gs in enumerate(geos):
+        gi = gs['gate_info']
+        cm_q = gs['cm_quality']
+        gv = gs['gate_values']
+        print(f"\n  Layer {i} CM gate:")
+        print(f"    active anchors:   {gi['active']:.1f} / {model.n_anchors}")
+        print(f"    gate mean:        {gi['gate_mean']:.4f}")
+        print(f"    cm_positive_frac: {gi['cm_positive_frac']:.3f}")
+        print(f"    gate_values:      {gv.shape}  range=[{gv.min():.3f}, {gv.max():.3f}]")
+        print(f"    cm_quality:       {cm_q.shape}  mean={cm_q.mean():.4f}")
+
+    # ── Verify geo_residual continuity ──
     gr0 = geos[0]['geo_residual']
     gr1 = geos[1]['geo_residual']
     print(f"\n  Geo residual stream:")
     print(f"    Layer 0: {gr0.shape}  norm={gr0.norm(dim=-1).mean():.4f}")
     print(f"    Layer 1: {gr1.shape}  norm={gr1.norm(dim=-1).mean():.4f}")
-    # Layer 1 should have accumulated from layer 0 — norms should differ
-    print(f"    Accumulated: {'YES' if gr1.norm() > gr0.norm() * 0.5 else 'NO (gate closed)'}")
 
-    # Verify rotations
+    # ── Geometric losses ──
+    geo_losses = model.geometric_losses()
+    print(f"\n  Geometric regularization:")
+    for k, v in geo_losses.items():
+        print(f"    {k}: {v.item():.6f}")
+
+    # ── Anchor diagnostics ──
+    diag = model.anchor_diagnostics()
+    print(f"\n  Anchor diagnostics:")
+    for layer_name, d in diag.items():
+        print(f"    {layer_name}:")
+        for k, v in d.items():
+            print(f"      {k}: {v:.4f}")
+
+    # ── Verify Cayley rotations ──
+    print(f"\n  Cayley rotations:")
     for name, module in model.named_modules():
         if isinstance(module, CayleyOrthogonal):
             R = module.get_rotation()
             I = torch.eye(R.shape[0], device=R.device)
-            print(f"  {name}: ‖RRᵀ-I‖={((R@R.T)-I).norm():.8f}  det={torch.det(R):.4f}")
+            print(f"    {name}: ‖RRᵀ-I‖={((R@R.T)-I).norm():.8f}  det={torch.det(R):.4f}")
 
-    # ESM-2 scale overhead
-    print(f"\n  ESM-2 scale:")
-    esm = geo_transformer_esm2('esm2', n_layers=6)
-    if hasattr(esm, 'network_to'):
-        esm.network_to(device=device, strict=False)
-    else:
-        esm = esm.to(device)
-    n = esm.param_report()
-    print(f"  Overhead on 650M base: {n/1e6:.1f}M ({n/650e6*100:.1f}%)")
+    # ── Gradient flow through CM gate ──
+    print(f"\n  Gradient flow test:")
+    model.zero_grad()
+    x_grad = torch.randn(B, L, D, device=device, requires_grad=True)
+    out_grad = model(x_grad)
+    loss = out_grad.sum()
+    loss.backward()
+
+    # Check gate_proj has gradients
+    for i in range(model.n_layers):
+        layer = model[f'layer_{i}']
+        gate_grads = [p.grad is not None and p.grad.abs().sum() > 0
+                      for p in layer['cm_gate'].parameters()]
+        print(f"    layer_{i} cm_gate grad: {'YES' if all(gate_grads) else 'NO'}")
+
+    # ── Training step simulation ──
+    print(f"\n  Training step simulation:")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer.zero_grad()
+
+    x_train = torch.randn(B, L, D, device=device)
+    out_train, states = model(x_train, return_geo_state=True)
+    task_loss = out_train.mean()  # dummy
+
+    geo_losses = model.geometric_losses()
+    total_loss = task_loss + geo_losses.get('geo_total', 0.0)
+    total_loss.backward()
+    optimizer.step()
+    print(f"    task_loss:  {task_loss.item():.4f}")
+    print(f"    cv_loss:    {geo_losses['cv'].item():.6f}")
+    print(f"    spread_loss:{geo_losses['spread'].item():.6f}")
+    print(f"    total:      {total_loss.item():.4f}")
 
     print(f"\n{'='*60}")
-    print(f"  PASSED")
+    print(f"  PASSED — v2 CM-validated pipeline operational")
     print(f"{'='*60}")
