@@ -976,9 +976,18 @@ class GeometricTransformer(BaseTower):
         self.attach('final_norm', nn.LayerNorm(d_model))
 
         # InfoNCE memory bank on geometric residual
+        # The bank loss flows through nce_proj only — NOT the constellation.
+        # nce_proj learns to read discriminative features from the residual.
+        # The constellation is protected: only geometric losses move anchors.
         if nce_bank_size > 0:
+            nce_proj_dim = self._pw_dim
+            self.attach('nce_proj', nn.Sequential(
+                nn.Linear(self._pw_dim, nce_proj_dim),
+                nn.GELU(),
+                nn.Linear(nce_proj_dim, nce_proj_dim),
+            ))
             self.attach('nce_bank', GeoResidualBank(
-                self._pw_dim, bank_size=nce_bank_size,
+                nce_proj_dim, bank_size=nce_bank_size,
                 temperature=nce_temperature))
 
         self._config = dict(
@@ -1050,14 +1059,18 @@ class GeometricTransformer(BaseTower):
         return losses
 
     def infonce_loss(self, geo_residual=None, cls_index=0):
-        """Compute InfoNCE contrastive loss on geometric residual.
+        """Uniformity loss on geometric residual via learned projection.
 
-        Takes the CLS token's accumulated geo_residual as the per-sample
-        geometric signature. Compares against the memory bank of recent
-        residuals. Gradient flows back through the full geometric pipeline.
+        The CLS token's residual is DETACHED from the geometric pipeline,
+        then passed through nce_proj (trainable). This means:
+          - Gradient flows into nce_proj (learns to read discriminative features)
+          - Gradient does NOT flow into constellation, patchwork, or geo_proj
+          - The constellation is protected — only geometric losses move anchors
 
-        Call DURING training, after forward pass. Call update_nce_bank()
-        AFTER backward to enqueue current batch.
+        The bank provides discriminative pressure on the projection head.
+        If the residual IS sample-discriminative (from CM-conditioned accumulation),
+        nce_proj amplifies it and loss drops. If not, loss stays high — honest
+        diagnostic of residual quality.
 
         Args:
             geo_residual: (B, L, pw_dim) or None (uses cached from last forward)
@@ -1074,19 +1087,23 @@ class GeometricTransformer(BaseTower):
         if geo_residual is None:
             return {}
 
-        cls_residual = geo_residual[:, cls_index]  # (B, pw_dim)
-        loss, avg_sim = self['nce_bank'](cls_residual)
+        # DETACH: stop gradient from reaching constellation/patchwork/geo_proj
+        cls_residual = geo_residual[:, cls_index].detach()  # (B, pw_dim)
+        # PROJECT: nce_proj IS trainable — learns to amplify discriminative dims
+        projected = self['nce_proj'](cls_residual)  # (B, proj_dim)
+        loss, avg_sim = self['nce_bank'](projected)
         return {'nce': loss, 'nce_avg_sim': avg_sim}
 
     @torch.no_grad()
     def update_nce_bank(self, geo_residual=None, cls_index=0):
-        """Enqueue current batch's residuals into the bank. Call AFTER backward.
+        """Enqueue current batch's projected residuals into the bank.
 
-        Args:
-            geo_residual: (B, L, pw_dim) or None (uses cached from last forward)
-            cls_index: which position to use (default 0 = CLS)
+        Projects through nce_proj before enqueuing so bank entries match
+        the query space used in forward().
+
+        Call AFTER backward.
         """
-        if not self.has('nce_bank'):
+        if not self.has('nce_bank') or not self.has('nce_proj'):
             return
 
         if geo_residual is None:
@@ -1094,8 +1111,9 @@ class GeometricTransformer(BaseTower):
         if geo_residual is None:
             return
 
-        cls_residual = F.normalize(geo_residual[:, cls_index].detach(), dim=-1)
-        self['nce_bank'].enqueue(cls_residual)
+        cls_residual = geo_residual[:, cls_index].detach()
+        projected = self['nce_proj'](cls_residual)
+        self['nce_bank'].enqueue(F.normalize(projected, dim=-1))
 
     def anchor_diagnostics(self):
         """Per-layer anchor health diagnostics. Call for monitoring."""
