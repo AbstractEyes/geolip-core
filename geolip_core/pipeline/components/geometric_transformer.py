@@ -459,48 +459,40 @@ class GeoResidualBank(nn.Module):
         self.queue_ptr[0] = (ptr + B) % self.bank_size
 
     def forward(self, queries):
-        """Compute InfoNCE loss: queries vs bank.
+        """Compute uniformity loss: push residuals apart from bank.
+
+        No explicit positive needed — the task loss (CE) pulls residuals
+        toward class-appropriate geometry. This loss pushes them apart
+        from everything in the bank. The two forces together create
+        sample-discriminative residuals that are also task-relevant.
+
+        log-sum-exp of similarities: penalizes being close to ANY bank entry.
+        When residuals are collapsed (all identical), all logits ≈ 1/temp,
+        gradient pushes queries away from stale copies. When diverse,
+        gradient pushes away from nearest bank neighbors.
 
         Args:
             queries: (B, feature_dim) — current batch's geo_residuals (LIVE, has grad)
 
         Returns:
-            loss: scalar InfoNCE loss
-            acc: scalar top-1 retrieval accuracy (for diagnostics)
+            loss: scalar uniformity loss
+            avg_sim: mean similarity to bank (diagnostic — should decrease over training)
         """
         queries = F.normalize(queries, dim=-1)  # (B, D)
         keys = self.queue.clone().detach()       # (K, D) — no grad to bank
 
-        # Positive: each query's closest match isn't defined in standard InfoNCE.
-        # For a memory bank without paired data, we use the query itself as
-        # the target — the loss pushes each query away from all bank entries
-        # while the bank gradually fills with diverse residuals.
-        #
-        # But we DO have paired data in CutMix-free batches. The clean approach:
-        # use the batch itself for positives. For sample i, its positive is itself
-        # (trivial), so instead we compute the batch-vs-bank contrastive:
-        # each query should be distinguishable from all bank entries.
-
-        # Logits: (B, K) — similarity of each query to all bank entries
+        # Similarity to all bank entries
         logits = queries @ keys.T / self.temperature  # (B, K)
 
-        # Self-similarity within batch for positive pairs
-        # Each sample's "positive" is its own representation — we want it to
-        # be MORE similar to itself than to any bank entry.
-        # Add self-similarity as column 0:
-        self_sim = (queries * queries).sum(dim=-1, keepdim=True) / self.temperature  # (B, 1)
-        logits = torch.cat([self_sim, logits], dim=1)  # (B, 1+K)
+        # Uniformity: minimize log-sum-exp of similarities
+        # = push each query away from all bank entries
+        loss = logits.logsumexp(dim=-1).mean()
 
-        # Labels: column 0 is the positive for every sample
-        labels = torch.zeros(queries.shape[0], dtype=torch.long, device=queries.device)
-
-        loss = F.cross_entropy(logits, labels)
-
-        # Accuracy: how often is the self-similarity highest
+        # Diagnostic: average similarity (not logsumexp)
         with torch.no_grad():
-            acc = (logits.argmax(dim=1) == 0).float().mean()
+            avg_sim = (queries @ keys.T).mean()
 
-        return loss, acc
+        return loss, avg_sim
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1072,7 +1064,7 @@ class GeometricTransformer(BaseTower):
             cls_index: which position to use as per-sample signature (default 0 = CLS)
 
         Returns:
-            dict with 'nce': loss tensor, 'nce_acc': retrieval accuracy
+            dict with 'nce': loss tensor, 'nce_avg_sim': avg similarity to bank
         """
         if not self.has('nce_bank'):
             return {}
@@ -1083,8 +1075,8 @@ class GeometricTransformer(BaseTower):
             return {}
 
         cls_residual = geo_residual[:, cls_index]  # (B, pw_dim)
-        loss, acc = self['nce_bank'](cls_residual)
-        return {'nce': loss, 'nce_acc': acc}
+        loss, avg_sim = self['nce_bank'](cls_residual)
+        return {'nce': loss, 'nce_avg_sim': avg_sim}
 
     @torch.no_grad()
     def update_nce_bank(self, geo_residual=None, cls_index=0):
