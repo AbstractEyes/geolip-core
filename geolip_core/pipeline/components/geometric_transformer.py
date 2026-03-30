@@ -401,6 +401,109 @@ class CMValidatedGate(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# INFONCE MEMORY BANK — contrastive pressure on geometric residual
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GeoResidualBank(nn.Module):
+    """MoCo-style memory bank for geometric residual contrastive learning.
+
+    The geometric residual converges to a consistent attractor (by design).
+    The bank provides discriminative pressure: different samples should
+    produce distinguishable residuals. Without it, the residual is
+    geometrically consistent but sample-agnostic — "maple" and "oak"
+    can both land at the same point.
+
+    The bank stores detached geo_residuals from recent batches as keys.
+    The current batch's residual is the query. InfoNCE asks: "can I
+    identify which sample produced this geometric residual among K
+    recent alternatives?"
+
+    Gradient flows: InfoNCE loss → query (current geo_residual) →
+    geo_proj → patchwork → CM-gated triangulation → constellation.
+    The bank entries are detached — no momentum encoder needed.
+
+    Args:
+        feature_dim: dimension of geo_residual (pw_dim = n_comp * d_comp)
+        bank_size: number of entries in the queue (default 4096)
+        temperature: InfoNCE temperature (default 0.1)
+    """
+    def __init__(self, feature_dim, bank_size=4096, temperature=0.1):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.bank_size = bank_size
+        self.temperature = temperature
+
+        # Queue buffer — not a parameter, not updated by optimizer
+        self.register_buffer('queue', torch.randn(bank_size, feature_dim))
+        self.queue = F.normalize(self.queue, dim=-1)
+        self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
+
+    @torch.no_grad()
+    def enqueue(self, keys):
+        """Add batch of keys to the queue. Called AFTER backward.
+
+        Args:
+            keys: (B, feature_dim) detached, normalized geo_residuals
+        """
+        B = keys.shape[0]
+        ptr = int(self.queue_ptr.item())
+
+        # Handle wrap-around
+        if ptr + B <= self.bank_size:
+            self.queue[ptr:ptr + B] = keys
+        else:
+            overflow = (ptr + B) - self.bank_size
+            self.queue[ptr:] = keys[:B - overflow]
+            self.queue[:overflow] = keys[B - overflow:]
+
+        self.queue_ptr[0] = (ptr + B) % self.bank_size
+
+    def forward(self, queries):
+        """Compute InfoNCE loss: queries vs bank.
+
+        Args:
+            queries: (B, feature_dim) — current batch's geo_residuals (LIVE, has grad)
+
+        Returns:
+            loss: scalar InfoNCE loss
+            acc: scalar top-1 retrieval accuracy (for diagnostics)
+        """
+        queries = F.normalize(queries, dim=-1)  # (B, D)
+        keys = self.queue.clone().detach()       # (K, D) — no grad to bank
+
+        # Positive: each query's closest match isn't defined in standard InfoNCE.
+        # For a memory bank without paired data, we use the query itself as
+        # the target — the loss pushes each query away from all bank entries
+        # while the bank gradually fills with diverse residuals.
+        #
+        # But we DO have paired data in CutMix-free batches. The clean approach:
+        # use the batch itself for positives. For sample i, its positive is itself
+        # (trivial), so instead we compute the batch-vs-bank contrastive:
+        # each query should be distinguishable from all bank entries.
+
+        # Logits: (B, K) — similarity of each query to all bank entries
+        logits = queries @ keys.T / self.temperature  # (B, K)
+
+        # Self-similarity within batch for positive pairs
+        # Each sample's "positive" is its own representation — we want it to
+        # be MORE similar to itself than to any bank entry.
+        # Add self-similarity as column 0:
+        self_sim = (queries * queries).sum(dim=-1, keepdim=True) / self.temperature  # (B, 1)
+        logits = torch.cat([self_sim, logits], dim=1)  # (B, 1+K)
+
+        # Labels: column 0 is the positive for every sample
+        labels = torch.zeros(queries.shape[0], dtype=torch.long, device=queries.device)
+
+        loss = F.cross_entropy(logits, labels)
+
+        # Accuracy: how often is the self-similarity highest
+        with torch.no_grad():
+            acc = (logits.argmax(dim=1) == 0).float().mean()
+
+        return loss, acc
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PROVEN COMPONENTS — from Ryan Spearman (unchanged, tested)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -854,11 +957,13 @@ class GeometricTransformer(BaseTower):
                  n_anchors=32, manifold_dim=256, n_comp=8, d_comp=32,
                  context_dim=128, quat_dim=64, dropout=0.1,
                  cross_layer_rotation=True, cm_neighbors=3,
+                 nce_bank_size=4096, nce_temperature=0.1,
                  vocab_size=None, max_seq_len=2048):
         super().__init__(name)
         self.d_model = d_model
         self.n_layers = n_layers
         self.n_anchors = n_anchors
+        self._pw_dim = n_comp * d_comp
 
         if vocab_size is not None:
             self.attach('embed', nn.Embedding(vocab_size, d_model))
@@ -878,6 +983,12 @@ class GeometricTransformer(BaseTower):
 
         self.attach('final_norm', nn.LayerNorm(d_model))
 
+        # InfoNCE memory bank on geometric residual
+        if nce_bank_size > 0:
+            self.attach('nce_bank', GeoResidualBank(
+                self._pw_dim, bank_size=nce_bank_size,
+                temperature=nce_temperature))
+
         self._config = dict(
             d_model=d_model, n_heads=n_heads, n_layers=n_layers,
             n_anchors=n_anchors, manifold_dim=manifold_dim,
@@ -885,6 +996,7 @@ class GeometricTransformer(BaseTower):
             quat_dim=quat_dim, dropout=dropout,
             cross_layer_rotation=cross_layer_rotation,
             cm_neighbors=cm_neighbors, vocab_size=vocab_size,
+            nce_bank_size=nce_bank_size, nce_temperature=nce_temperature,
         )
 
     @property
@@ -945,6 +1057,54 @@ class GeometricTransformer(BaseTower):
             losses['geo_total'] = losses['cv'] + losses['spread']
         return losses
 
+    def infonce_loss(self, geo_residual=None, cls_index=0):
+        """Compute InfoNCE contrastive loss on geometric residual.
+
+        Takes the CLS token's accumulated geo_residual as the per-sample
+        geometric signature. Compares against the memory bank of recent
+        residuals. Gradient flows back through the full geometric pipeline.
+
+        Call DURING training, after forward pass. Call update_nce_bank()
+        AFTER backward to enqueue current batch.
+
+        Args:
+            geo_residual: (B, L, pw_dim) or None (uses cached from last forward)
+            cls_index: which position to use as per-sample signature (default 0 = CLS)
+
+        Returns:
+            dict with 'nce': loss tensor, 'nce_acc': retrieval accuracy
+        """
+        if not self.has('nce_bank'):
+            return {}
+
+        if geo_residual is None:
+            geo_residual = getattr(self, '_last_geo_residual', None)
+        if geo_residual is None:
+            return {}
+
+        cls_residual = geo_residual[:, cls_index]  # (B, pw_dim)
+        loss, acc = self['nce_bank'](cls_residual)
+        return {'nce': loss, 'nce_acc': acc}
+
+    @torch.no_grad()
+    def update_nce_bank(self, geo_residual=None, cls_index=0):
+        """Enqueue current batch's residuals into the bank. Call AFTER backward.
+
+        Args:
+            geo_residual: (B, L, pw_dim) or None (uses cached from last forward)
+            cls_index: which position to use (default 0 = CLS)
+        """
+        if not self.has('nce_bank'):
+            return
+
+        if geo_residual is None:
+            geo_residual = getattr(self, '_last_geo_residual', None)
+        if geo_residual is None:
+            return
+
+        cls_residual = F.normalize(geo_residual[:, cls_index].detach(), dim=-1)
+        self['nce_bank'].enqueue(cls_residual)
+
     def anchor_diagnostics(self):
         """Per-layer anchor health diagnostics. Call for monitoring."""
         diag = {}
@@ -994,6 +1154,10 @@ class GeometricTransformer(BaseTower):
         Returns:
             out: (B, L, D) transformed hidden states (or logits if head attached)
             geo_states: list of per-layer geo_state dicts (if return_geo_state)
+
+        Side effect:
+            self._last_geo_residual is set to the final geo_residual (B, L, pw_dim)
+            for use by infonce_loss() and update_nce_bank() without changing the return API.
         """
         if self.has('embed') and x.dtype in (torch.long, torch.int32, torch.int64):
             pos = torch.arange(x.shape[1], device=x.device)
@@ -1012,6 +1176,9 @@ class GeometricTransformer(BaseTower):
             if has_xrot and i < self.n_layers - 1:
                 x = self[f'cross_rot_{i}'](x)
                 # geo_residual NOT rotated — lives in patchwork space, basis-independent
+
+        # Cache for infonce_loss / update_nce_bank
+        self._last_geo_residual = geo_residual
 
         x = self['final_norm'](x)
         if self.has('head'):
