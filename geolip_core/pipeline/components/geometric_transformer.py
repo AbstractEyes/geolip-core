@@ -301,12 +301,11 @@ def anchor_neighborhood_cm(anchors, n_neighbors=3):
     dists = dists + self_mask
     _, nn_idx = dists.topk(n_neighbors, largest=False)  # (A, n_neighbors)
 
-    # Build simplices: [anchor_a, neighbor_1, ..., neighbor_k] per anchor
-    K = n_neighbors + 1
-    simplices = torch.zeros(A, K, D, device=anchors.device, dtype=anchors.dtype)
-    simplices[:, 0] = anchors
-    for j in range(n_neighbors):
-        simplices[:, j + 1] = anchors[nn_idx[:, j]]
+    # Build simplices: [anchor_a, neighbor_1, ..., neighbor_k] — fully vectorized
+    simplices = torch.cat([
+        anchors.unsqueeze(1),   # (A, 1, D)
+        anchors[nn_idx],        # (A, n_neighbors, D)
+    ], dim=1)                   # (A, K, D)
 
     dets = cayley_menger_det(simplices)  # (A,)
     sign = dets.sign()
@@ -321,17 +320,17 @@ def anchor_neighborhood_cm(anchors, n_neighbors=3):
 class CMValidatedGate(nn.Module):
     """Anchor gate based on Cayley-Menger validity.
 
-    Efficient for transformer scale: anchor CM quality is precomputed O(A²),
-    then combined with per-position proximity features through a learned gate.
+    Efficient for transformer scale: anchor CM quality is precomputed O(A²)
+    and CACHED (only recomputed on invalidate_cache()), then combined with
+    per-position proximity features through a learned gate.
 
     The gate starts OPEN (bias=+2, sigmoid≈0.88) and learns to CLOSE on
     geometrically invalid configurations. Architecture-before-loss: the gate
     suppresses degenerate measurements structurally, not through a loss signal.
 
     Gate features per (position, anchor):
-        - anchor_cm_quality: CM volume of anchor's local neighborhood (position-independent)
+        - anchor_cm_quality: CM volume of anchor's local neighborhood (cached)
         - cos_to_anchor: cosine similarity (position-dependent)
-        - distance_rank: normalized rank of this anchor by proximity (position-dependent)
 
     Args:
         n_anchors: number of constellation anchors
@@ -342,15 +341,32 @@ class CMValidatedGate(nn.Module):
         self.n_anchors = n_anchors
         self.n_neighbors = n_neighbors
 
-        # Learned gate: [cm_quality, cos_sim, dist_rank] → scalar gate
+        # Learned gate: [cm_quality, cos_sim] → scalar gate
         self.gate_proj = nn.Sequential(
-            nn.Linear(3, 16),
+            nn.Linear(2, 16),
             nn.GELU(),
             nn.Linear(16, 1),
         )
         # Init OPEN — learn to close. sigmoid(2.0) ≈ 0.88
         nn.init.zeros_(self.gate_proj[2].weight)
         nn.init.constant_(self.gate_proj[2].bias, 2.0)
+
+        # Anchor CM cache — invalidated after optimizer step
+        self._cached_cm_norm = None
+
+    def invalidate_cache(self):
+        """Call after optimizer.step() to recompute anchor CM next forward."""
+        self._cached_cm_norm = None
+
+    def _get_anchor_cm_norm(self, anchors):
+        """Compute or return cached normalized anchor CM quality."""
+        if self._cached_cm_norm is not None:
+            return self._cached_cm_norm
+        with torch.no_grad():
+            anchor_cm, _ = anchor_neighborhood_cm(anchors, self.n_neighbors)
+            cm_std = anchor_cm.std().clamp(min=1e-8)
+            self._cached_cm_norm = ((anchor_cm - anchor_cm.mean()) / cm_std).detach()
+        return self._cached_cm_norm
 
     def forward(self, embedding, anchors, tri):
         """Compute per-(position, anchor) gate values.
@@ -362,44 +378,29 @@ class CMValidatedGate(nn.Module):
 
         Returns:
             gate_values: (N, A) in [0, 1] — per-anchor validity gate
-            gate_info: dict with diagnostics
+            gate_info: dict with diagnostics (tensors, no .item() — compile-safe)
         """
         N, A = tri.shape
 
-        # ── Anchor CM quality: position-independent, O(A²) ──
-        with torch.no_grad():
-            anchor_cm, nn_idx = anchor_neighborhood_cm(anchors, self.n_neighbors)
-            # Normalize to ~ [-1, 1]
-            cm_std = anchor_cm.std().clamp(min=1e-8)
-            anchor_cm_norm = (anchor_cm - anchor_cm.mean()) / cm_std
+        # Anchor CM quality — cached, position-independent
+        anchor_cm_norm = self._get_anchor_cm_norm(anchors)
 
-        # ── Per-position features ──
+        # Per-position features — no double argsort
         cos_sim = 1.0 - tri  # (N, A)
 
-        # Distance rank: 0=nearest, 1=farthest
-        ranks = tri.argsort(dim=-1).argsort(dim=-1).float()
-        ranks = ranks / max(A - 1, 1)
-
-        # ── Gate features: (N, A, 3) ──
+        # Gate features: (N, A, 2)
         features = torch.stack([
             anchor_cm_norm.unsqueeze(0).expand(N, -1),
             cos_sim,
-            ranks,
         ], dim=-1)
 
         gate_values = torch.sigmoid(self.gate_proj(features).squeeze(-1))
 
-        # ── Diagnostics (no .item() — compile-safe) ──
-        with torch.no_grad():
-            active = (gate_values > 0.5).float().sum(-1).mean()
-            cm_positive_frac = (anchor_cm > 0).float().mean()
-            gate_mean = gate_values.mean()
-
+        # Diagnostics — pure tensor ops, no graph breaks
         gate_info = {
-            'active': active,
-            'gate_mean': gate_mean,
-            'cm_positive_frac': cm_positive_frac,
-            'anchor_cm': anchor_cm.detach(),
+            'active': (gate_values.detach() > 0.5).float().sum(-1).mean(),
+            'gate_mean': gate_values.detach().mean(),
+            'cm_positive_frac': (anchor_cm_norm > 0).float().mean(),
         }
 
         return gate_values, gate_info
@@ -1002,6 +1003,11 @@ class GeometricTransformer(BaseTower):
     @property
     def config(self):
         return self._config.copy()
+
+    def invalidate_caches(self):
+        """Invalidate all CM gate caches. Call after optimizer.step()."""
+        for i in range(self.n_layers):
+            self[f'layer_{i}']['cm_gate'].invalidate_cache()
 
     def geometric_losses(self, cv_target=0.215, cv_weight=0.1, spread_weight=0.01):
         """Compute geometric regularization from current anchor geometry.
