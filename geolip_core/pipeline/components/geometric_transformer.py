@@ -358,8 +358,10 @@ class CMValidatedGate(nn.Module):
         """Call after optimizer.step() to recompute anchor CM next forward."""
         self._cached_cm_norm = None
 
+    @torch.compiler.disable
     def _get_anchor_cm_norm(self, anchors):
-        """Compute or return cached normalized anchor CM quality."""
+        """Compute or return cached normalized anchor CM quality.
+        Excluded from torch.compile — linalg.det not CUDA-graph-safe."""
         if self._cached_cm_norm is not None:
             return self._cached_cm_norm
         with torch.no_grad():
