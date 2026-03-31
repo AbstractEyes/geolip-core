@@ -61,8 +61,6 @@ try:
     from geolip_core.core.distinguish.losses import (
         observer_loss as _geolip_observer_loss,
         ce_loss_paired as _geolip_ce_loss_paired,
-        cv_loss as _geolip_cv_loss,
-        spread_loss as _geolip_spread_loss,
     )
     _HAS_GEOLIP = True
 except ImportError:
@@ -1196,11 +1194,13 @@ class GeometricTransformer(BaseTower):
     def _run_view(self, x, attn_mask=None, key_padding_mask=None):
         """Run one view through the full pipeline.
 
+        Only retains the final layer's geo_state — intermediate layers'
+        states are freed, saving ~160MB per layer during backward.
+
         Returns:
             features: (B, L, D) transformed hidden states (post-norm)
-            geo_states: list of per-layer geo_state dicts
+            final_geo_state: geo_state dict from the last layer only
         """
-        geo_states = []
         has_xrot = self.has('cross_rot_0')
         geo_residual = None
 
@@ -1208,16 +1208,16 @@ class GeometricTransformer(BaseTower):
             pos = torch.arange(x.shape[1], device=x.device)
             x = self['embed'](x) + self['pos_embed'](pos)
 
+        geo_state = None
         for i in range(self.n_layers):
             x, geo_residual, geo_state = self[f'layer_{i}'](
                 x, geo_residual=geo_residual,
                 attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-            geo_states.append(geo_state)
             if has_xrot and i < self.n_layers - 1:
                 x = self[f'cross_rot_{i}'](x)
 
         x = self['final_norm'](x)
-        return x, geo_states
+        return x, geo_state
 
     def forward_paired(self, x1, x2, cls_index=0,
                        attn_mask=None, key_padding_mask=None):
@@ -1235,39 +1235,35 @@ class GeometricTransformer(BaseTower):
             output dict matching observer_loss spec:
                 embedding, embedding_aug, patchwork1, patchwork1_aug,
                 bridge1, bridge2, assign1, assign2, cos1, tri1, tri2
-            Plus: features1, features2, geo_states1, geo_states2
+            Plus: features1, features2, gate_values, cm_quality
         """
         feat1, gs1 = self._run_view(x1, attn_mask, key_padding_mask)
         feat2, gs2 = self._run_view(x2, attn_mask, key_padding_mask)
 
-        # Extract CLS position from final layer geo_state
-        g1 = gs1[-1]
-        g2 = gs2[-1]
+        # gs1, gs2 are final layer geo_state dicts (not lists)
         c = cls_index
 
         return {
             # observe_paired format — what observer_loss reads
-            'embedding':      g1['embedding'][:, c],
-            'embedding_aug':  g2['embedding'][:, c],
-            'patchwork1':     g1['patchwork'][:, c],
-            'patchwork1_aug': g2['patchwork'][:, c],
-            'bridge1':        g1['bridge'][:, c],
-            'bridge2':        g2['bridge'][:, c],
-            'assign1':        g1['assignment'][:, c],
-            'assign2':        g2['assignment'][:, c],
-            'cos1':           g1['cos_to_anchors'][:, c],
-            'tri1':           g1['triangulation'][:, c],
-            'tri2':           g2['triangulation'][:, c],
+            'embedding':      gs1['embedding'][:, c],
+            'embedding_aug':  gs2['embedding'][:, c],
+            'patchwork1':     gs1['patchwork'][:, c],
+            'patchwork1_aug': gs2['patchwork'][:, c],
+            'bridge1':        gs1['bridge'][:, c],
+            'bridge2':        gs2['bridge'][:, c],
+            'assign1':        gs1['assignment'][:, c],
+            'assign2':        gs2['assignment'][:, c],
+            'cos1':           gs1['cos_to_anchors'][:, c],
+            'tri1':           gs1['triangulation'][:, c],
+            'tri2':           gs2['triangulation'][:, c],
             # Full features for task head
             'features1':      feat1,
             'features2':      feat2,
             # Diagnostics
-            'gate_values1':   g1['gate_values'][:, c],
-            'gate_values2':   g2['gate_values'][:, c],
-            'cm_quality1':    g1['cm_quality'],
-            'cm_quality2':    g2['cm_quality'],
-            'geo_states1':    gs1,
-            'geo_states2':    gs2,
+            'gate_values1':   gs1['gate_values'][:, c],
+            'gate_values2':   gs2['gate_values'][:, c],
+            'cm_quality1':    gs1['cm_quality'],
+            'cm_quality2':    gs2['cm_quality'],
         }
 
     def compute_loss(self, output, targets, cls_index=0,
@@ -1313,14 +1309,6 @@ class GeometricTransformer(BaseTower):
             ld['loss_task'] = l_ce.item()
         else:
             loss = obs_loss
-
-        # Anchor maintenance across ALL layers (not just final)
-        total_spread = torch.tensor(0.0, device=anchors.device)
-        for i in range(self.n_layers):
-            layer = self[f'layer_{i}']
-            layer_anchors = layer['observer'].association.constellation.anchors
-            total_spread = total_spread + _geolip_spread_loss(layer_anchors)
-        ld['spread_all_layers'] = total_spread / self.n_layers
 
         ld['loss_observer'] = obs_loss.item()
         ld['total'] = loss
