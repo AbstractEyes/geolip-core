@@ -75,7 +75,7 @@ def _sequential_pentachoron_volumes(emb, n_samples=200, n_points=5):
         k = n_points - 1
         pf = ((-1.0) ** (k + 1)) / ((2.0 ** k) * (math.factorial(k) ** 2))
         v2 = pf * torch.linalg.det(cm.float())
-        if v2[0].item() > 1e-20:
+        if v2[0] > 1e-20:
             vols.append(v2[0].to(dtype).sqrt())
     if len(vols) < 5:
         return torch.tensor([], device=device, dtype=dtype)
@@ -137,7 +137,7 @@ def nce_loss(z1, z2, temperature=0.07, normalize=True):
     labels = torch.arange(B, device=z1.device)
     sim = z1 @ z2.T / temperature
     loss = F.cross_entropy(sim, labels)
-    acc = (sim.argmax(1) == labels).float().mean().item()
+    acc = (sim.argmax(1) == labels).float().mean()
     return loss, acc
 
 
@@ -148,7 +148,7 @@ def nce_loss(z1, z2, temperature=0.07, normalize=True):
 def ce_loss(logits, targets):
     """Cross-entropy + accuracy. Returns (loss, accuracy)."""
     loss = F.cross_entropy(logits, targets)
-    acc = (logits.argmax(-1) == targets).float().mean().item()
+    acc = (logits.argmax(-1) == targets).float().mean()
     return loss, acc
 
 
@@ -156,7 +156,7 @@ def ce_loss_paired(logits1, logits2, targets):
     """Averaged CE over two views. Returns (loss, accuracy from view 1)."""
     l1 = F.cross_entropy(logits1, targets)
     l2 = F.cross_entropy(logits2, targets)
-    acc = (logits1.argmax(-1) == targets).float().mean().item()
+    acc = (logits1.argmax(-1) == targets).float().mean()
     return (l1 + l2) / 2, acc
 
 
@@ -168,7 +168,7 @@ def bridge_loss(bridge_logits, assign_targets, detach_targets=True):
     """Soft CE: patchwork predicts constellation's soft assignment. Returns (loss, accuracy)."""
     if detach_targets: assign_targets = assign_targets.detach()
     loss = -(assign_targets * F.log_softmax(bridge_logits, dim=-1)).sum(-1).mean()
-    acc = (bridge_logits.argmax(-1) == assign_targets.argmax(-1)).float().mean().item()
+    acc = (bridge_logits.argmax(-1) == assign_targets.argmax(-1)).float().mean()
     return loss, acc
 
 
@@ -191,7 +191,7 @@ def assign_bce_loss(soft_assign, cos_to_anchors):
     with torch.amp.autocast("cuda", enabled=False):
         loss = F.binary_cross_entropy(
             soft_assign.float().clamp(1e-7, 1 - 1e-7), hard.float(), reduction='mean')
-    entropy = -(soft_assign * soft_assign.clamp(min=1e-8).log()).sum(-1).mean().item()
+    entropy = -(soft_assign * soft_assign.clamp(min=1e-8).log()).sum(-1).mean()
     return loss, entropy
 
 
@@ -201,7 +201,7 @@ def assign_nce_loss(assign1, assign2, temperature=0.1):
     labels = torch.arange(B, device=assign1.device)
     sim = assign1 @ assign2.T / temperature
     loss = F.cross_entropy(sim, labels)
-    acc = (sim.argmax(1) == labels).float().mean().item()
+    acc = (sim.argmax(1) == labels).float().mean()
     return loss, acc
 
 
@@ -213,7 +213,7 @@ def attraction_loss(cos_to_anchors):
     """Pull embeddings toward nearest anchor. Returns (loss, mean_nearest_cos)."""
     nearest_cos = cos_to_anchors.max(dim=1).values
     loss = (1.0 - nearest_cos).mean()
-    return loss, nearest_cos.mean().item()
+    return loss, nearest_cos.mean()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -232,6 +232,7 @@ def spread_loss(anchors, target_cos=0.0):
 # kNN — non-differentiable validation metric
 # ══════════════════════════════════════════════════════════════════
 
+@torch.compiler.disable
 @torch.no_grad()
 def knn_accuracy(embeddings, targets, k=1):
     """k-NN classification accuracy in embedding space."""
@@ -307,18 +308,18 @@ def three_domain_loss(output, targets, constellation, cv_target=0.22,
                      + w_cv * l_cv + w_spread * l_spread)
     loss = loss_external + loss_geometric + loss_internal
 
-    ld['loss_external'] = loss_external.item()
-    ld['loss_geometric'] = loss_geometric.item()
-    ld['loss_internal'] = loss_internal.item()
+    ld['loss_external'] = loss_external.detach()
+    ld['loss_geometric'] = loss_geometric.detach()
+    ld['loss_internal'] = loss_internal.detach()
     ld['total'] = loss
-    ld['t_ce'] = l_ce.item()
-    ld['t_nce_emb'] = l_nce_emb.item()
-    ld['t_nce_pw'] = l_nce_pw.item()
-    ld['t_bridge'] = l_bridge.item()
-    ld['t_assign'] = l_assign.item()
-    ld['t_assign_nce'] = l_assign_nce.item()
-    ld['t_nce_tri'] = l_nce_tri.item()
-    ld['t_attract'] = l_attract.item()
+    ld['t_ce'] = l_ce.detach()
+    ld['t_nce_emb'] = l_nce_emb.detach()
+    ld['t_nce_pw'] = l_nce_pw.detach()
+    ld['t_bridge'] = l_bridge.detach()
+    ld['t_assign'] = l_assign.detach()
+    ld['t_assign_nce'] = l_assign_nce.detach()
+    ld['t_nce_tri'] = l_nce_tri.detach()
+    ld['t_attract'] = l_attract.detach()
     return loss, ld
 
 
@@ -402,7 +403,7 @@ def observer_loss(output, anchors, targets=None,
                      + w_cv * l_cv + w_spread * l_spread)
     loss = w_nce_emb * l_nce_emb + loss_geometric + loss_internal
 
-    ld['loss_geometric'] = loss_geometric.item()
-    ld['loss_internal'] = loss_internal.item()
+    ld['loss_geometric'] = loss_geometric.detach()
+    ld['loss_internal'] = loss_internal.detach()
     ld['total'] = loss
     return loss, ld

@@ -1130,11 +1130,11 @@ class GeometricTransformer(BaseTower):
             ld['ce'], ld['acc'] = l_ce, acc
             ld['logits'] = logits1
             loss = w_ce * l_ce + obs_loss
-            ld['loss_task'] = l_ce.item()
+            ld['loss_task'] = l_ce.detach()
         else:
             loss = obs_loss
 
-        ld['loss_observer'] = obs_loss.item()
+        ld['loss_observer'] = obs_loss.detach()
 
         # Spread maintenance for non-final layers — observer_loss only
         # covers the final layer's anchors. Without this, layers 0..N-2
@@ -1148,7 +1148,7 @@ class GeometricTransformer(BaseTower):
                 other_spread = other_spread + _geolip_spread_loss(layer_anchors)
             other_spread = w_spread * other_spread / (self.n_layers - 1)
             loss = loss + other_spread
-            ld['spread_other_layers'] = other_spread.item()
+            ld['spread_other_layers'] = other_spread.detach()
 
         ld['total'] = loss
         return loss, ld
