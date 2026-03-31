@@ -405,94 +405,85 @@ class CMValidatedGate(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GeoResidualBank(nn.Module):
-    """MoCo-style memory bank for geometric residual contrastive learning.
+    """Cross-stream contrastive memory bank (CLIP-style).
 
-    The geometric residual converges to a consistent attractor (by design).
-    The bank provides discriminative pressure: different samples should
-    produce distinguishable residuals. Without it, the residual is
-    geometrically consistent but sample-agnostic — "maple" and "oak"
-    can both land at the same point.
+    Aligns content (Stream A CLS) and geometry (geo_residual CLS)
+    through contrastive learning. Same sample's content and geometry
+    should match; different samples' should not.
 
-    The bank stores detached geo_residuals from recent batches as keys.
-    The current batch's residual is the query. InfoNCE asks: "can I
-    identify which sample produced this geometric residual among K
-    recent alternatives?"
+    Bank stores projected geo_residual keys from recent batches.
+    Query is projected content CLS from current batch.
+    Positive pair: (content_i, geometry_i) from same sample.
+    Negatives: geometry from bank.
 
-    Gradient flows: InfoNCE loss → query (current geo_residual) →
-    geo_proj → patchwork → CM-gated triangulation → constellation.
-    The bank entries are detached — no momentum encoder needed.
+    Gradient flows through BOTH streams:
+      - Content CLS → transformer → input (learns distinctive content)
+      - Geo residual CLS → geo_proj → patchwork → CM gate → constellation
+        (learns to observe what content finds relevant)
 
     Args:
-        feature_dim: dimension of geo_residual (pw_dim = n_comp * d_comp)
-        bank_size: number of entries in the queue (default 4096)
-        temperature: InfoNCE temperature (default 0.1)
+        bank_size: number of entries in the queue
+        proj_dim: shared projection dimension for content and geometry
+        temperature: InfoNCE temperature
     """
-    def __init__(self, feature_dim, bank_size=4096, temperature=0.1):
+    def __init__(self, proj_dim, bank_size=4096, temperature=0.1):
         super().__init__()
-        self.feature_dim = feature_dim
+        self.proj_dim = proj_dim
         self.bank_size = bank_size
         self.temperature = temperature
 
-        # Queue buffer — not a parameter, not updated by optimizer
-        self.register_buffer('queue', torch.randn(bank_size, feature_dim))
+        # Queue of projected geo_residual keys
+        self.register_buffer('queue', torch.randn(bank_size, proj_dim))
         self.queue = F.normalize(self.queue, dim=-1)
         self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
 
     @torch.no_grad()
     def enqueue(self, keys):
-        """Add batch of keys to the queue. Called AFTER backward.
-
+        """Add projected geo keys to queue. Called AFTER backward.
         Args:
-            keys: (B, feature_dim) detached, normalized geo_residuals
+            keys: (B, proj_dim) normalized projected geo_residual CLS
         """
         B = keys.shape[0]
         ptr = int(self.queue_ptr.item())
-
-        # Handle wrap-around
         if ptr + B <= self.bank_size:
             self.queue[ptr:ptr + B] = keys
         else:
             overflow = (ptr + B) - self.bank_size
             self.queue[ptr:] = keys[:B - overflow]
             self.queue[:overflow] = keys[B - overflow:]
-
         self.queue_ptr[0] = (ptr + B) % self.bank_size
 
-    def forward(self, queries):
-        """Compute uniformity loss: push residuals apart from bank.
-
-        No explicit positive needed — the task loss (CE) pulls residuals
-        toward class-appropriate geometry. This loss pushes them apart
-        from everything in the bank. The two forces together create
-        sample-discriminative residuals that are also task-relevant.
-
-        log-sum-exp of similarities: penalizes being close to ANY bank entry.
-        When residuals are collapsed (all identical), all logits ≈ 1/temp,
-        gradient pushes queries away from stale copies. When diverse,
-        gradient pushes away from nearest bank neighbors.
+    def forward(self, content_proj, geo_proj):
+        """Cross-stream InfoNCE: content queries vs geometry keys.
 
         Args:
-            queries: (B, feature_dim) — current batch's geo_residuals (LIVE, has grad)
+            content_proj: (B, proj_dim) — projected content CLS (LIVE, has grad)
+            geo_proj: (B, proj_dim) — projected geo_residual CLS (LIVE, has grad)
 
         Returns:
-            loss: scalar uniformity loss
-            avg_sim: mean similarity to bank (diagnostic — should decrease over training)
+            loss: scalar InfoNCE loss
+            acc: top-1 retrieval accuracy (diagnostic)
         """
-        queries = F.normalize(queries, dim=-1)  # (B, D)
-        keys = self.queue.clone().detach()       # (K, D) — no grad to bank
+        q = F.normalize(content_proj, dim=-1)  # (B, D)
+        k_pos = F.normalize(geo_proj, dim=-1)  # (B, D) — positive keys
+        k_neg = self.queue.clone().detach()     # (K, D) — negative keys from bank
 
-        # Similarity to all bank entries
-        logits = queries @ keys.T / self.temperature  # (B, K)
+        # Positive logits: each content matches its own geometry
+        pos_logits = (q * k_pos).sum(dim=-1, keepdim=True) / self.temperature  # (B, 1)
 
-        # Uniformity: minimize log-sum-exp of similarities
-        # = push each query away from all bank entries
-        loss = logits.logsumexp(dim=-1).mean()
+        # Negative logits: each content vs all bank geometry
+        neg_logits = q @ k_neg.T / self.temperature  # (B, K)
 
-        # Diagnostic: average similarity (not logsumexp)
+        # InfoNCE: positive is column 0
+        logits = torch.cat([pos_logits, neg_logits], dim=1)  # (B, 1+K)
+        labels = torch.zeros(q.shape[0], dtype=torch.long, device=q.device)
+
+        loss = F.cross_entropy(logits, labels)
+
         with torch.no_grad():
-            avg_sim = (queries @ keys.T).mean()
+            acc = (logits.argmax(dim=1) == 0).float().mean()
 
-        return loss, avg_sim
+        return loss, acc
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -975,13 +966,16 @@ class GeometricTransformer(BaseTower):
 
         self.attach('final_norm', nn.LayerNorm(d_model))
 
-        # InfoNCE memory bank on geometric residual
-        # The bank loss flows through nce_proj only — NOT the constellation.
-        # nce_proj learns to read discriminative features from the residual.
-        # The constellation is protected: only geometric losses move anchors.
+        # Cross-stream contrastive (CLIP-style): content CLS vs geometry CLS
+        # Two projections map content (d_model) and geometry (pw_dim) to shared space
         if nce_bank_size > 0:
-            nce_proj_dim = self._pw_dim
-            self.attach('nce_proj', nn.Sequential(
+            nce_proj_dim = 128
+            self.attach('nce_content_proj', nn.Sequential(
+                nn.Linear(d_model, nce_proj_dim),
+                nn.GELU(),
+                nn.Linear(nce_proj_dim, nce_proj_dim),
+            ))
+            self.attach('nce_geo_proj', nn.Sequential(
                 nn.Linear(self._pw_dim, nce_proj_dim),
                 nn.GELU(),
                 nn.Linear(nce_proj_dim, nce_proj_dim),
@@ -1058,62 +1052,49 @@ class GeometricTransformer(BaseTower):
             losses['geo_total'] = losses['cv'] + losses['spread']
         return losses
 
-    def infonce_loss(self, geo_residual=None, cls_index=0):
-        """Uniformity loss on geometric residual via learned projection.
+    def infonce_loss(self, cls_index=0):
+        """Cross-stream contrastive loss (CLIP-style).
 
-        The CLS token's residual is DETACHED from the geometric pipeline,
-        then passed through nce_proj (trainable). This means:
-          - Gradient flows into nce_proj (learns to read discriminative features)
-          - Gradient does NOT flow into constellation, patchwork, or geo_proj
-          - The constellation is protected — only geometric losses move anchors
+        Content CLS (from hidden states) queries against geometry CLS
+        (from geo_residual). Same sample's content and geometry should match;
+        different samples' should not.
 
-        The bank provides discriminative pressure on the projection head.
-        If the residual IS sample-discriminative (from CM-conditioned accumulation),
-        nce_proj amplifies it and loss drops. If not, loss stays high — honest
-        diagnostic of residual quality.
+        Gradient flows through BOTH streams:
+          - Content projection ← hidden state ← transformer ← input
+          - Geometry projection ← geo_residual ← geo_proj ← patchwork ← CM gate
 
-        Args:
-            geo_residual: (B, L, pw_dim) or None (uses cached from last forward)
-            cls_index: which position to use as per-sample signature (default 0 = CLS)
+        Uses cached tensors from last forward pass.
 
         Returns:
-            dict with 'nce': loss tensor, 'nce_avg_sim': avg similarity to bank
+            dict with 'nce': loss tensor, 'nce_acc': retrieval accuracy
         """
         if not self.has('nce_bank'):
             return {}
 
-        if geo_residual is None:
-            geo_residual = getattr(self, '_last_geo_residual', None)
-        if geo_residual is None:
+        hidden = getattr(self, '_last_hidden', None)
+        geo_residual = getattr(self, '_last_geo_residual', None)
+        if hidden is None or geo_residual is None:
             return {}
 
-        # DETACH: stop gradient from reaching constellation/patchwork/geo_proj
-        cls_residual = geo_residual[:, cls_index].detach()  # (B, pw_dim)
-        # PROJECT: nce_proj IS trainable — learns to amplify discriminative dims
-        projected = self['nce_proj'](cls_residual)  # (B, proj_dim)
-        loss, avg_sim = self['nce_bank'](projected)
-        return {'nce': loss, 'nce_avg_sim': avg_sim}
+        # Project both streams to shared space — BOTH have gradient
+        content_cls = self['nce_content_proj'](hidden[:, cls_index])
+        geo_cls = self['nce_geo_proj'](geo_residual[:, cls_index])
+
+        loss, acc = self['nce_bank'](content_cls, geo_cls)
+        return {'nce': loss, 'nce_acc': acc}
 
     @torch.no_grad()
-    def update_nce_bank(self, geo_residual=None, cls_index=0):
-        """Enqueue current batch's projected residuals into the bank.
-
-        Projects through nce_proj before enqueuing so bank entries match
-        the query space used in forward().
-
-        Call AFTER backward.
-        """
-        if not self.has('nce_bank') or not self.has('nce_proj'):
+    def update_nce_bank(self, cls_index=0):
+        """Enqueue projected geo keys into bank. Call AFTER backward."""
+        if not self.has('nce_bank') or not self.has('nce_geo_proj'):
             return
 
-        if geo_residual is None:
-            geo_residual = getattr(self, '_last_geo_residual', None)
+        geo_residual = getattr(self, '_last_geo_residual', None)
         if geo_residual is None:
             return
 
-        cls_residual = geo_residual[:, cls_index].detach()
-        projected = self['nce_proj'](cls_residual)
-        self['nce_bank'].enqueue(F.normalize(projected, dim=-1))
+        geo_cls = self['nce_geo_proj'](geo_residual[:, cls_index].detach())
+        self['nce_bank'].enqueue(F.normalize(geo_cls, dim=-1))
 
     def anchor_diagnostics(self):
         """Per-layer anchor health diagnostics. Call for monitoring."""
@@ -1187,8 +1168,9 @@ class GeometricTransformer(BaseTower):
                 x = self[f'cross_rot_{i}'](x)
                 # geo_residual NOT rotated — lives in patchwork space, basis-independent
 
-        # Cache for infonce_loss / update_nce_bank
+        # Cache for cross-stream contrastive: content CLS vs geometry CLS
         self._last_geo_residual = geo_residual
+        self._last_hidden = x  # pre-norm hidden states — content representation
 
         x = self['final_norm'](x)
         if self.has('head'):
