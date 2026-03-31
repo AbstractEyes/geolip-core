@@ -61,6 +61,7 @@ try:
     from geolip_core.core.distinguish.losses import (
         observer_loss as _geolip_observer_loss,
         ce_loss_paired as _geolip_ce_loss_paired,
+        spread_loss as _geolip_spread_loss,
     )
     _HAS_GEOLIP = True
 except ImportError:
@@ -1311,6 +1312,21 @@ class GeometricTransformer(BaseTower):
             loss = obs_loss
 
         ld['loss_observer'] = obs_loss.item()
+
+        # Spread maintenance for non-final layers — observer_loss only
+        # covers the final layer's anchors. Without this, layers 0..N-2
+        # have zero repulsion pressure and their anchors can collapse.
+        w_spread = loss_kwargs.get('w_spread', 0.01)
+        if self.n_layers > 1 and w_spread > 0:
+            other_spread = torch.tensor(0.0, device=anchors.device)
+            for i in range(self.n_layers - 1):
+                layer = self[f'layer_{i}']
+                layer_anchors = layer['observer'].association.constellation.anchors
+                other_spread = other_spread + _geolip_spread_loss(layer_anchors)
+            other_spread = w_spread * other_spread / (self.n_layers - 1)
+            loss = loss + other_spread
+            ld['spread_other_layers'] = other_spread.item()
+
         ld['total'] = loss
         return loss, ld
 
