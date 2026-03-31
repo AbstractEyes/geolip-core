@@ -58,6 +58,12 @@ try:
     from geolip_core.pipeline.observer import (
         TorchComponent, BaseTower, Input, Curation, Distinction,
     )
+    from geolip_core.core.distinguish.losses import (
+        observer_loss as _geolip_observer_loss,
+        ce_loss_paired as _geolip_ce_loss_paired,
+        cv_loss as _geolip_cv_loss,
+        spread_loss as _geolip_spread_loss,
+    )
     _HAS_GEOLIP = True
 except ImportError:
     _HAS_GEOLIP = False
@@ -1185,6 +1191,141 @@ class GeometricTransformer(BaseTower):
 
         return (x, geo_states) if return_geo_state else x
 
+    # ── Paired forward + observer loss ──────────────────────────────
+
+    def _run_view(self, x, attn_mask=None, key_padding_mask=None):
+        """Run one view through the full pipeline.
+
+        Returns:
+            features: (B, L, D) transformed hidden states (post-norm)
+            geo_states: list of per-layer geo_state dicts
+        """
+        geo_states = []
+        has_xrot = self.has('cross_rot_0')
+        geo_residual = None
+
+        if self.has('embed') and x.dtype in (torch.long, torch.int32, torch.int64):
+            pos = torch.arange(x.shape[1], device=x.device)
+            x = self['embed'](x) + self['pos_embed'](pos)
+
+        for i in range(self.n_layers):
+            x, geo_residual, geo_state = self[f'layer_{i}'](
+                x, geo_residual=geo_residual,
+                attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+            geo_states.append(geo_state)
+            if has_xrot and i < self.n_layers - 1:
+                x = self[f'cross_rot_{i}'](x)
+
+        x = self['final_norm'](x)
+        return x, geo_states
+
+    def forward_paired(self, x1, x2, cls_index=0,
+                       attn_mask=None, key_padding_mask=None):
+        """Dual-view forward for observer loss training.
+
+        Runs both views through the full CM-gated pipeline, extracts
+        CLS-position geometric state from the final layer, and packages
+        into the observe_paired output format expected by observer_loss().
+
+        Args:
+            x1, x2: (B, L, D) two views of input hidden states
+            cls_index: position index for image-level outputs (default 0)
+
+        Returns:
+            output dict matching observer_loss spec:
+                embedding, embedding_aug, patchwork1, patchwork1_aug,
+                bridge1, bridge2, assign1, assign2, cos1, tri1, tri2
+            Plus: features1, features2, geo_states1, geo_states2
+        """
+        feat1, gs1 = self._run_view(x1, attn_mask, key_padding_mask)
+        feat2, gs2 = self._run_view(x2, attn_mask, key_padding_mask)
+
+        # Extract CLS position from final layer geo_state
+        g1 = gs1[-1]
+        g2 = gs2[-1]
+        c = cls_index
+
+        return {
+            # observe_paired format — what observer_loss reads
+            'embedding':      g1['embedding'][:, c],
+            'embedding_aug':  g2['embedding'][:, c],
+            'patchwork1':     g1['patchwork'][:, c],
+            'patchwork1_aug': g2['patchwork'][:, c],
+            'bridge1':        g1['bridge'][:, c],
+            'bridge2':        g2['bridge'][:, c],
+            'assign1':        g1['assignment'][:, c],
+            'assign2':        g2['assignment'][:, c],
+            'cos1':           g1['cos_to_anchors'][:, c],
+            'tri1':           g1['triangulation'][:, c],
+            'tri2':           g2['triangulation'][:, c],
+            # Full features for task head
+            'features1':      feat1,
+            'features2':      feat2,
+            # Diagnostics
+            'gate_values1':   g1['gate_values'][:, c],
+            'gate_values2':   g2['gate_values'][:, c],
+            'cm_quality1':    g1['cm_quality'],
+            'cm_quality2':    g2['cm_quality'],
+            'geo_states1':    gs1,
+            'geo_states2':    gs2,
+        }
+
+    def compute_loss(self, output, targets, cls_index=0,
+                     w_ce=1.0, head=None, **loss_kwargs):
+        """Three-domain observer loss through the CM-gated pipeline.
+
+        Follows ConstellationEncoder.compute_loss pattern:
+            observer_loss (geometric + internal) + CE (external)
+
+        The observer_loss reads patchwork, bridge, assign, tri, cos —
+        all of which flowed through the CM gate during forward_paired.
+
+        Args:
+            output: dict from forward_paired()
+            targets: (B,) class labels
+            cls_index: which position has the CLS token
+            w_ce: weight on cross-entropy loss
+            head: nn.Module mapping (B, D) → (B, num_classes), or None
+            **loss_kwargs: forwarded to observer_loss (w_nce_pw, w_bridge, etc.)
+
+        Returns:
+            (total_loss, loss_dict)
+        """
+        # Get anchors from final layer's constellation
+        final_layer = self[f'layer_{self.n_layers - 1}']
+        anchors = final_layer['observer'].association.constellation.anchors
+
+        # Observer self-organization loss (geometric + internal)
+        obs_loss, ld = _geolip_observer_loss(
+            output, anchors=anchors, targets=targets,
+            **loss_kwargs)
+
+        # Task loss if head provided
+        if head is not None:
+            feat1 = output['features1'][:, cls_index]
+            feat2 = output['features2'][:, cls_index]
+            logits1 = head(feat1)
+            logits2 = head(feat2)
+            l_ce, acc = _geolip_ce_loss_paired(logits1, logits2, targets)
+            ld['ce'], ld['acc'] = l_ce, acc
+            ld['logits'] = logits1
+            loss = w_ce * l_ce + obs_loss
+            ld['loss_task'] = l_ce.item()
+        else:
+            loss = obs_loss
+
+        # Anchor maintenance across ALL layers (not just final)
+        total_spread = torch.tensor(0.0, device=anchors.device)
+        for i in range(self.n_layers):
+            layer = self[f'layer_{i}']
+            layer_anchors = layer['observer'].association.constellation.anchors
+            total_spread = total_spread + _geolip_spread_loss(layer_anchors)
+        ld['spread_all_layers'] = total_spread / self.n_layers
+
+        ld['loss_observer'] = obs_loss.item()
+        ld['total'] = loss
+        return loss, ld
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FACTORIES
@@ -1312,6 +1453,69 @@ if __name__ == '__main__':
     print(f"    cv_loss:    {geo_losses['cv'].item():.6f}")
     print(f"    spread_loss:{geo_losses['spread'].item():.6f}")
     print(f"    total:      {total_loss.item():.4f}")
+
+    # ── Paired forward + observer loss (if geolip_core available) ──
+    if _HAS_GEOLIP:
+        print(f"\n  Paired forward + observer loss:")
+        model.zero_grad()
+
+        x1 = torch.randn(B, L, D, device=device)
+        x2 = x1 + 0.1 * torch.randn_like(x1)  # view 2 = slight perturbation
+        targets = torch.randint(0, 10, (B,), device=device)
+
+        output = model.forward_paired(x1, x2)
+        print(f"    Output keys: {sorted(k for k in output if not k.startswith('geo_'))}")
+        for k in ['embedding', 'patchwork1', 'bridge1', 'assign1', 'tri1']:
+            print(f"    {k}: {output[k].shape}")
+
+        # Task head for CE
+        num_classes = 10
+        head = nn.Linear(D, num_classes).to(device)
+
+        loss, ld = model.compute_loss(output, targets, head=head)
+        print(f"\n    Three-domain loss breakdown:")
+        for k in ['loss_observer', 'loss_task', 'ce', 'nce_emb', 'nce_pw',
+                   'bridge', 'assign', 'assign_nce', 'nce_tri', 'attract',
+                   'cv', 'spread']:
+            if k in ld:
+                v = ld[k]
+                v = v.item() if isinstance(v, torch.Tensor) else v
+                print(f"      {k:16s} = {v:.4f}")
+        for k in ['nce_emb_acc', 'nce_pw_acc', 'nce_tri_acc', 'bridge_acc',
+                   'assign_nce_acc', 'acc']:
+            if k in ld:
+                v = ld[k]
+                v = v if isinstance(v, float) else v.item()
+                print(f"      {k:16s} = {v*100:.1f}%")
+        print(f"      {'TOTAL':16s} = {loss.item():.4f}")
+
+        # Verify backward through observer loss
+        loss.backward()
+        alive, dead = 0, 0
+        for n, p in model.named_parameters():
+            if p.grad is not None and p.grad.norm() > 0:
+                alive += 1
+            else:
+                dead += 1
+        print(f"\n    Gradient flow: {alive} params alive, {dead} dead")
+
+        # Check critical components
+        for i in range(model.n_layers):
+            layer = model[f'layer_{i}']
+            for comp_name in ['cm_gate', 'observer']:
+                has = any(p.grad is not None and p.grad.norm() > 0
+                          for p in layer[comp_name].parameters())
+                print(f"    layer_{i}.{comp_name}: {'LIVE' if has else 'DEAD'}")
+
+        # Bridge specifically — was never used in loss before
+        for i in range(model.n_layers):
+            layer = model[f'layer_{i}']
+            bridge = layer['observer'].curation.bridge
+            has = any(p.grad is not None and p.grad.norm() > 0
+                      for p in bridge.parameters())
+            print(f"    layer_{i}.bridge: {'LIVE' if has else 'DEAD'}")
+    else:
+        print(f"\n  [SKIP] forward_paired + compute_loss require geolip_core imports")
 
     print(f"\n{'='*60}")
     print(f"  PASSED — CM-validated pipeline operational")
