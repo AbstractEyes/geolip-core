@@ -1233,9 +1233,9 @@ class GeometricTransformer(BaseTower):
                        attn_mask=None, key_padding_mask=None):
         """Dual-view forward for observer loss training.
 
-        Runs both views through the full CM-gated pipeline, extracts
-        CLS-position geometric state from the final layer, and packages
-        into the observe_paired output format expected by observer_loss().
+        Concatenates both views along batch dim → single forward pass →
+        splits output. Same compute, half the batches, double GPU utilization.
+        Attention is per-sample (batch_first), so views don't cross-attend.
 
         Args:
             x1, x2: (B, L, D) two views of input hidden states
@@ -1247,33 +1247,32 @@ class GeometricTransformer(BaseTower):
                 bridge1, bridge2, assign1, assign2, cos1, tri1, tri2
             Plus: features1, features2, gate_values, cm_quality
         """
-        feat1, gs1 = self._run_view(x1, attn_mask, key_padding_mask)
-        feat2, gs2 = self._run_view(x2, attn_mask, key_padding_mask)
+        B = x1.shape[0]
+        x_cat = torch.cat([x1, x2], dim=0)  # (2B, L, D)
+        feat_cat, gs = self._run_view(x_cat, attn_mask, key_padding_mask)
 
-        # gs1, gs2 are final layer geo_state dicts (not lists)
         c = cls_index
-
         return {
             # observe_paired format — what observer_loss reads
-            'embedding':      gs1['embedding'][:, c],
-            'embedding_aug':  gs2['embedding'][:, c],
-            'patchwork1':     gs1['patchwork'][:, c],
-            'patchwork1_aug': gs2['patchwork'][:, c],
-            'bridge1':        gs1['bridge'][:, c],
-            'bridge2':        gs2['bridge'][:, c],
-            'assign1':        gs1['assignment'][:, c],
-            'assign2':        gs2['assignment'][:, c],
-            'cos1':           gs1['cos_to_anchors'][:, c],
-            'tri1':           gs1['triangulation'][:, c],
-            'tri2':           gs2['triangulation'][:, c],
+            'embedding':      gs['embedding'][:B, c],
+            'embedding_aug':  gs['embedding'][B:, c],
+            'patchwork1':     gs['patchwork'][:B, c],
+            'patchwork1_aug': gs['patchwork'][B:, c],
+            'bridge1':        gs['bridge'][:B, c],
+            'bridge2':        gs['bridge'][B:, c],
+            'assign1':        gs['assignment'][:B, c],
+            'assign2':        gs['assignment'][B:, c],
+            'cos1':           gs['cos_to_anchors'][:B, c],
+            'tri1':           gs['triangulation'][:B, c],
+            'tri2':           gs['triangulation'][B:, c],
             # Full features for task head
-            'features1':      feat1,
-            'features2':      feat2,
+            'features1':      feat_cat[:B],
+            'features2':      feat_cat[B:],
             # Diagnostics
-            'gate_values1':   gs1['gate_values'][:, c],
-            'gate_values2':   gs2['gate_values'][:, c],
-            'cm_quality1':    gs1['cm_quality'],
-            'cm_quality2':    gs2['cm_quality'],
+            'gate_values1':   gs['gate_values'][:B, c],
+            'gate_values2':   gs['gate_values'][B:, c],
+            'cm_quality1':    gs['cm_quality'][:B],
+            'cm_quality2':    gs['cm_quality'][B:],
         }
 
     def compute_loss(self, output, targets, cls_index=0,
