@@ -730,7 +730,8 @@ class ContentAttention(TorchComponent):
 
     def forward(self, x, attn_mask=None, key_padding_mask=None):
         a, _ = self.attn(x, x, x, attn_mask=attn_mask,
-                         key_padding_mask=key_padding_mask)
+                         key_padding_mask=key_padding_mask,
+                         need_weights=False)
         x = self.norm(x + a)
         x = self.ffn_norm(x + self.ffn(x))
         return x
