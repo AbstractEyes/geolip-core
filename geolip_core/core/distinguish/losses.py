@@ -82,8 +82,10 @@ def _sequential_pentachoron_volumes(emb, n_samples=200, n_points=5):
     return torch.stack(vols)
 
 
+@torch.compiler.disable
 def cv_loss(emb, target=0.22, n_samples=64, n_points=5, batched=True):
-    """Differentiable CV loss. Returns (CV - target)²."""
+    """Differentiable CV loss. Returns (CV - target)².
+    Excluded from torch.compile — linalg.det not CUDA-graph-safe."""
     if emb.shape[0] < n_points:
         return torch.tensor(0.0, device=emb.device, requires_grad=True)
     vols = _batch_pentachoron_volumes(emb, n_samples, n_points) if batched else _sequential_pentachoron_volumes(emb, n_samples, n_points)
@@ -111,6 +113,7 @@ def cv_multi_scale(emb, scales=(3, 4, 5, 6, 7, 8), n_samples=100, batched=True):
     return results
 
 
+@torch.compiler.disable
 def cayley_menger_vol2(points):
     """Squared simplex volume. points: (B, N, D) → (B,)."""
     B, N, D = points.shape
