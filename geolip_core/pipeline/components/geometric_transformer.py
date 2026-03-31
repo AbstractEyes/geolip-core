@@ -1053,17 +1053,21 @@ class GeometricTransformer(BaseTower):
         return losses
 
     def infonce_loss(self, cls_index=0):
-        """Cross-stream contrastive loss (CLIP-style).
+        """Cross-stream contrastive: content queries against decoupled geometry.
 
-        Content CLS (from hidden states) queries against geometry CLS
-        (from geo_residual). Same sample's content and geometry should match;
-        different samples' should not.
+        The constellation provides a STABLE geometric reference frame.
+        The content stream needs discriminative correction.
+        The InfoNCE targets weaker content representations by measuring
+        them against the constellation's observation.
 
-        Gradient flows through BOTH streams:
-          - Content projection ← hidden state ← transformer ← input
-          - Geometry projection ← geo_residual ← geo_proj ← patchwork ← CM gate
+        Gradient path (info-side only):
+          - nce_content_proj ← hidden_cls ← transformer ← input  (LIVE)
+          - nce_geo_proj ← learns to read detached residual       (LIVE proj, FROZEN input)
+          - geo_residual ← constellation/patchwork/geo_proj       (DETACHED — decoupled)
 
-        Uses cached tensors from last forward pass.
+        The constellation's anchors never see NCE gradient.
+        Both projection heads learn from InfoNCE to find shared space.
+        Content stream receives corrective gradient at weak positions.
 
         Returns:
             dict with 'nce': loss tensor, 'nce_acc': retrieval accuracy
@@ -1076,9 +1080,12 @@ class GeometricTransformer(BaseTower):
         if hidden is None or geo_residual is None:
             return {}
 
-        # Project both streams to shared space — BOTH have gradient
+        # Content CLS → shared space (LIVE — info-side gets gradient)
         content_cls = self['nce_content_proj'](hidden[:, cls_index])
-        geo_cls = self['nce_geo_proj'](geo_residual[:, cls_index])
+
+        # Geo residual CLS → shared space (DETACHED input — constellation decoupled)
+        # nce_geo_proj itself IS trainable — learns to read the frozen residual
+        geo_cls = self['nce_geo_proj'](geo_residual[:, cls_index].detach())
 
         loss, acc = self['nce_bank'](content_cls, geo_cls)
         return {'nce': loss, 'nce_acc': acc}
