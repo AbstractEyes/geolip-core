@@ -45,209 +45,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# GEOLIP IMPORTS — real components, not reimplementations
+# IMPORTS — hard dependencies, no fallback stubs
 # ═══════════════════════════════════════════════════════════════════════════════
 
-try:
-    from geolip_core.core.associate.constellation import (
-        ConstellationObserver, ConstellationAssociation, ConstellationCuration,
-        Constellation, init_anchors_repulsion,
-    )
-    from geolip_core.core.curate.gate import AnchorGate as _GeolipAnchorGate
-    from geolip_core.pipeline.observer import (
-        TorchComponent, BaseTower, Input, Curation, Distinction,
-    )
-    from geolip_core.core.distinguish.losses import (
-        observer_loss as _geolip_observer_loss,
-        ce_loss_paired as _geolip_ce_loss_paired,
-        spread_loss as _geolip_spread_loss,
-    )
-    _HAS_GEOLIP = True
-except ImportError:
-    _HAS_GEOLIP = False
-
-    # ── Fallback stubs ──
-    class TorchComponent(nn.Module):
-        def __init__(self, name=None, **kwargs):
-            super().__init__()
-            self._component_name = name or self.__class__.__name__
-
-    class BaseTower(nn.Module):
-        def __init__(self, name=None, **kwargs):
-            super().__init__()
-            self._tower_name = name or self.__class__.__name__
-            self._components = nn.ModuleDict()
-            self._cache = {}
-
-        def attach(self, name, module):
-            if isinstance(module, nn.Module):
-                self._components[name] = module
-            return self
-
-        def has(self, name):
-            return name in self._components
-
-        def __getitem__(self, key):
-            return self._components[key]
-
-        def cache_set(self, key, value):
-            self._cache[key] = value
-
-        def cache_get(self, key, default=None):
-            return self._cache.get(key, default)
-
-        def cache_clear(self):
-            self._cache.clear()
-
-    Input = TorchComponent
-    Curation = TorchComponent
-    Distinction = TorchComponent
-
-    class Constellation(nn.Module):
-        """Learned anchors on S^(d-1). Triangulates input embeddings."""
-        def __init__(self, n_anchors, dim, anchor_drop=0.0, anchor_init='repulsion'):
-            super().__init__()
-            self.n_anchors = n_anchors
-            self.dim = dim
-            anchors = torch.randn(n_anchors, dim)
-            anchors = F.normalize(anchors, dim=-1)
-            for _ in range(200):
-                sim = anchors @ anchors.T
-                sim.fill_diagonal_(-2.0)
-                anchors = F.normalize(anchors - 0.05 * anchors[sim.argmax(dim=1)], dim=-1)
-            self.anchors = nn.Parameter(anchors)
-
-        def forward(self, emb, training=False):
-            anchors = F.normalize(self.anchors, dim=-1)
-            cos = emb @ anchors.T
-            tri = 1.0 - cos
-            _, nearest = cos.max(dim=-1)
-            return tri, nearest
-
-    class ConstellationAssociation(TorchComponent):
-        """Association through constellation anchors."""
-        def __init__(self, dim=256, n_anchors=32, anchor_drop=0.0,
-                     anchor_init='repulsion', assign_temp=0.1, **kwargs):
-            super().__init__(**kwargs)
-            self.assign_temp = assign_temp
-            self.constellation = Constellation(n_anchors, dim, anchor_drop, anchor_init)
-
-        @property
-        def frame_dim(self):
-            return self.constellation.n_anchors
-
-        def associate(self, emb, **context):
-            anchors_n = F.normalize(self.constellation.anchors, dim=-1)
-            cos = emb @ anchors_n.T
-            tri = 1.0 - cos
-            _, nearest = cos.max(dim=-1)
-            soft_assign = F.softmax(cos / self.assign_temp, dim=-1)
-            mag = context.get('mag', None)
-            distances_weighted = tri * mag if mag is not None else tri
-            return {
-                'distances': tri, 'distances_weighted': distances_weighted,
-                'cos_to_anchors': cos, 'assignment': soft_assign,
-                'nearest': nearest,
-            }
-
-        def forward(self, emb, **context):
-            return self.associate(emb, **context)
-
-    class Patchwork(nn.Module):
-        """Round-robin patchwork compartments."""
-        def __init__(self, n_anchors, n_comp=8, d_comp=32, activation='gelu'):
-            super().__init__()
-            self.n_comp = n_comp
-            anchors_per = max(1, n_anchors // n_comp)
-            self.compartments = nn.ModuleList([
-                nn.Sequential(nn.Linear(anchors_per, d_comp), nn.GELU(), nn.Linear(d_comp, d_comp))
-                for _ in range(n_comp)
-            ])
-            self.output_dim = n_comp * d_comp
-            self.anchors_per = anchors_per
-
-        def forward(self, distances):
-            parts = []
-            for i, comp in enumerate(self.compartments):
-                start = i * self.anchors_per
-                end = start + self.anchors_per
-                chunk = distances[..., start:end]
-                if chunk.shape[-1] < self.anchors_per:
-                    chunk = F.pad(chunk, (0, self.anchors_per - chunk.shape[-1]))
-                parts.append(comp(chunk))
-            return torch.cat(parts, dim=-1)
-
-    class ConstellationCuration(Curation):
-        """Curation through patchwork compartments + bridge."""
-        def __init__(self, n_anchors=32, dim=256, n_comp=8, d_comp=32,
-                     activation='gelu', **kwargs):
-            super().__init__(**kwargs)
-            self.dim = dim
-            self.n_anchors = n_anchors
-            self.patchwork = Patchwork(n_anchors, n_comp, d_comp, activation)
-            pw_dim = self.patchwork.output_dim
-            self.bridge = nn.Linear(pw_dim, n_anchors)
-            self._feature_dim = n_anchors + pw_dim + dim
-
-        @property
-        def feature_dim(self):
-            return self._feature_dim
-
-        def curate_full(self, association_output, emb=None, **context):
-            distances = association_output['distances_weighted']
-            assignment = association_output['assignment']
-            pw = self.patchwork(distances)
-            bridge = self.bridge(pw)
-            parts = [assignment, pw]
-            if emb is not None:
-                parts.append(emb)
-            features = torch.cat(parts, dim=-1)
-            return {'patchwork': pw, 'bridge': bridge, 'features': features}
-
-        def forward(self, association_output, emb=None, **context):
-            return self.curate_full(association_output, emb=emb, **context)['features']
-
-    class ConstellationObserver(nn.Module):
-        """Composed association + curation."""
-        def __init__(self, dim=256, n_anchors=32, n_comp=8, d_comp=32,
-                     anchor_drop=0.0, anchor_init='repulsion',
-                     activation='gelu', assign_temp=0.1):
-            super().__init__()
-            self.association = ConstellationAssociation(
-                dim=dim, n_anchors=n_anchors, anchor_drop=anchor_drop,
-                anchor_init=anchor_init, assign_temp=assign_temp)
-            self.curation = ConstellationCuration(
-                n_anchors=n_anchors, dim=dim, n_comp=n_comp,
-                d_comp=d_comp, activation=activation)
-
-        @property
-        def constellation(self):
-            return self.association.constellation
-
-        @property
-        def patchwork(self):
-            return self.curation.patchwork
-
-        @property
-        def feature_dim(self):
-            return self.curation.feature_dim
-
-        def observe(self, emb, **context):
-            a_out = self.association(emb, **context)
-            c_out = self.curation.curate_full(a_out, emb=emb, **context)
-            return {
-                'embedding': emb, 'features': c_out['features'],
-                'triangulation': a_out['distances'],
-                'cos_to_anchors': a_out['cos_to_anchors'],
-                'nearest': a_out['nearest'],
-                'assignment': a_out['assignment'],
-                'patchwork': c_out['patchwork'], 'bridge': c_out['bridge'],
-            }
-
-        def forward(self, emb, **context):
-            return self.observe(emb, **context)
-
+from geolip_core.core.associate.constellation import (
+    ConstellationObserver, ConstellationAssociation, ConstellationCuration,
+    Constellation, init_anchors_repulsion,
+)
+from geolip_core.core.curate.gate import AnchorGate as _GeolipAnchorGate
+from geolip_core.pipeline.observer import (
+    TorchComponent, BaseTower, Input, Curation, Distinction,
+)
+from geolip_core.core.distinguish.losses import (
+    observer_loss as _geolip_observer_loss,
+    ce_loss_paired as _geolip_ce_loss_paired,
+    spread_loss as _geolip_spread_loss,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CAYLEY-MENGER VALIDITY — geometric quality measurement
@@ -1368,7 +1183,6 @@ def geo_transformer_vision(name='geo_vit', n_layers=4, **kw):
 
 if __name__ == '__main__':
     print("Geometric Transformer — CM Validated — Self-Test")
-    print(f"  geolip_core available: {_HAS_GEOLIP}")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1466,68 +1280,65 @@ if __name__ == '__main__':
     print(f"    spread_loss:{geo_losses['spread'].item():.6f}")
     print(f"    total:      {total_loss.item():.4f}")
 
-    # ── Paired forward + observer loss (if geolip_core available) ──
-    if _HAS_GEOLIP:
-        print(f"\n  Paired forward + observer loss:")
-        model.zero_grad()
+    # ── Paired forward + observer loss ──
+    print(f"\n  Paired forward + observer loss:")
+    model.zero_grad()
 
-        x1 = torch.randn(B, L, D, device=device)
-        x2 = x1 + 0.1 * torch.randn_like(x1)  # view 2 = slight perturbation
-        targets = torch.randint(0, 10, (B,), device=device)
+    x1 = torch.randn(B, L, D, device=device)
+    x2 = x1 + 0.1 * torch.randn_like(x1)  # view 2 = slight perturbation
+    targets = torch.randint(0, 10, (B,), device=device)
 
-        output = model.forward_paired(x1, x2)
-        print(f"    Output keys: {sorted(k for k in output if not k.startswith('geo_'))}")
-        for k in ['embedding', 'patchwork1', 'bridge1', 'assign1', 'tri1']:
-            print(f"    {k}: {output[k].shape}")
+    output = model.forward_paired(x1, x2)
+    print(f"    Output keys: {sorted(k for k in output if not k.startswith('geo_'))}")
+    for k in ['embedding', 'patchwork1', 'bridge1', 'assign1', 'tri1']:
+        print(f"    {k}: {output[k].shape}")
 
-        # Task head for CE
-        num_classes = 10
-        head = nn.Linear(D, num_classes).to(device)
+    # Task head for CE
+    num_classes = 10
+    head = nn.Linear(D, num_classes).to(device)
 
-        loss, ld = model.compute_loss(output, targets, head=head)
-        print(f"\n    Three-domain loss breakdown:")
-        for k in ['loss_observer', 'loss_task', 'ce', 'nce_emb', 'nce_pw',
-                   'bridge', 'assign', 'assign_nce', 'nce_tri', 'attract',
-                   'cv', 'spread']:
-            if k in ld:
-                v = ld[k]
-                v = v.item() if isinstance(v, torch.Tensor) else v
-                print(f"      {k:16s} = {v:.4f}")
-        for k in ['nce_emb_acc', 'nce_pw_acc', 'nce_tri_acc', 'bridge_acc',
-                   'assign_nce_acc', 'acc']:
-            if k in ld:
-                v = ld[k]
-                v = v if isinstance(v, float) else v.item()
-                print(f"      {k:16s} = {v*100:.1f}%")
-        print(f"      {'TOTAL':16s} = {loss.item():.4f}")
+    loss, ld = model.compute_loss(output, targets, head=head)
+    print(f"\n    Three-domain loss breakdown:")
+    for k in ['loss_observer', 'loss_task', 'ce', 'nce_emb', 'nce_pw',
+               'bridge', 'assign', 'assign_nce', 'nce_tri', 'attract',
+               'cv', 'spread']:
+        if k in ld:
+            v = ld[k]
+            v = v.item() if isinstance(v, torch.Tensor) else v
+            print(f"      {k:16s} = {v:.4f}")
+    for k in ['nce_emb_acc', 'nce_pw_acc', 'nce_tri_acc', 'bridge_acc',
+               'assign_nce_acc', 'acc']:
+        if k in ld:
+            v = ld[k]
+            v = v if isinstance(v, float) else v.item()
+            print(f"      {k:16s} = {v*100:.1f}%")
+    print(f"      {'TOTAL':16s} = {loss.item():.4f}")
 
-        # Verify backward through observer loss
-        loss.backward()
-        alive, dead = 0, 0
-        for n, p in model.named_parameters():
-            if p.grad is not None and p.grad.norm() > 0:
-                alive += 1
-            else:
-                dead += 1
-        print(f"\n    Gradient flow: {alive} params alive, {dead} dead")
+    # Verify backward through observer loss
+    loss.backward()
+    alive, dead = 0, 0
+    for n, p in model.named_parameters():
+        if p.grad is not None and p.grad.norm() > 0:
+            alive += 1
+        else:
+            dead += 1
+    print(f"\n    Gradient flow: {alive} params alive, {dead} dead")
 
-        # Check critical components
-        for i in range(model.n_layers):
-            layer = model[f'layer_{i}']
-            for comp_name in ['cm_gate', 'observer']:
-                has = any(p.grad is not None and p.grad.norm() > 0
-                          for p in layer[comp_name].parameters())
-                print(f"    layer_{i}.{comp_name}: {'LIVE' if has else 'DEAD'}")
-
-        # Bridge specifically — was never used in loss before
-        for i in range(model.n_layers):
-            layer = model[f'layer_{i}']
-            bridge = layer['observer'].curation.bridge
+    # Check critical components
+    for i in range(model.n_layers):
+        layer = model[f'layer_{i}']
+        for comp_name in ['cm_gate', 'observer']:
             has = any(p.grad is not None and p.grad.norm() > 0
-                      for p in bridge.parameters())
-            print(f"    layer_{i}.bridge: {'LIVE' if has else 'DEAD'}")
-    else:
-        print(f"\n  [SKIP] forward_paired + compute_loss require geolip_core imports")
+                      for p in layer[comp_name].parameters())
+            print(f"    layer_{i}.{comp_name}: {'LIVE' if has else 'DEAD'}")
+
+    # Bridge specifically — was never used in loss before
+    for i in range(model.n_layers):
+        layer = model[f'layer_{i}']
+        bridge = layer['observer'].curation.bridge
+        has = any(p.grad is not None and p.grad.norm() > 0
+                  for p in bridge.parameters())
+        print(f"    layer_{i}.bridge: {'LIVE' if has else 'DEAD'}")
 
     print(f"\n{'='*60}")
     print(f"  PASSED — CM-validated pipeline operational")
