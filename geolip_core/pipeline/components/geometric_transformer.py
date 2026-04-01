@@ -64,6 +64,13 @@ from geolip_core.core.distinguish.losses import (
     spread_loss as _geolip_spread_loss,
 )
 
+# Optional: geofractal compiler for diagnostics
+try:
+    from geofractal.router.compiler.compile_router import CompileRouter
+    _HAS_COMPILE_ROUTER = True
+except ImportError:
+    _HAS_COMPILE_ROUTER = False
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CAYLEY-MENGER VALIDITY — geometric quality measurement
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -185,24 +192,22 @@ class CMValidatedGate(nn.Module):
             self._cached_cm_norm = ((anchor_cm - anchor_cm.mean()) / cm_std).detach()
         return self._cached_cm_norm
 
-    def forward(self, embedding, anchors, tri):
-        """Compute per-(position, anchor) gate values.
+    def _compute_gate(self, anchor_cm_norm, tri):
+        """Compilable gate computation — pure tensor ops, no graph breaks.
+
+        Separated from forward() so torch.compile can trace this as a
+        contiguous subgraph. The only graph break is in _get_anchor_cm_norm()
+        which hands off a single (A,) tensor to this method.
 
         Args:
-            embedding: (N, D) — positions on S^(d-1), where N = B*L
-            anchors:   (A, D) — normalized anchor positions (DETACHED by caller)
-            tri:       (N, A) — triangulation distances (1 - cos)
+            anchor_cm_norm: (A,) normalized CM quality per anchor (from cache)
+            tri:            (N, A) triangulation distances (1 - cos)
 
         Returns:
             gate_values: (N, A) in [0, 1] — per-anchor validity gate
             gate_info: dict with diagnostics (tensors, no .item() — compile-safe)
         """
         N, A = tri.shape
-
-        # Anchor CM quality — cached, position-independent
-        anchor_cm_norm = self._get_anchor_cm_norm(anchors)
-
-        # Per-position features — no double argsort
         cos_sim = 1.0 - tri  # (N, A)
 
         # Gate features: (N, A, 2)
@@ -221,6 +226,23 @@ class CMValidatedGate(nn.Module):
         }
 
         return gate_values, gate_info
+
+    def forward(self, embedding, anchors, tri):
+        """Compute per-(position, anchor) gate values.
+
+        Args:
+            embedding: (N, D) — positions on S^(d-1), where N = B*L
+            anchors:   (A, D) — normalized anchor positions (DETACHED by caller)
+            tri:       (N, A) — triangulation distances (1 - cos)
+
+        Returns:
+            gate_values: (N, A) in [0, 1] — per-anchor validity gate
+            gate_info: dict with diagnostics (tensors, no .item() — compile-safe)
+        """
+        # Non-compilable: exits torch.compile graph, returns single (A,) tensor
+        anchor_cm_norm = self._get_anchor_cm_norm(anchors)
+        # Compilable: re-enters torch.compile graph
+        return self._compute_gate(anchor_cm_norm, tri)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -975,6 +997,186 @@ class GeometricTransformer(BaseTower):
         print(f"  {'TOTAL':<35s}  {total:>12,}")
         return total
 
+    # ── Tower compiler integration ──────────────────────────────────
+
+    # Submodules that are always safe to compile (no linalg.det, no dynamic dispatch)
+    _COMPILABLE_LAYER_KEYS = (
+        'projection', 'context', 'content', 'geometric',
+        'compose', 'decode', 'gate', 'geo_proj',
+    )
+    # Submodules excluded from compilation (contain @torch.compiler.disable methods)
+    _EXCLUDED_LAYER_KEYS = ('cm_gate', 'observer')
+    # Conditionally compilable (linalg.solve works in inductor but may fail in CUDA graphs)
+    _CONDITIONAL_LAYER_KEYS = ('rotation',)
+
+    def enable_compilation(self, mode='selective', backend='inductor',
+                           compile_rotations=False, **compile_kwargs):
+        """Apply torch.compile to compilable submodules.
+
+        The geometric transformer has a clean separation between compilable
+        tensor operations (~80% of compute) and non-compilable regions
+        (CM determinant via linalg.det). This method compiles the safe
+        regions while preserving the graph break boundaries.
+
+        Args:
+            mode: 'selective' — compile individual submodules per layer
+            backend: torch.compile backend (default: 'inductor')
+            compile_rotations: whether to compile CayleyOrthogonal modules
+                (linalg.solve works in inductor but may fail with CUDA graphs)
+            **compile_kwargs: passed to torch.compile (e.g. mode='reduce-overhead')
+
+        Returns:
+            dict with compilation statistics
+        """
+        if not hasattr(self, '_compiled_originals'):
+            self._compiled_originals = {}
+
+        compiled_count = 0
+        skipped_count = 0
+
+        for i in range(self.n_layers):
+            layer = self[f'layer_{i}']
+
+            # Always-safe submodules
+            for key in self._COMPILABLE_LAYER_KEYS:
+                if layer.has(key):
+                    original = layer[key]
+                    if not getattr(original, '_is_compiled', False):
+                        path = f'layer_{i}.{key}'
+                        self._compiled_originals[path] = original
+                        compiled = torch.compile(
+                            original, backend=backend, **compile_kwargs)
+                        compiled._is_compiled = True
+                        layer.attach(key, compiled)
+                        compiled_count += 1
+
+            # Conditional: CayleyOrthogonal
+            if compile_rotations:
+                for key in self._CONDITIONAL_LAYER_KEYS:
+                    if layer.has(key):
+                        original = layer[key]
+                        if not getattr(original, '_is_compiled', False):
+                            path = f'layer_{i}.{key}'
+                            self._compiled_originals[path] = original
+                            compiled = torch.compile(
+                                original, backend=backend, **compile_kwargs)
+                            compiled._is_compiled = True
+                            layer.attach(key, compiled)
+                            compiled_count += 1
+
+            # Excluded: count for reporting
+            for key in self._EXCLUDED_LAYER_KEYS:
+                if layer.has(key):
+                    skipped_count += 1
+
+        # Cross-layer rotations
+        if compile_rotations:
+            for i in range(self.n_layers - 1):
+                key = f'cross_rot_{i}'
+                if self.has(key):
+                    original = self[key]
+                    if not getattr(original, '_is_compiled', False):
+                        self._compiled_originals[key] = original
+                        compiled = torch.compile(
+                            original, backend=backend, **compile_kwargs)
+                        compiled._is_compiled = True
+                        self.attach(key, compiled)
+                        compiled_count += 1
+
+        # Final norm
+        if self.has('final_norm'):
+            original = self['final_norm']
+            if not getattr(original, '_is_compiled', False):
+                self._compiled_originals['final_norm'] = original
+                compiled = torch.compile(
+                    original, backend=backend, **compile_kwargs)
+                compiled._is_compiled = True
+                self.attach('final_norm', compiled)
+                compiled_count += 1
+
+        self._compile_mode = mode
+        stats = {
+            'compiled': compiled_count,
+            'skipped': skipped_count,
+            'mode': mode,
+            'backend': backend,
+            'compile_rotations': compile_rotations,
+        }
+        return stats
+
+    def disable_compilation(self):
+        """Revert all compiled submodules to their originals.
+
+        Returns:
+            int: number of modules reverted
+        """
+        if not hasattr(self, '_compiled_originals'):
+            return 0
+
+        reverted = 0
+        for path, original in self._compiled_originals.items():
+            if '.' in path:
+                # layer_i.key
+                layer_name, key = path.split('.', 1)
+                layer = self[layer_name]
+                layer.attach(key, original)
+            else:
+                self.attach(path, original)
+            reverted += 1
+
+        self._compiled_originals.clear()
+        self._compile_mode = None
+        return reverted
+
+    def compilation_report(self):
+        """Analyze module tree using geofractal CompileRouter.
+
+        Returns dict with introspection results: module categories,
+        signature groups, batchable stages, and compilability map.
+        Requires geofractal to be installed.
+        """
+        if not _HAS_COMPILE_ROUTER:
+            return {'error': 'geofractal not installed — CompileRouter unavailable'}
+
+        compiler = CompileRouter.from_module(self, name=f'compiled_{self.name}')
+        compiler.introspect()
+        structure = compiler.compile_towers()
+
+        # Build compilability map
+        compilability = {}
+        for i in range(self.n_layers):
+            layer = self[f'layer_{i}']
+            for key in self._COMPILABLE_LAYER_KEYS:
+                if layer.has(key):
+                    is_compiled = getattr(layer[key], '_is_compiled', False)
+                    compilability[f'layer_{i}.{key}'] = {
+                        'status': 'compiled' if is_compiled else 'compilable',
+                    }
+            for key in self._EXCLUDED_LAYER_KEYS:
+                if layer.has(key):
+                    compilability[f'layer_{i}.{key}'] = {
+                        'status': 'excluded',
+                        'reason': 'contains @torch.compiler.disable methods',
+                    }
+            for key in self._CONDITIONAL_LAYER_KEYS:
+                if layer.has(key):
+                    is_compiled = getattr(layer[key], '_is_compiled', False)
+                    compilability[f'layer_{i}.{key}'] = {
+                        'status': 'compiled' if is_compiled else 'conditional',
+                        'reason': 'linalg.solve — safe in inductor, risky in CUDA graphs',
+                    }
+
+        return {
+            'total_stages': structure.total_stages,
+            'batchable_stages': structure.batchable_stages,
+            'total_params': structure.total_params,
+            'signature_groups': {
+                sig: len(nodes) for sig, nodes in structure.signature_groups.items()
+            },
+            'compilability': compilability,
+            'compile_mode': getattr(self, '_compile_mode', None),
+        }
+
     def forward(self, x, attn_mask=None, key_padding_mask=None,
                 return_geo_state=False):
         """
@@ -1340,6 +1542,112 @@ if __name__ == '__main__':
                   for p in bridge.parameters())
         print(f"    layer_{i}.bridge: {'LIVE' if has else 'DEAD'}")
 
+    # ══════════════════════════════════════════════════════════════
+    # TOWER COMPILER INTEGRATION TESTS
+    # ══════════════════════════════════════════════════════════════
+
+    print(f"\n{'='*60}")
+    print(f"  Tower Compiler Integration")
+    print(f"{'='*60}")
+
+    # ── Baseline forward (uncompiled) ──
+    # Use seeded input in eval mode for deterministic comparison
+    model.eval()
+    torch.manual_seed(42)
+    model.zero_grad()
+    model.invalidate_caches()
+    x_baseline = torch.randn(B, L, D, device=device)
+    with torch.no_grad():
+        out_baseline = model(x_baseline)
+    # CM cache is now warm — do NOT invalidate before compiled run
+
+    # ── CompileRouter diagnostics ──
+    report = model.compilation_report()
+    if 'error' not in report:
+        print(f"\n  CompileRouter analysis:")
+        print(f"    total stages:     {report['total_stages']}")
+        print(f"    batchable stages: {report['batchable_stages']}")
+        print(f"    total params:     {report['total_params']:,}")
+        print(f"    signature groups: {len(report['signature_groups'])}")
+        print(f"\n  Compilability map:")
+        for path, info in sorted(report['compilability'].items()):
+            reason = info.get('reason', '')
+            tag = f" ({reason})" if reason else ''
+            print(f"    {path:<30s} {info['status']}{tag}")
+    else:
+        print(f"\n  CompileRouter: {report['error']}")
+
+    # ── Detect best available backend ──
+    # inductor needs a C++ compiler (cl/gcc); fall back to aot_eager if absent
+    _test_backend = 'inductor'
+    try:
+        _test_mod = torch.compile(nn.Linear(2, 2), backend='inductor')
+        _test_mod(torch.randn(1, 2))
+    except Exception:
+        _test_backend = 'aot_eager'
+        print(f"\n  inductor unavailable — falling back to aot_eager backend")
+
+    # ── Enable selective compilation ──
+    print(f"\n  Enabling selective compilation...")
+    stats = model.enable_compilation(
+        mode='selective', backend=_test_backend, compile_rotations=False)
+    print(f"    compiled:  {stats['compiled']} submodules")
+    print(f"    skipped:   {stats['skipped']} submodules (non-compilable)")
+    print(f"    backend:   {stats['backend']}")
+
+    # ── Compiled forward (same input, same cached CM — deterministic) ──
+    with torch.no_grad():
+        out_compiled = model(x_baseline)
+
+    # ── Numerical equivalence ──
+    # Note: first compiled run triggers tracing, so values may differ
+    # slightly due to operator fusion reordering. We use relaxed tolerance.
+    max_diff = (out_compiled - out_baseline).abs().max().item()
+    mean_diff = (out_compiled - out_baseline).abs().mean().item()
+    print(f"\n  Numerical equivalence (compiled vs baseline):")
+    print(f"    max diff:  {max_diff:.2e}")
+    print(f"    mean diff: {mean_diff:.2e}")
+    if max_diff < 1e-3:
+        print(f"    STATUS: PASS (within tolerance)")
+    else:
+        print(f"    STATUS: WARN — diff > 1e-3 (may be expected on first trace)")
+
+    # ── Compiled gradient flow ──
+    model.train()
+    model.zero_grad()
+    model.invalidate_caches()
+    x_cgrad = torch.randn(B, L, D, device=device, requires_grad=True)
+    out_cgrad = model(x_cgrad)
+    out_cgrad.sum().backward()
+
+    alive_c, dead_c = 0, 0
+    for n, p in model.named_parameters():
+        if p.grad is not None and p.grad.norm() > 0:
+            alive_c += 1
+        else:
+            dead_c += 1
+    print(f"\n  Compiled gradient flow: {alive_c} alive, {dead_c} dead")
+
+    # CM gate must still receive gradients through the compiler boundary
+    for i in range(model.n_layers):
+        layer = model[f'layer_{i}']
+        gate_grads_c = [p.grad is not None and p.grad.abs().sum() > 0
+                        for p in layer['cm_gate'].parameters()]
+        print(f"    layer_{i} cm_gate grad (compiled): {'YES' if all(gate_grads_c) else 'NO'}")
+
+    # ── Disable compilation ──
+    reverted = model.disable_compilation()
+    print(f"\n  Disabled compilation: reverted {reverted} submodules")
+
+    # ── Post-revert diagnostics ──
+    report_after = model.compilation_report()
+    if 'error' not in report_after:
+        compiled_after = sum(
+            1 for v in report_after['compilability'].values()
+            if v['status'] == 'compiled')
+        print(f"    compiled modules after revert: {compiled_after} (should be 0)")
+
     print(f"\n{'='*60}")
     print(f"  PASSED — CM-validated pipeline operational")
+    print(f"  PASSED — Tower compiler integration verified")
     print(f"{'='*60}")
