@@ -1,31 +1,25 @@
 """
-geolip.linalg — Geometric linear algebra primitives.
+geolip.linalg — Drop-in replacement for torch.linalg.
 
-Compilable eigendecomposition, batched SVD, Procrustes alignment.
-Falls back to PyTorch defaults with a single warning when CUDA/Triton unavailable.
+Our implementations override where we have something better.
+Everything else transparently proxies to torch.linalg.
 
-Quick start::
+    import geolip.linalg as LA
 
-    from geolip.linalg import eigh, svd, procrustes
-
-    vals, vecs = eigh(A)                     # FL for n<=12, cuSOLVER otherwise
-    U, S, Vh = svd(A)                        # Triton N=2,3 -> FL N<=12 -> cuSOLVER
-    aligned, info = procrustes(src, tgt)
+    vals, vecs = LA.eigh(A)          # FL pipeline (n<=12), cuSOLVER otherwise
+    U, S, Vh = LA.svd(A)             # Triton/FL/cuSOLVER auto-dispatch
+    x = LA.solve(A, b)               # passthrough to torch.linalg.solve
+    L = LA.cholesky(A)               # passthrough to torch.linalg.cholesky
+    n = LA.norm(x)                   # passthrough to torch.linalg.norm
 
 Configuration::
 
     from geolip.linalg import backend
-
-    backend.status()                          # print what's available
-    backend.use_fl_eigh = False               # disable FL, use cuSOLVER everywhere
-    backend.use_triton = False                # disable Triton SVD kernels
-
-For torch.compile::
-
-    from geolip.linalg import FLEigh
-    solver = torch.compile(FLEigh(), fullgraph=True)
-    vals, vecs = solver(A)                    # zero graph breaks
+    backend.status()                  # show what's available
+    backend.use_fl_eigh = False       # disable FL, cuSOLVER everywhere
 """
+
+import torch.linalg as _torch_linalg
 
 from ._backend import backend
 from .eigh import FLEigh, eigh
@@ -33,24 +27,38 @@ from .svd import batched_svd, gram_eigh_svd, gram_fl_eigh_svd
 from .newton_schulz import newton_schulz_invsqrt
 from .procrustes import batched_procrustes
 
-# Convenience aliases
+# Our overrides — these names shadow torch.linalg when accessed via geolip.linalg
 svd = batched_svd
 procrustes = batched_procrustes
 
 __all__ = [
     # Backend
     'backend',
-    # Eigendecomposition
+    # Eigendecomposition (ours)
     'FLEigh',
     'eigh',
-    # SVD
+    # SVD (ours)
     'batched_svd',
     'gram_eigh_svd',
     'gram_fl_eigh_svd',
     'svd',
-    # Newton-Schulz
+    # Newton-Schulz (ours)
     'newton_schulz_invsqrt',
-    # Procrustes
+    # Procrustes (ours)
     'batched_procrustes',
     'procrustes',
 ]
+
+
+def __getattr__(name):
+    """Proxy anything we haven't overridden to torch.linalg.
+
+    This makes geolip.linalg a superset of torch.linalg:
+      - geolip.linalg.eigh     -> our FL pipeline
+      - geolip.linalg.solve    -> torch.linalg.solve
+      - geolip.linalg.cholesky -> torch.linalg.cholesky
+      - etc.
+    """
+    if hasattr(_torch_linalg, name):
+        return getattr(_torch_linalg, name)
+    raise AttributeError(f"module 'geolip.linalg' has no attribute '{name}'")
