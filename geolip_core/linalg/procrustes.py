@@ -1,8 +1,7 @@
 """
 Subspace-preserving Procrustes alignment.
 
-N <= 32: full N-d Procrustes via SVD.
-N > 32:  project to rank-d, align there, lift back.
+Uses geolip.linalg.svd internally (auto-dispatches FL eigh / Triton / torch).
 """
 
 import torch
@@ -23,6 +22,9 @@ def batched_procrustes(
     schulz_iters: int = 10,
 ) -> Tuple[Tensor, Dict[str, Any]]:
     """Batched Procrustes alignment with subspace-preserving rotation.
+
+    N <= 32: full N-d Procrustes via SVD.
+    N > 32:  project to rank-d, align, lift back preserving orthogonal complement.
 
     Args:
         source:       (B, n_samples, N) or (n_samples, N)

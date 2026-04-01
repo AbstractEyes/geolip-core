@@ -2,25 +2,33 @@
 geolip.linalg — Geometric linear algebra primitives.
 
 Compilable eigendecomposition, batched SVD, Procrustes alignment.
+Falls back to PyTorch defaults with a single warning when CUDA/Triton unavailable.
 
-Quick start:
+Quick start::
+
     from geolip.linalg import eigh, svd, procrustes
 
-    # Eigendecomposition (FL Hybrid, 70/72 math purity vs cuSOLVER)
-    eigenvalues, eigenvectors = eigh(A)
+    vals, vecs = eigh(A)                     # FL for n<=12, cuSOLVER otherwise
+    U, S, Vh = svd(A)                        # Triton N=2,3 -> FL N<=12 -> cuSOLVER
+    aligned, info = procrustes(src, tgt)
 
-    # For torch.compile:
+Configuration::
+
+    from geolip.linalg import backend
+
+    backend.status()                          # print what's available
+    backend.use_fl_eigh = False               # disable FL, use cuSOLVER everywhere
+    backend.use_triton = False                # disable Triton SVD kernels
+
+For torch.compile::
+
     from geolip.linalg import FLEigh
     solver = torch.compile(FLEigh(), fullgraph=True)
-
-    # Batched thin SVD (auto-dispatches N=2,3 to Triton, N<=12 to FL)
-    U, S, Vh = svd(A)
-
-    # Procrustes alignment
-    aligned, info = procrustes(source, target)
+    vals, vecs = solver(A)                    # zero graph breaks
 """
 
-from .eigh import FLEigh, fl_eigh, eigh
+from ._backend import backend
+from .eigh import FLEigh, eigh
 from .svd import batched_svd, gram_eigh_svd, gram_fl_eigh_svd
 from .newton_schulz import newton_schulz_invsqrt
 from .procrustes import batched_procrustes
@@ -30,9 +38,10 @@ svd = batched_svd
 procrustes = batched_procrustes
 
 __all__ = [
+    # Backend
+    'backend',
     # Eigendecomposition
     'FLEigh',
-    'fl_eigh',
     'eigh',
     # SVD
     'batched_svd',

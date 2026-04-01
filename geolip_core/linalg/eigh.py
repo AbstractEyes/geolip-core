@@ -7,23 +7,12 @@ Fully compilable with torch.compile(fullgraph=True).
 Wins 70/72 mathematical purity metrics vs cuSOLVER (n=3-12).
 Zero graph breaks. 40x less memory than cuSOLVER.
 
-Pipeline:
-  Phase 1: FL characteristic polynomial (fp64, n bmm)
-  Phase 2: Laguerre root-finding + Newton polish (fp32/fp64)
-  Phase 3: FL adjugate eigenvectors (fp64 Horner + max-col)
-  Phase 4: Newton-Schulz orthogonalization (fp32, 2 iterations)
-  Phase 5: Rayleigh quotient eigenvalue refinement (fp32, 2 bmm)
-
 Usage:
-    from geolip.linalg import eigh, fl_eigh
+    from geolip.linalg import eigh, FLEigh
 
-    # Functional API (auto-dispatches)
-    eigenvalues, eigenvectors = eigh(A)
-
-    # Module API (for torch.compile)
-    solver = FLEigh()
-    compiled = torch.compile(solver, fullgraph=True)
-    eigenvalues, eigenvectors = compiled(A)
+    vals, vecs = eigh(A)                              # auto-dispatch
+    vals, vecs = torch.compile(FLEigh())(A)           # compiled
+    vals, vecs = eigh(A, method='torch')              # force cuSOLVER
 
 Mathematical lineage:
   Faddeev-LeVerrier (1840), Laguerre (1834), Newton (1669),
@@ -34,23 +23,27 @@ import math
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import Tuple, Optional
+from typing import Tuple
 
-__all__ = ['FLEigh', 'fl_eigh', 'eigh']
-
-# Threshold: FL for n <= this, cuSOLVER fallback above
-_FL_MAX_N = 12
+__all__ = ['FLEigh', 'eigh']
 
 
 class FLEigh(nn.Module):
     """Compilable eigendecomposition for small symmetric matrices.
 
+    Phases:
+      1. FL characteristic polynomial (fp64, n bmm)
+      2. Laguerre root-finding + Newton polish (fp32/fp64)
+      3. FL adjugate eigenvectors (fp64 Horner + max-col extraction)
+      4. Newton-Schulz orthogonalization (fp32, 2 iterations)
+      5. Rayleigh quotient eigenvalue refinement (fp32, 2 bmm)
+
     Args:
-        laguerre_iters: Laguerre root-finding iterations (default 5)
-        polish_iters: Newton polish iterations on original polynomial (default 3)
+        laguerre_iters: Root-finding iterations per eigenvalue (default 5)
+        polish_iters: Newton refinement on original polynomial (default 3)
         ns_iters: Newton-Schulz orthogonalization iterations (default 2)
 
-    Input:  A [B, n, n] symmetric matrix (fp32)
+    Input:  A [B, n, n] symmetric fp32 tensor
     Output: (eigenvalues [B, n], eigenvectors [B, n, n]) sorted ascending
     """
 
@@ -64,7 +57,6 @@ class FLEigh(nn.Module):
         B, n, _ = A.shape
         device = A.device
 
-        # Pre-scale to unit Frobenius
         scale = (torch.linalg.norm(A.reshape(B, -1), dim=-1) / math.sqrt(n)).clamp(min=1e-12)
         As = A / scale[:, None, None]
 
@@ -135,7 +127,6 @@ class FLEigh(nn.Module):
         R = Mstore[1].unsqueeze(1).expand(-1, n, -1, -1).clone()
         for k in range(2, n + 1):
             R = R * lam[:, :, None, None] + Mstore[k].unsqueeze(1)
-
         cnorms = R.norm(dim=-2)
         best = cnorms.argmax(dim=-1)
         idx = best.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, n, 1)
@@ -162,36 +153,39 @@ class FLEigh(nn.Module):
         return se, sv
 
 
-def fl_eigh(A: Tensor) -> Tuple[Tensor, Tensor]:
-    """Functional FL eigendecomposition. Not compilable (creates module each call)."""
-    return FLEigh()(A)
+# ── Threshold for auto-dispatch ──
+_FL_MAX_N = 12
 
 
-def eigh(A: Tensor, force_fl: bool = False) -> Tuple[Tensor, Tensor]:
+def eigh(A: Tensor, method: str = 'auto') -> Tuple[Tensor, Tensor]:
     """Auto-dispatching eigendecomposition.
 
-    Uses FL pipeline for n <= 12 (compilable, mathematically superior).
-    Falls back to torch.linalg.eigh for n > 12.
+    Methods:
+      'auto':  FL for n<=12 on CUDA, torch.linalg.eigh otherwise
+      'fl':    Force FL pipeline (any size, must be CUDA)
+      'torch': Force torch.linalg.eigh (cuSOLVER)
 
     Args:
         A: [B, n, n] or [n, n] symmetric matrix
-        force_fl: Always use FL regardless of size
+        method: 'auto', 'fl', 'torch'
 
     Returns: (eigenvalues, eigenvectors) sorted ascending
     """
+    from ._backend import backend
+
     squeeze = A.ndim == 2
     if squeeze:
         A = A.unsqueeze(0)
 
     n = A.shape[-1]
 
-    if force_fl or n <= _FL_MAX_N:
+    if method == 'fl' or (method == 'auto' and backend.use_fl_eigh and n <= _FL_MAX_N and A.is_cuda):
         vals, vecs = FLEigh()(A)
     else:
+        if method == 'auto' and not A.is_cuda:
+            backend.warn('eigh')
         vals, vecs = torch.linalg.eigh(A)
 
     if squeeze:
-        vals = vals.squeeze(0)
-        vecs = vecs.squeeze(0)
-
+        vals, vecs = vals.squeeze(0), vecs.squeeze(0)
     return vals, vecs

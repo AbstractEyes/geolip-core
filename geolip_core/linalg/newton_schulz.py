@@ -1,7 +1,8 @@
 """
 Newton-Schulz iterative inverse square root.
 
-Pure bmm — zero eigensolvers. Quadratic convergence.
+Pure bmm — no eigensolvers, no Triton dependency.
+Quadratic convergence. Works on any device.
 """
 
 import torch
