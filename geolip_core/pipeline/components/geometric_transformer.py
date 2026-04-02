@@ -178,24 +178,27 @@ class CMValidatedGate(nn.Module):
         nn.init.normal_(self.gate_proj[2].weight, std=0.01)
         nn.init.constant_(self.gate_proj[2].bias, 2.0)
 
-        # Anchor CM cache — invalidated after optimizer step
-        self._cached_cm_norm = None
+        # Pre-allocated cache — address-stable for CUDA graph replay.
+        # .copy_() updates values without changing tensor address.
+        self.register_buffer('_cached_cm_norm', torch.zeros(n_anchors), persistent=False)
+        self._cache_warm = False
 
     def invalidate_cache(self):
-        """Call after optimizer.step() to recompute anchor CM next forward."""
-        self._cached_cm_norm = None
+        """Mark cache stale. Buffer stays allocated (same address)."""
+        self._cache_warm = False
 
     def precompute(self, anchors):
         """Compute anchor CM norm OUTSIDE compile graph.
-        Called from layer forward before the compilable gate computation.
-        Idempotent: skips if cache is warm.
+        Updates buffer in-place via .copy_() — address stays fixed.
         """
-        if self._cached_cm_norm is not None:
+        if self._cache_warm:
             return
         with torch.no_grad():
             anchor_cm, _ = anchor_neighborhood_cm(anchors, self.n_neighbors)
             cm_std = anchor_cm.std().clamp(min=1e-8)
-            self._cached_cm_norm = ((anchor_cm - anchor_cm.mean()) / cm_std).detach()
+            new_val = ((anchor_cm - anchor_cm.mean()) / cm_std).detach()
+            self._cached_cm_norm.copy_(new_val)
+            self._cache_warm = True
 
     def _compute_gate(self, anchor_cm_norm, tri):
         """Fully compilable — pure tensor ops, no linalg, no graph breaks."""
@@ -292,8 +295,9 @@ class FiLMLayer(TorchComponent):
 class CayleyOrthogonal(TorchComponent):
     """Guaranteed SO(d) rotation via Cayley map. det(Q) = 1 always.
 
-    precompute() caches the rotation matrix outside the compile graph.
-    forward() reads the cached rotation — pure tensor ops, CUDA-graph-safe.
+    Cache uses a pre-allocated registered buffer updated in-place.
+    CUDA graph replay requires fixed tensor addresses — allocating new
+    tensors on each precompute would invalidate recorded addresses.
     """
     def __init__(self, name, dim):
         super().__init__(name)
@@ -303,7 +307,9 @@ class CayleyOrthogonal(TorchComponent):
         self.register_buffer('_triu_row', idx[0], persistent=False)
         self.register_buffer('_triu_col', idx[1], persistent=False)
         self.register_buffer('_eye', torch.eye(dim), persistent=False)
-        self._cached_rotation = None
+        # Pre-allocated cache — address-stable for CUDA graph replay
+        self.register_buffer('_cached_rotation', torch.eye(dim), persistent=False)
+        self._cache_warm = False
 
     def get_rotation(self):
         """Compute rotation via Cayley map. Uses cuSOLVER (LA.solve)."""
@@ -314,16 +320,18 @@ class CayleyOrthogonal(TorchComponent):
         return LA.solve(self._eye + A, self._eye - A)
 
     def precompute(self):
-        """Cache rotation matrix. Call outside compiled graph."""
-        if self._cached_rotation is None:
-            self._cached_rotation = self.get_rotation()
+        """Update cached rotation in-place. Call outside compiled graph."""
+        self._cached_rotation.copy_(self.get_rotation())
+        self._cache_warm = True
 
     def invalidate_cache(self):
-        self._cached_rotation = None
+        self._cache_warm = False
 
     def forward(self, x):
-        R = self._cached_rotation if self._cached_rotation is not None else self.get_rotation()
-        return x @ R.T
+        if not self._cache_warm:
+            self._cached_rotation.copy_(self.get_rotation())
+            self._cache_warm = True
+        return x @ self._cached_rotation.T
 
 
 def quaternion_multiply_batched(q1, q2):
