@@ -185,24 +185,23 @@ class CMValidatedGate(nn.Module):
         """Call after optimizer.step() to recompute anchor CM next forward."""
         self._cached_cm_norm = None
 
-    @torch.compiler.disable
-    def _get_anchor_cm_norm(self, anchors):
-        """Compute or return cached normalized anchor CM quality.
-        Excluded from torch.compile — linalg.det not CUDA-graph-safe."""
+    def precompute(self, anchors):
+        """Compute anchor CM norm OUTSIDE compile graph.
+        Called from layer forward before the compilable gate computation.
+        Idempotent: skips if cache is warm.
+        """
         if self._cached_cm_norm is not None:
-            return self._cached_cm_norm
+            return
         with torch.no_grad():
             anchor_cm, _ = anchor_neighborhood_cm(anchors, self.n_neighbors)
             cm_std = anchor_cm.std().clamp(min=1e-8)
             self._cached_cm_norm = ((anchor_cm - anchor_cm.mean()) / cm_std).detach()
-        return self._cached_cm_norm
 
     def _compute_gate(self, anchor_cm_norm, tri):
-        """Compilable gate computation — pure tensor ops, no graph breaks."""
+        """Fully compilable — pure tensor ops, no linalg, no graph breaks."""
         N, A = tri.shape
-        cos_sim = 1.0 - tri  # (N, A)
+        cos_sim = 1.0 - tri
 
-        # Gate features: (N, A, 2)
         features = torch.stack([
             anchor_cm_norm.unsqueeze(0).expand(N, -1),
             cos_sim,
@@ -210,7 +209,6 @@ class CMValidatedGate(nn.Module):
 
         gate_values = torch.sigmoid(self.gate_proj(features).squeeze(-1))
 
-        # Diagnostics — pure tensor ops, no graph breaks
         gate_info = {
             'active': (gate_values.detach() > 0.5).float().sum(-1).mean(),
             'gate_mean': gate_values.detach().mean(),
@@ -219,12 +217,9 @@ class CMValidatedGate(nn.Module):
 
         return gate_values, gate_info
 
-    def forward(self, embedding, anchors, tri):
-        """Compute per-(position, anchor) gate values."""
-        # Non-compilable: exits torch.compile graph, returns single (A,) tensor
-        anchor_cm_norm = self._get_anchor_cm_norm(anchors)
-        # Compilable: re-enters torch.compile graph
-        return self._compute_gate(anchor_cm_norm, tri)
+    def forward(self, tri):
+        """Fully compilable forward. Requires precompute() called first."""
+        return self._compute_gate(self._cached_cm_norm, tri)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -635,8 +630,10 @@ class GeometricTransformerLayer(BaseTower):
         # ════ 3. CM Gate — validate anchor measurements ════
         anchors_n = F.normalize(
             self['observer'].association.constellation.anchors, dim=-1)
-        gate_values, gate_info = self['cm_gate'](
-            emb_flat, anchors_n.detach(), a_out['distances'])
+        # Precompute CM quality outside compile graph (idempotent, uses cache)
+        self['cm_gate'].precompute(anchors_n.detach())
+        # Compilable gate forward — pure tensor ops
+        gate_values, gate_info = self['cm_gate'](a_out['distances'])
 
         # ════ 4. Gated curation — patchwork reads validated triangulation ════
         a_out_gated = dict(a_out)
@@ -980,53 +977,36 @@ class GeometricTransformer(BaseTower):
                        attn_mask=None, key_padding_mask=None):
         """Dual-view forward for observer loss training.
 
-        Aggregates geometric observations from ALL layers so every
-        layer's observer/constellation/flows receive gradient.
-        Patchwork, bridge, triangulation, etc. are summed across layers —
-        the observer loss sees the full-stack geometric observation.
+        Observer loss reads FINAL layer's observations (coherent space).
+        Non-final layers get gradient through the geo_residual stream
+        (FiLM → context → history_mlp → geo_residual → earlier layers).
+        All layers' computation graphs are retained by _run_view.
         """
         B = x1.shape[0]
         x_cat = torch.cat([x1, x2], dim=0)
         feat_cat, geo_states = self._run_view(x_cat, attn_mask, key_padding_mask)
 
         c = cls_index
-        n_layers = len(geo_states)
-
-        # Aggregate geometric observations across all layers
-        def _agg(key):
-            """Sum across layers — every layer gets gradient."""
-            vals = [gs[key] for gs in geo_states if gs.get(key) is not None]
-            if not vals:
-                return None
-            return sum(vals)
-
-        emb_agg = _agg('embedding')
-        pw_agg = _agg('patchwork')
-        br_agg = _agg('bridge')
-        asgn_agg = _agg('assignment')
-        cos_agg = _agg('cos_to_anchors')
-        tri_agg = _agg('triangulation')
-        gv_agg = _agg('gate_values')
-        cm_agg = _agg('cm_quality')
+        gs = geo_states[-1]  # final layer — coherent representation space
 
         return {
-            'embedding':      emb_agg[:B, c],
-            'embedding_aug':  emb_agg[B:, c],
-            'patchwork1':     pw_agg[:B, c],
-            'patchwork1_aug': pw_agg[B:, c],
-            'bridge1':        br_agg[:B, c],
-            'bridge2':        br_agg[B:, c],
-            'assign1':        asgn_agg[:B, c],
-            'assign2':        asgn_agg[B:, c],
-            'cos1':           cos_agg[:B, c],
-            'tri1':           tri_agg[:B, c],
-            'tri2':           tri_agg[B:, c],
+            'embedding':      gs['embedding'][:B, c],
+            'embedding_aug':  gs['embedding'][B:, c],
+            'patchwork1':     gs['patchwork'][:B, c],
+            'patchwork1_aug': gs['patchwork'][B:, c],
+            'bridge1':        gs['bridge'][:B, c],
+            'bridge2':        gs['bridge'][B:, c],
+            'assign1':        gs['assignment'][:B, c],
+            'assign2':        gs['assignment'][B:, c],
+            'cos1':           gs['cos_to_anchors'][:B, c],
+            'tri1':           gs['triangulation'][:B, c],
+            'tri2':           gs['triangulation'][B:, c],
             'features1':      feat_cat[:B],
             'features2':      feat_cat[B:],
-            'gate_values1':   gv_agg[:B, c],
-            'gate_values2':   gv_agg[B:, c],
-            'cm_quality1':    cm_agg[:B],
-            'cm_quality2':    cm_agg[B:],
+            'gate_values1':   gs['gate_values'][:B, c],
+            'gate_values2':   gs['gate_values'][B:, c],
+            'cm_quality1':    gs['cm_quality'][:B],
+            'cm_quality2':    gs['cm_quality'][B:],
         }
 
     def compute_loss(self, output, targets, cls_index=0,
