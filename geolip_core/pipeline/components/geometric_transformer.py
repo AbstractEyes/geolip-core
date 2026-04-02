@@ -981,8 +981,10 @@ class GeometricTransformer(BaseTower):
             if has_xrot and i < self.n_layers - 1:
                 x = self[f'cross_rot_{i}'](x)
 
-        self._last_geo_residual = geo_residual
-        self._last_hidden = x
+        # Stash for NCE bank if active (outside compiled graph only)
+        if self.has('nce_bank'):
+            self._last_geo_residual = geo_residual
+            self._last_hidden = x
 
         x = self['final_norm'](x)
         if self.has('head'):
