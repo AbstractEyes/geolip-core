@@ -75,9 +75,9 @@ class FLEigh(nn.Module):
         # Phase 2: Laguerre + deflation + Newton polish
         use_f64 = n > 6
         dt = torch.float64 if use_f64 else torch.float32
-        cl = c.to(dt).clone()
+        cl = c.to(dt).clone().detach()  # deflation mutates in-place
         roots = torch.zeros(B, n, device=device, dtype=dt)
-        zi = As.to(dt).diagonal(dim1=-2, dim2=-1).sort(dim=-1).values
+        zi = As.to(dt).diagonal(dim1=-2, dim2=-1).sort(dim=-1).values.detach()  # initial guesses, no gradient needed
         zi = zi + torch.linspace(-1e-4, 1e-4, n, device=device, dtype=dt).unsqueeze(0)
 
         for ri in range(n):
