@@ -196,7 +196,7 @@ class FlowMagnitude(BaseFlow):
         a_geom = self.anchor_proj(anchors)  # [A, geom_dim]
         G = a_geom.T @ a_geom  # [gd, gd]
         G = G.unsqueeze(0)  # [1, gd, gd]
-        eigenvalues, _ = LA.eigh(G, method='torch')  # [1, gd]
+        eigenvalues, _ = LA.eigh(G, method='fl')  # [1, gd]
         magnitudes = eigenvalues.abs().sqrt().squeeze(0)  # [gd]
         # Spectral profile → per-anchor weight
         anchor_weights = torch.sigmoid(self.spec_to_anchor(magnitudes))  # [A]
@@ -229,7 +229,7 @@ class FlowOrbital(BaseFlow):
         A = anchors.shape[0]
         a_geom = self.anchor_proj(anchors)  # [A, gd]
         G = (a_geom.T @ a_geom).unsqueeze(0)  # [1, gd, gd]
-        eigenvalues, eigenvectors = LA.eigh(G, method='torch')  # [1, gd], [1, gd, gd]
+        eigenvalues, eigenvectors = LA.eigh(G, method='fl')  # [1, gd], [1, gd, gd]
         eigenvalues = eigenvalues.squeeze(0)  # [gd]
         eigenvectors = eigenvectors.squeeze(0)  # [gd, gd]
 
@@ -274,7 +274,11 @@ class FlowAlignment(BaseFlow):
         # Cross-covariance [gd, gd]
         C = (q_g.T @ q_g) + (a_g.T @ a_g)  # symmetric, stable for eigh path
         C = C.unsqueeze(0)
-        U, _, Vh = LA.svd(C, method='gram_eigh')
+        # C is symmetric — use eigh directly (FL kernel, CUDA-graph-safe)
+        eigenvalues, eigenvectors = LA.eigh(C, method='fl')
+        # Procrustes rotation from eigenvectors
+        U = eigenvectors
+        Vh = eigenvectors.transpose(-2, -1)
         R = (U @ Vh).squeeze(0)  # [gd, gd]
         # Align queries in projected space
         q_aligned = q_g @ R  # [N, gd]

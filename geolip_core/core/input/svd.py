@@ -49,14 +49,25 @@ class _SVDFeatureMixin:
         return S - self.ema_s.clone().unsqueeze(0)
 
     def _decompose(self, matrix):
-        """SVD via geolip_core.linalg. (B, M, N) → S, Vh.
+        """SVD via Gram matrix + FL eigh. (B, M, N) → S, Vh.
 
-        Dispatches through LA.svd:
-            method='gram_eigh' → Gram matrix + eigh (default, differentiable)
-            Compiled inference automatically uses FL kernel (zero graph breaks).
+        Manual decomposition using LA.eigh(method='fl') which is
+        pure tensor ops — CUDA-graph-safe for reduce-overhead compilation.
+        cuSOLVER's eigh can't be captured in CUDA graphs.
         """
         with torch.amp.autocast('cuda', enabled=False):
-            U, S, Vh = LA.svd(matrix.float(), method='gram_eigh')
+            A = matrix.float()
+            # Gram matrix: (B, N, N) = A^T @ A
+            G = A.transpose(-2, -1) @ A
+            # FL eigh: pure tensor ops, no cuSOLVER, CUDA-graph-safe
+            eigenvalues, eigenvectors = LA.eigh(G, method='fl')
+            # eigenvalues → singular values (ascending from eigh)
+            S = eigenvalues.clamp(min=1e-12).sqrt()
+            Vh = eigenvectors.transpose(-2, -1)
+            # Reverse to descending order
+            S = S.flip(-1)
+            Vh = Vh.flip(-2)
+            # Safety clamps
             S = S.clamp(min=1e-6)
             S = torch.where(torch.isfinite(S), S, torch.ones_like(S))
             Vh = torch.where(torch.isfinite(Vh), Vh, torch.zeros_like(Vh))
