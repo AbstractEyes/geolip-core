@@ -335,7 +335,7 @@ Optional:
 - [geofractal](https://github.com/AbstractEyes/geofractal) — Router/tower/component composition framework
 - [wide-compiler](https://github.com/AbstractEyes/wide-compiler) — N-model batched fusion via grouped operations
 - [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) — Full GeoLIP package
-- [FL Eigh Article](https://huggingface.co/blog/AbstractPhil/fl-hybrid-eigendecomposition) — Compilable eigendecomposition beating cuSOLVER
+- [FL Eigh Article](https://huggingface.co/blog/AbstractPhil/linalg-eigh-rehaul-ft1) — Compilable eigendecomposition beating cuSOLVER
 - [SVD Kernel Article](https://huggingface.co/blog/AbstractPhil/svd-triton-kernel-optimization) — Engineering specification
 - [SVD Experiment Journey](https://huggingface.co/blog/AbstractPhil/svd-experiment-journey) — Development map
 - [geolip-bertenstein](https://huggingface.co/AbstractPhil/geolip-bertenstein) — Multi-expert geometric fusion
