@@ -15,7 +15,7 @@ pip install "git+https://github.com/AbstractEyes/geofractal.git"
 pip install "git+https://github.com/AbstractEyes/geolip-core.git"
 ```
 
-Triton is optional — fused SVD kernels activate automatically if installed. Everything falls back to PyTorch without it.
+Triton is optional — fused SVD kernels activate automatically if installed. CuPy is optional — CUDA eigendecomposition kernels activate if installed. Everything falls back to PyTorch without either.
 
 ## Architecture
 
@@ -74,10 +74,23 @@ geolip_core/
 │   ├── layer.py                       ConstellationLayer (one depth)
 │   └── backbone.py                    GeometricBackbone (multi-depth)
 │
+├── linalg/                        Geometric linear algebra primitives
+│   ├── __init__.py                    Drop-in torch.linalg replacement
+│   ├── _backend.py                    CUDA/Triton/CuPy detection, one-time warning
+│   ├── eigh.py                        FL Hybrid Eigendecomposition (FLEigh)
+│   ├── svd.py                         Batched thin SVD with FL eigh integration
+│   ├── newton_schulz.py               Iterative inverse square root (pure bmm)
+│   └── procrustes.py                  Subspace-preserving Procrustes alignment
+│
 ├── example/                       Working models built with the pipeline
 ├── analysis/                      Diagnostic tools
 └── utils/                         Engineering infrastructure
-    ├── kernel.py                      Triton SVD, gram_eigh, Procrustes math
+    ├── kernel.py                      Triton SVD N=2,3, gram_eigh, Procrustes math
+    ├── cuda/                          CuPy/NVRTC eigendecomposition kernels
+    │   └── fl_eigh_cuda.py                Per-N generated CUDA kernels (n=3-16)
+    ├── triton/                        Generated Triton kernels (experimental)
+    │   ├── fl_eigh_gen.py                 Kernel source generator
+    │   └── fl_eigh_n6.py                 Pre-generated n=6 kernel (7465 lines)
     └── memory.py                      EmbeddingBuffer
 ```
 
@@ -124,6 +137,46 @@ pipe.cache_clear()          # managed lifecycle
 # Swap a stage at runtime
 pipe.detach('curate_gate')
 pipe.attach('curate_gate', CurateCMGate('curate_gate', 32, 256, strategy='top_k'))
+```
+
+### Geometric Linear Algebra
+
+`geolip.linalg` is a drop-in replacement for `torch.linalg`. Our implementations override where we have something better. Everything else transparently proxies to PyTorch.
+
+```python
+import geolip.linalg as LA
+
+# Our implementations (auto-dispatch to best available)
+vals, vecs = LA.eigh(A)           # FL pipeline n≤12, cuSOLVER n>12
+U, S, Vh = LA.svd(A)              # Triton n=2,3 → FL n≤12 → cuSOLVER
+
+# These pass through to torch.linalg (zero overhead)
+x = LA.solve(A, b)
+L = LA.cholesky(A)
+n = LA.norm(x)
+
+# Configuration
+LA.backend.status()               # print available features
+LA.backend.use_fl_eigh = False    # disable FL, use cuSOLVER everywhere
+```
+
+**FL Hybrid Eigendecomposition** — Faddeev-LeVerrier characteristic polynomial → Laguerre root-finding → Newton-Schulz orthogonalization → Rayleigh quotient refinement. Wins 84/84 mathematical purity metrics against cuSOLVER across n=3-12. Zero graph breaks under `torch.compile(fullgraph=True)`. 40× less memory.
+
+```python
+from geolip.linalg import FLEigh
+
+# Compiled training loop — zero graph breaks
+solver = torch.compile(FLEigh(), fullgraph=True)
+eigenvalues, eigenvectors = solver(cm_matrices)  # [B, 6, 6] → [B, 6], [B, 6, 6]
+```
+
+**CUDA Eigendecomposition Kernel** — Per-matrix CUDA kernel via CuPy/NVRTC. One thread per matrix, entire pipeline in registers. Flat batch scaling — 1.73× cuSOLVER at B=16,384, runs where cuSOLVER OOMs at B=32,768.
+
+```python
+from geolip.utils.cuda.fl_eigh_cuda import fl_eigh_cuda
+
+# High-batch: 0.7MB vs cuSOLVER's 1,099MB
+eigenvalues, eigenvectors = fl_eigh_cuda(A)  # any n in 3-16
 ```
 
 ### Individual Components
@@ -185,6 +238,38 @@ Each reads from and writes to the parent router's cache. Core modules do the mat
 | `AlignProcrustes` | `ProcrustesAlignment` | Align | `aligned`, `alignment_info` |
 | `FuseGeometric` | (pipeline-specific) | Fuse | `svd_context`, `geo_features` |
 
+### Geometric Linear Algebra (`linalg/`)
+
+Drop-in `torch.linalg` replacement with geometric optimizations. Anything not overridden proxies transparently to PyTorch.
+
+| Function | Implementation | Performance |
+|---|---|---|
+| `eigh(A)` | FL Hybrid (n≤12), cuSOLVER fallback | 84/84 purity, 40× less memory, zero graph breaks |
+| `svd(A)` | Triton N=2,3 → FL eigh N≤12 → cuSOLVER | 3,850× at N=2, compilable |
+| `newton_schulz_invsqrt(G)` | Pure bmm iteration | Zero eigensolvers, quadratic convergence |
+| `procrustes(src, tgt)` | Subspace-preserving rotation | 1.000 NN agreement at N=32-128 |
+| Everything else | `torch.linalg` passthrough | Zero overhead |
+
+Backend auto-detection with single warning on first fallback:
+
+```python
+from geolip.linalg import backend
+backend.status()
+# geolip.linalg backend:
+#   CUDA:       yes
+#   Triton:     3.6.0
+#   FL eigh:    enabled
+#   Triton SVD: enabled
+#   GPU:        NVIDIA RTX PRO 6000 Blackwell Server Edition
+```
+
+| Dispatch condition | Implementation | Why |
+|---|---|---|
+| n≤4, CuPy available, B≥512 | CUDA kernel | 2-7× cuSOLVER |
+| n≤6, CuPy available, B≥8,192 | CUDA kernel | 1.7× cuSOLVER, flat scaling |
+| n≤12, CUDA | FL Precise (compiled) | 84/84 purity, 40× less memory |
+| n>12 | `torch.linalg.eigh` | FL conditioning degrades |
+
 ### Key Core Modules
 
 **SVD Kernel** (`utils/kernel.py`) — Fused Triton kernels for batched thin SVD:
@@ -195,6 +280,28 @@ Each reads from and writes to the parent router's cache. Core modules do the mat
 | 3 | 0.022ms | 5,488× |
 | 8 | 0.290ms | 584× |
 | 32 | 0.781ms | 388× |
+
+**FL Hybrid Eigh** (`linalg/eigh.py`) — Five-phase compilable eigendecomposition:
+
+| Phase | Method | Precision |
+|---|---|---|
+| 1. Characteristic polynomial | Faddeev-LeVerrier recurrence | fp64 |
+| 2. Root-finding | Laguerre + synthetic deflation | fp32/fp64 adaptive |
+| 3. Eigenvectors | FL adjugate Horner evaluation | fp64, chunked for n>6 |
+| 4. Orthogonalization | Newton-Schulz polar iteration | fp32, 2 iterations |
+| 5. Eigenvalue refinement | Rayleigh quotient | fp32, 2 bmm |
+
+Benchmarked on NVIDIA RTX PRO 6000 Blackwell (B=4,096, n=6):
+
+| Method | Time | vs cuSOLVER | Memory |
+|---|---|---|---|
+| cuSOLVER | 241 µs | 1.00× | 1,099 MB |
+| FL Precise compiled | 350 µs | 0.69× | 32 MB |
+| FL Precise + CUDA Graph | 287 µs | 0.84× | 32 MB |
+| CUDA kernel (n=6, B=16K) | 429 µs | 1.73× | 0.7 MB |
+| CUDA kernel (n=3, B=4K) | 45 µs | 3.06× | 0.7 MB |
+
+**CUDA Eigh Kernel** (`utils/cuda/fl_eigh_cuda.py`) — Generated per matrix size via Python template, compiled by NVRTC at runtime, cached at `~/.cupy/kernel_cache/`. One thread per matrix, zero intermediate memory, flat batch scaling.
 
 **CM Validity Gate** (`core/curate/gate.py`) — Cayley-Menger determinant as geometric attention. Simplex volume is the relevance score. Strategies: `round_robin`, `cm_gate`, `top_k`, `top_p`.
 
@@ -218,12 +325,17 @@ torch >= 2.0
 geofractal @ git+https://github.com/AbstractEyes/geofractal.git
 ```
 
-Optional: `triton >= 2.1` (fused SVD kernels), `kymatio` (scattering).
+Optional:
+- `triton >= 2.1` — fused SVD kernels for N=2,3
+- `cupy-cuda12x` — CUDA eigendecomposition kernels via NVRTC
+- `kymatio` — scattering transforms
 
 ## Ecosystem
 
 - [geofractal](https://github.com/AbstractEyes/geofractal) — Router/tower/component composition framework
+- [wide-compiler](https://github.com/AbstractEyes/wide-compiler) — N-model batched fusion via grouped operations
 - [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) — Full GeoLIP package
+- [FL Eigh Article](https://huggingface.co/blog/AbstractPhil/fl-hybrid-eigendecomposition) — Compilable eigendecomposition beating cuSOLVER
 - [SVD Kernel Article](https://huggingface.co/blog/AbstractPhil/svd-triton-kernel-optimization) — Engineering specification
 - [SVD Experiment Journey](https://huggingface.co/blog/AbstractPhil/svd-experiment-journey) — Development map
 - [geolip-bertenstein](https://huggingface.co/AbstractPhil/geolip-bertenstein) — Multi-expert geometric fusion
