@@ -371,9 +371,15 @@ class FlowEnsemble(BaseTower):
         return [n for n in self._flow_names if self.has(n)]
 
     def attach_flow(self, key: str, **kwargs):
-        """Attach a new flow by registry key."""
+        """Attach a new flow by registry key. Inherits device from ensemble."""
         flow_name = f'flow_{key}'
         flow = build_flow(key, flow_name, self.d_model, self.n_anchors, **kwargs)
+        # Inherit device from existing parameters
+        try:
+            device = next(self.parameters()).device
+            flow = flow.to(device)
+        except StopIteration:
+            pass  # no existing params — leave on default device
         self.attach(flow_name, flow)
         if flow_name not in self._flow_names:
             self._flow_names.append(flow_name)

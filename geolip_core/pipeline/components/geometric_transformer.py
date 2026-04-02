@@ -6,17 +6,19 @@ quaternion composition, and per-layer Cayley alignment.
 
 CM-validated pipeline changes:
     - CM validity gate between association and curation (AnchorGate)
-    - 4-stream PositionGeometricContext: anchor + structural + history + quality
+    - 5-stream PositionGeometricContext: anchor + structural + history + quality + FLOW
     - CM-conditioned geometric residual accumulation (replaces blind learned gate)
     - Built-in geometric regularization (CV target + anchor spread)
     - Decomposed observer pipeline: association → CM gate → gated curation
+    - Optional FlowEnsemble: multi-opinion geometric fusion (quat, velocity, orbital, etc.)
 
 Pipeline per layer:
     1. ManifoldProjection:  h_i → emb_i on S^(d-1) per position
     2. ConstellationAssociation: emb_i → raw triangulation, cos, assignment
     3. CMValidatedGate: per-anchor CM validity → gate_values (B*L, A)
     4. Gated curation: patchwork reads tri * gate_values (validated only)
-    5. PositionGeometricContext: 4 streams → FiLM context (B, L, context_dim)
+    4.5 FlowEnsemble (optional): multi-opinion geometric predictions
+    5. PositionGeometricContext: 5 streams → FiLM context (B, L, context_dim)
     6. ContentAttention (Stream A): standard MHA
     7. GeometricAttention (Stream B): FiLM(Q,K | geo_ctx), V pure
     8. CayleyOrthogonal: align B → A basis
@@ -55,6 +57,7 @@ from geolip_core.core.associate.constellation import (
     Constellation, init_anchors_repulsion,
 )
 from geolip_core.core.curate.gate import AnchorGate as _GeolipAnchorGate
+from geolip_core.core.curate.flows import FlowEnsemble
 from geolip_core.pipeline.observer import (
     TorchComponent, BaseTower, Input, Curation, Distinction,
 )
@@ -193,20 +196,7 @@ class CMValidatedGate(nn.Module):
         return self._cached_cm_norm
 
     def _compute_gate(self, anchor_cm_norm, tri):
-        """Compilable gate computation — pure tensor ops, no graph breaks.
-
-        Separated from forward() so torch.compile can trace this as a
-        contiguous subgraph. The only graph break is in _get_anchor_cm_norm()
-        which hands off a single (A,) tensor to this method.
-
-        Args:
-            anchor_cm_norm: (A,) normalized CM quality per anchor (from cache)
-            tri:            (N, A) triangulation distances (1 - cos)
-
-        Returns:
-            gate_values: (N, A) in [0, 1] — per-anchor validity gate
-            gate_info: dict with diagnostics (tensors, no .item() — compile-safe)
-        """
+        """Compilable gate computation — pure tensor ops, no graph breaks."""
         N, A = tri.shape
         cos_sim = 1.0 - tri  # (N, A)
 
@@ -228,17 +218,7 @@ class CMValidatedGate(nn.Module):
         return gate_values, gate_info
 
     def forward(self, embedding, anchors, tri):
-        """Compute per-(position, anchor) gate values.
-
-        Args:
-            embedding: (N, D) — positions on S^(d-1), where N = B*L
-            anchors:   (A, D) — normalized anchor positions (DETACHED by caller)
-            tri:       (N, A) — triangulation distances (1 - cos)
-
-        Returns:
-            gate_values: (N, A) in [0, 1] — per-anchor validity gate
-            gate_info: dict with diagnostics (tensors, no .item() — compile-safe)
-        """
+        """Compute per-(position, anchor) gate values."""
         # Non-compilable: exits torch.compile graph, returns single (A,) tensor
         anchor_cm_norm = self._get_anchor_cm_norm(anchors)
         # Compilable: re-enters torch.compile graph
@@ -250,44 +230,19 @@ class CMValidatedGate(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GeoResidualBank(nn.Module):
-    """Cross-stream contrastive memory bank (CLIP-style).
-
-    Aligns content (Stream A CLS) and geometry (geo_residual CLS)
-    through contrastive learning. Same sample's content and geometry
-    should match; different samples' should not.
-
-    Bank stores projected geo_residual keys from recent batches.
-    Query is projected content CLS from current batch.
-    Positive pair: (content_i, geometry_i) from same sample.
-    Negatives: geometry from bank.
-
-    Gradient flows through BOTH streams:
-      - Content CLS → transformer → input (learns distinctive content)
-      - Geo residual CLS → geo_proj → patchwork → CM gate → constellation
-        (learns to observe what content finds relevant)
-
-    Args:
-        bank_size: number of entries in the queue
-        proj_dim: shared projection dimension for content and geometry
-        temperature: InfoNCE temperature
-    """
+    """Cross-stream contrastive memory bank (CLIP-style)."""
     def __init__(self, proj_dim, bank_size=4096, temperature=0.1):
         super().__init__()
         self.proj_dim = proj_dim
         self.bank_size = bank_size
         self.temperature = temperature
 
-        # Queue of projected geo_residual keys
         self.register_buffer('queue', torch.randn(bank_size, proj_dim))
         self.queue = F.normalize(self.queue, dim=-1)
         self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
 
     @torch.no_grad()
     def enqueue(self, keys):
-        """Add projected geo keys to queue. Called AFTER backward.
-        Args:
-            keys: (B, proj_dim) normalized projected geo_residual CLS
-        """
         B = keys.shape[0]
         ptr = int(self.queue_ptr.item())
         if ptr + B <= self.bank_size:
@@ -299,28 +254,14 @@ class GeoResidualBank(nn.Module):
         self.queue_ptr[0] = (ptr + B) % self.bank_size
 
     def forward(self, content_proj, geo_proj):
-        """Cross-stream InfoNCE: content queries vs geometry keys.
+        q = F.normalize(content_proj, dim=-1)
+        k_pos = F.normalize(geo_proj, dim=-1)
+        k_neg = self.queue.clone().detach()
 
-        Args:
-            content_proj: (B, proj_dim) — projected content CLS (LIVE, has grad)
-            geo_proj: (B, proj_dim) — projected geo_residual CLS (LIVE, has grad)
+        pos_logits = (q * k_pos).sum(dim=-1, keepdim=True) / self.temperature
+        neg_logits = q @ k_neg.T / self.temperature
 
-        Returns:
-            loss: scalar InfoNCE loss
-            acc: top-1 retrieval accuracy (diagnostic)
-        """
-        q = F.normalize(content_proj, dim=-1)  # (B, D)
-        k_pos = F.normalize(geo_proj, dim=-1)  # (B, D) — positive keys
-        k_neg = self.queue.clone().detach()     # (K, D) — negative keys from bank
-
-        # Positive logits: each content matches its own geometry
-        pos_logits = (q * k_pos).sum(dim=-1, keepdim=True) / self.temperature  # (B, 1)
-
-        # Negative logits: each content vs all bank geometry
-        neg_logits = q @ k_neg.T / self.temperature  # (B, K)
-
-        # InfoNCE: positive is column 0
-        logits = torch.cat([pos_logits, neg_logits], dim=1)  # (B, 1+K)
+        logits = torch.cat([pos_logits, neg_logits], dim=1)
         labels = torch.zeros(q.shape[0], dtype=torch.long, device=q.device)
 
         loss = F.cross_entropy(logits, labels)
@@ -336,9 +277,7 @@ class GeoResidualBank(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class FiLMLayer(TorchComponent):
-    """Feature-wise Linear Modulation. Proven in Ryan Spearman.
-    Identity-initialized: γ=1, β=0 at init.
-    """
+    """Feature-wise Linear Modulation. Identity-initialized."""
     def __init__(self, name, feature_dim, context_dim):
         super().__init__(name)
         self.to_gamma = nn.Linear(context_dim, feature_dim)
@@ -385,9 +324,7 @@ def quaternion_multiply_batched(q1, q2):
 
 
 class QuaternionCompose(TorchComponent):
-    """Four-arm Hamilton product composition. Proven in GeoQuat head.
-    Fully vectorized: single batched Hamilton product, no Python loops.
-    """
+    """Four-arm Hamilton product composition. Proven in GeoQuat head."""
     def __init__(self, name, input_dim, quat_dim=64):
         super().__init__(name)
         self.quat_dim = quat_dim
@@ -425,9 +362,7 @@ class QuaternionCompose(TorchComponent):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ManifoldProjection(TorchComponent):
-    """Input stage: project transformer hidden states to S^(d-1).
-    Per-position, per-layer. L2-normalized to unit hypersphere.
-    """
+    """Input stage: project transformer hidden states to S^(d-1)."""
     def __init__(self, name, d_model, manifold_dim):
         super().__init__(name)
         self.proj = nn.Linear(d_model, manifold_dim)
@@ -439,22 +374,24 @@ class ManifoldProjection(TorchComponent):
 
 
 class PositionGeometricContext(TorchComponent):
-    """Curation stage: 4-stream fusion → FiLM context.
+    """Curation stage: 5-stream fusion → FiLM context.
 
-    Four streams:
+    Five streams:
         anchor:     cos_to_anchors + assignment + triangulation — WHERE on the manifold
         structural: patchwork + embedding — WHAT the local geometry looks like
         history:    geo_residual from previous layers — WHAT prior layers observed
         quality:    CM gate values per anchor — HOW TRUSTWORTHY is this observation
+        flow:       FlowEnsemble predictions — WHAT other mathematical lenses see
 
-    The quality stream gives FiLM direct knowledge of which anchors formed
-    valid simplices. This is not a scalar — the full (N, A) gate profile
-    tells the context WHICH directions on the manifold are reliable.
+    The flow stream starts at zero (zero-init) and learns to contribute.
+    Without flows attached, the 5th stream is zeros — equivalent to the
+    original 4-stream architecture.
     """
     def __init__(self, name, n_anchors, pw_dim, manifold_dim, context_dim):
         super().__init__(name)
         self.context_dim = context_dim
         self.pw_dim = pw_dim
+        self.manifold_dim = manifold_dim
 
         # WHERE on the manifold
         self.anchor_mlp = nn.Sequential(
@@ -468,17 +405,23 @@ class PositionGeometricContext(TorchComponent):
         # HOW TRUSTWORTHY — full per-anchor gate profile
         self.quality_mlp = nn.Sequential(
             nn.Linear(n_anchors, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
+        # FLOW OPINIONS — ensemble geometric predictions (zero-init → no disruption)
+        self.flow_mlp = nn.Sequential(
+            nn.Linear(manifold_dim, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
+        nn.init.zeros_(self.flow_mlp[0].weight)
+        nn.init.zeros_(self.flow_mlp[0].bias)
 
-        # Fuse 4 streams
+        # Fuse 5 streams
         self.fuse = nn.Sequential(
-            nn.Linear(context_dim * 4, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
+            nn.Linear(context_dim * 5, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
 
-    def forward(self, obs_dict, gate_values=None, geo_residual=None):
+    def forward(self, obs_dict, gate_values=None, geo_residual=None, flow_output=None):
         """
         Args:
             obs_dict: from decomposed association + gated curation
             gate_values: (N, A) CM gate values per anchor, or None
             geo_residual: (N, pw_dim) accumulated context, or None for first layer
+            flow_output: (N, manifold_dim) flow ensemble prediction, or None
         Returns:
             (N, context_dim) geometric context for FiLM
         """
@@ -496,14 +439,13 @@ class PositionGeometricContext(TorchComponent):
         s = self.struct_mlp(struct_feats)
         h = self.history_mlp(geo_residual) if geo_residual is not None else torch.zeros_like(a)
         q = self.quality_mlp(gate_values) if gate_values is not None else torch.zeros_like(a)
+        f = self.flow_mlp(flow_output) if flow_output is not None else torch.zeros_like(a)
 
-        return self.fuse(torch.cat([a, s, h, q], dim=-1))
+        return self.fuse(torch.cat([a, s, h, q, f], dim=-1))
 
 
 class GeometricAttention(TorchComponent):
-    """Attention with FiLM from curated constellation. Stream B.
-    FiLM modulates Q,K BEFORE attention. V stays unmodulated.
-    """
+    """Attention with FiLM from curated constellation. Stream B."""
     def __init__(self, name, d_model, n_heads=8, context_dim=128, dropout=0.1):
         super().__init__(name)
         self.d_model = d_model
@@ -577,18 +519,19 @@ class ContentAttention(TorchComponent):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LAYER — CM-validated dual-stream with constellation routing
+# LAYER — CM-validated dual-stream with constellation routing + flows
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GeometricTransformerLayer(BaseTower):
-    """One layer of the geometric transformer (CM validated).
+    """One layer of the geometric transformer (CM validated + flows).
 
     Pipeline per layer:
         1. ManifoldProjection: h → emb on S^(d-1)
         2. Association: emb → raw triangulation, cos, assignment
         3. CMValidatedGate: per-anchor CM validity → gate_values
         4. Gated curation: patchwork reads tri * gate_values
-        5. PositionGeometricContext: 4 streams → FiLM context
+        4.5 FlowEnsemble (optional): multi-opinion geometric predictions
+        5. PositionGeometricContext: 5 streams → FiLM context
         6. ContentAttention (Stream A): standard MHA
         7. GeometricAttention (Stream B): FiLM(Q,K | geo_ctx)
         8. CayleyOrthogonal: align B → A
@@ -596,23 +539,18 @@ class GeometricTransformerLayer(BaseTower):
        10. Decode + gated residual
        11. CM-conditioned geometric residual accumulation
 
-    The observer is DECOMPOSED: association and curation are called
-    separately with the CM gate inserted between them. The gate
-    suppresses degenerate anchor measurements before the patchwork
-    reads them. The patchwork only interprets validated geometry.
-
-    The geometric residual is accumulated using CM quality as the
-    write weight — no learned gate. Positions with high-quality
-    simplex observations contribute more. Positions in degenerate
-    regions contribute less.
+    Flows are optional, config-driven, and individually replaceable:
+        layer['flows'].attach_flow('alignment')
+        layer['flows'].detach_flow('velocity')
     """
     def __init__(self, name, d_model, n_heads=8, n_anchors=32,
                  manifold_dim=256, n_comp=8, d_comp=32,
                  context_dim=128, quat_dim=64, dropout=0.1,
-                 cm_neighbors=3):
+                 cm_neighbors=3, flow_keys=None, flow_fusion='weighted'):
         super().__init__(name)
         self.d_model = d_model
         self.n_anchors = n_anchors
+        self.manifold_dim = manifold_dim
 
         # 1. Project to manifold
         self.attach('projection', ManifoldProjection(
@@ -627,7 +565,13 @@ class GeometricTransformerLayer(BaseTower):
         self.attach('cm_gate', CMValidatedGate(
             n_anchors=n_anchors, n_neighbors=cm_neighbors))
 
-        # 4. Fuse observation into FiLM context (4 streams)
+        # 3.5 Flow ensemble — optional multi-opinion geometric fusion
+        if flow_keys:
+            self.attach('flows', FlowEnsemble(
+                f'{name}_flows', manifold_dim, n_anchors,
+                flow_keys=flow_keys, fusion=flow_fusion))
+
+        # 4. Fuse observation into FiLM context (5 streams)
         pw_dim = self['observer'].curation.patchwork.output_dim
         self.attach('context', PositionGeometricContext(
             f'{name}_ctx', n_anchors, pw_dim, manifold_dim, context_dim))
@@ -701,10 +645,18 @@ class GeometricTransformerLayer(BaseTower):
             'bridge': c_out['bridge'],
         }
 
-        # ════ 5. Build FiLM context — 4 streams ════
+        # ════ 4.5 Flow ensemble — multi-opinion geometric predictions ════
+        flow_output_flat = None
+        if self.has('flows'):
+            anchors_for_flows = anchors_n.unsqueeze(0).expand(B, -1, -1)
+            flow_pred = self['flows'](anchors_for_flows, emb)  # [B, L, manifold_dim]
+            flow_output_flat = flow_pred.reshape(B * L, -1)
+
+        # ════ 5. Build FiLM context — 5 streams ════
         geo_res_flat = geo_residual.reshape(B * L, -1) if geo_residual is not None else None
         geo_ctx_flat = self['context'](
-            obs, gate_values=gate_values, geo_residual=geo_res_flat)
+            obs, gate_values=gate_values, geo_residual=geo_res_flat,
+            flow_output=flow_output_flat)
         geo_ctx = geo_ctx_flat.reshape(B, L, -1)
 
         # ════ 6. Stream A: content attention ════
@@ -729,11 +681,8 @@ class GeometricTransformerLayer(BaseTower):
         x_out = g * decoded + (1 - g) * x
 
         # ════ 11. CM-conditioned geometric residual accumulation ════
-        # CM quality per position: mean gate value across anchors.
-        # High quality = position's simplex with anchors is non-degenerate.
-        # Low quality = position is in a boundary region or near dead anchors.
         pw_validated = c_out['patchwork'].reshape(B, L, -1)
-        cm_quality = gate_values.mean(dim=-1).reshape(B, L, 1)  # (B, L, 1)
+        cm_quality = gate_values.mean(dim=-1).reshape(B, L, 1)
         geo_update = self['geo_proj'](pw_validated)
 
         if geo_residual is None:
@@ -775,11 +724,12 @@ class GeometricTransformerLayer(BaseTower):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GeometricTransformer(BaseTower):
-    """Geometric Transformer — CM-validated dual-stream.
+    """Geometric Transformer — CM-validated dual-stream with optional flows.
 
     Stack of GeometricTransformerLayers with:
         - CM-gated observation at every layer
-        - Cross-layer Cayley rotation on hidden states (not geo_residual)
+        - Optional FlowEnsemble at every layer (config-driven)
+        - Cross-layer Cayley rotation on hidden states
         - Built-in geometric regularization via geometric_losses()
     """
     def __init__(self, name, d_model=512, n_heads=8, n_layers=4,
@@ -787,7 +737,8 @@ class GeometricTransformer(BaseTower):
                  context_dim=128, quat_dim=64, dropout=0.1,
                  cross_layer_rotation=True, cm_neighbors=3,
                  nce_bank_size=4096, nce_temperature=0.1,
-                 vocab_size=None, max_seq_len=2048):
+                 vocab_size=None, max_seq_len=2048,
+                 flow_keys=None, flow_fusion='weighted'):
         super().__init__(name)
         self.d_model = d_model
         self.n_layers = n_layers
@@ -803,7 +754,8 @@ class GeometricTransformer(BaseTower):
             self.attach(f'layer_{i}', GeometricTransformerLayer(
                 f'{name}_L{i}', d_model, n_heads, n_anchors,
                 manifold_dim, n_comp, d_comp, context_dim, quat_dim,
-                dropout, cm_neighbors))
+                dropout, cm_neighbors,
+                flow_keys=flow_keys, flow_fusion=flow_fusion))
 
         if cross_layer_rotation and n_layers > 1:
             for i in range(n_layers - 1):
@@ -812,8 +764,7 @@ class GeometricTransformer(BaseTower):
 
         self.attach('final_norm', nn.LayerNorm(d_model))
 
-        # Cross-stream contrastive (CLIP-style): content CLS vs geometry CLS
-        # Two projections map content (d_model) and geometry (pw_dim) to shared space
+        # Cross-stream contrastive (CLIP-style)
         if nce_bank_size > 0:
             nce_proj_dim = 128
             self.attach('nce_content_proj', nn.Sequential(
@@ -838,6 +789,7 @@ class GeometricTransformer(BaseTower):
             cross_layer_rotation=cross_layer_rotation,
             cm_neighbors=cm_neighbors, vocab_size=vocab_size,
             nce_bank_size=nce_bank_size, nce_temperature=nce_temperature,
+            flow_keys=flow_keys, flow_fusion=flow_fusion,
         )
 
     @property
@@ -850,24 +802,7 @@ class GeometricTransformer(BaseTower):
             self[f'layer_{i}']['cm_gate'].invalidate_cache()
 
     def geometric_losses(self, cv_target=0.215, cv_weight=0.1, spread_weight=0.01):
-        """Compute geometric regularization from current anchor geometry.
-
-        These losses maintain the constellation in the regime where
-        CM validation, patchwork interpretation, and the full observation
-        pipeline produce meaningful results.
-
-        CV loss: push anchor coefficient of variation toward pentachoron
-        band (0.20-0.23). This is where CM computation has maximal
-        discriminative power — anchors are neither too uniform (CV≈0,
-        CM uninformative) nor too clustered (CV>0.3, degenerate simplices).
-
-        Spread loss: penalize positive cosine similarity between anchors.
-        Prevents collapse where multiple anchors occupy the same region,
-        creating redundant measurements and wasting patchwork capacity.
-
-        Returns:
-            dict with 'cv', 'spread', 'geo_total' loss tensors
-        """
+        """Compute geometric regularization from current anchor geometry."""
         total_cv = torch.tensor(0.0)
         total_spread = torch.tensor(0.0)
         n = 0
@@ -878,19 +813,16 @@ class GeometricTransformer(BaseTower):
             anchors_n = F.normalize(anchors, dim=-1)
             A = anchors_n.shape[0]
 
-            # Ensure we're on the right device
             if n == 0:
                 total_cv = total_cv.to(anchors.device)
                 total_spread = total_spread.to(anchors.device)
 
-            # ── CV loss: pairwise angular distance coefficient of variation ──
             cos = anchors_n @ anchors_n.T
             idx = torch.triu_indices(A, A, offset=1, device=cos.device)
             pairwise_dist = 1.0 - cos[idx[0], idx[1]]
             cv = pairwise_dist.std() / (pairwise_dist.mean() + 1e-8)
             total_cv = total_cv + (cv - cv_target).pow(2)
 
-            # ── Spread loss: penalize positive cosine between anchors ──
             mask = ~torch.eye(A, dtype=torch.bool, device=cos.device)
             total_spread = total_spread + F.relu(cos[mask]).mean()
 
@@ -904,25 +836,7 @@ class GeometricTransformer(BaseTower):
         return losses
 
     def infonce_loss(self, cls_index=0):
-        """Cross-stream contrastive: content queries against decoupled geometry.
-
-        The constellation provides a STABLE geometric reference frame.
-        The content stream needs discriminative correction.
-        The InfoNCE targets weaker content representations by measuring
-        them against the constellation's observation.
-
-        Gradient path (info-side only):
-          - nce_content_proj ← hidden_cls ← transformer ← input  (LIVE)
-          - nce_geo_proj ← learns to read detached residual       (LIVE proj, FROZEN input)
-          - geo_residual ← constellation/patchwork/geo_proj       (DETACHED — decoupled)
-
-        The constellation's anchors never see NCE gradient.
-        Both projection heads learn from InfoNCE to find shared space.
-        Content stream receives corrective gradient at weak positions.
-
-        Returns:
-            dict with 'nce': loss tensor, 'nce_acc': retrieval accuracy
-        """
+        """Cross-stream contrastive: content queries against decoupled geometry."""
         if not self.has('nce_bank'):
             return {}
 
@@ -931,11 +845,7 @@ class GeometricTransformer(BaseTower):
         if hidden is None or geo_residual is None:
             return {}
 
-        # Content CLS → shared space (LIVE — info-side gets gradient)
         content_cls = self['nce_content_proj'](hidden[:, cls_index])
-
-        # Geo residual CLS → shared space (DETACHED input — constellation decoupled)
-        # nce_geo_proj itself IS trainable — learns to read the frozen residual
         geo_cls = self['nce_geo_proj'](geo_residual[:, cls_index].detach())
 
         loss, acc = self['nce_bank'](content_cls, geo_cls)
@@ -955,7 +865,7 @@ class GeometricTransformer(BaseTower):
         self['nce_bank'].enqueue(F.normalize(geo_cls, dim=-1))
 
     def anchor_diagnostics(self):
-        """Per-layer anchor health diagnostics. Call for monitoring."""
+        """Per-layer anchor health diagnostics."""
         diag = {}
         for i in range(self.n_layers):
             layer = self[f'layer_{i}']
@@ -968,7 +878,6 @@ class GeometricTransformer(BaseTower):
             pairwise = 1.0 - cos[idx[0], idx[1]]
             cv = (pairwise.std() / (pairwise.mean() + 1e-8)).item()
 
-            # CM quality per anchor
             with torch.no_grad():
                 anchor_cm, _ = anchor_neighborhood_cm(
                     anchors_n, layer['cm_gate'].n_neighbors)
@@ -986,7 +895,7 @@ class GeometricTransformer(BaseTower):
     def param_report(self):
         total = 0
         name = getattr(self, '_tower_name', self.__class__.__name__)
-        print(f"\n  {name} — parameter report (CM-validated)")
+        print(f"\n  {name} — parameter report (CM-validated + flows)")
         print(f"  {'Component':<35s}  {'Params':>12s}")
         print(f"  {'─'*35}  {'─'*12}")
         for cname, module in self.named_children():
@@ -999,35 +908,16 @@ class GeometricTransformer(BaseTower):
 
     # ── Tower compiler integration ──────────────────────────────────
 
-    # Submodules that are always safe to compile (no linalg.det, no dynamic dispatch)
     _COMPILABLE_LAYER_KEYS = (
         'projection', 'context', 'content', 'geometric',
-        'compose', 'decode', 'gate', 'geo_proj',
+        'compose', 'decode', 'gate', 'geo_proj', 'flows',
     )
-    # Submodules excluded from compilation (contain @torch.compiler.disable methods)
     _EXCLUDED_LAYER_KEYS = ('cm_gate', 'observer')
-    # Conditionally compilable (linalg.solve works in inductor but may fail in CUDA graphs)
     _CONDITIONAL_LAYER_KEYS = ('rotation',)
 
     def enable_compilation(self, mode='selective', backend='inductor',
                            compile_rotations=False, **compile_kwargs):
-        """Apply torch.compile to compilable submodules.
-
-        The geometric transformer has a clean separation between compilable
-        tensor operations (~80% of compute) and non-compilable regions
-        (CM determinant via linalg.det). This method compiles the safe
-        regions while preserving the graph break boundaries.
-
-        Args:
-            mode: 'selective' — compile individual submodules per layer
-            backend: torch.compile backend (default: 'inductor')
-            compile_rotations: whether to compile CayleyOrthogonal modules
-                (linalg.solve works in inductor but may fail with CUDA graphs)
-            **compile_kwargs: passed to torch.compile (e.g. mode='reduce-overhead')
-
-        Returns:
-            dict with compilation statistics
-        """
+        """Apply torch.compile to compilable submodules."""
         if not hasattr(self, '_compiled_originals'):
             self._compiled_originals = {}
 
@@ -1037,7 +927,6 @@ class GeometricTransformer(BaseTower):
         for i in range(self.n_layers):
             layer = self[f'layer_{i}']
 
-            # Always-safe submodules
             for key in self._COMPILABLE_LAYER_KEYS:
                 if layer.has(key):
                     original = layer[key]
@@ -1050,7 +939,6 @@ class GeometricTransformer(BaseTower):
                         layer.attach(key, compiled)
                         compiled_count += 1
 
-            # Conditional: CayleyOrthogonal
             if compile_rotations:
                 for key in self._CONDITIONAL_LAYER_KEYS:
                     if layer.has(key):
@@ -1064,12 +952,10 @@ class GeometricTransformer(BaseTower):
                             layer.attach(key, compiled)
                             compiled_count += 1
 
-            # Excluded: count for reporting
             for key in self._EXCLUDED_LAYER_KEYS:
                 if layer.has(key):
                     skipped_count += 1
 
-        # Cross-layer rotations
         if compile_rotations:
             for i in range(self.n_layers - 1):
                 key = f'cross_rot_{i}'
@@ -1083,7 +969,6 @@ class GeometricTransformer(BaseTower):
                         self.attach(key, compiled)
                         compiled_count += 1
 
-        # Final norm
         if self.has('final_norm'):
             original = self['final_norm']
             if not getattr(original, '_is_compiled', False):
@@ -1105,18 +990,13 @@ class GeometricTransformer(BaseTower):
         return stats
 
     def disable_compilation(self):
-        """Revert all compiled submodules to their originals.
-
-        Returns:
-            int: number of modules reverted
-        """
+        """Revert all compiled submodules to their originals."""
         if not hasattr(self, '_compiled_originals'):
             return 0
 
         reverted = 0
         for path, original in self._compiled_originals.items():
             if '.' in path:
-                # layer_i.key
                 layer_name, key = path.split('.', 1)
                 layer = self[layer_name]
                 layer.attach(key, original)
@@ -1129,12 +1009,7 @@ class GeometricTransformer(BaseTower):
         return reverted
 
     def compilation_report(self):
-        """Analyze module tree using geofractal CompileRouter.
-
-        Returns dict with introspection results: module categories,
-        signature groups, batchable stages, and compilability map.
-        Requires geofractal to be installed.
-        """
+        """Analyze module tree using geofractal CompileRouter."""
         if not _HAS_COMPILE_ROUTER:
             return {'error': 'geofractal not installed — CompileRouter unavailable'}
 
@@ -1142,7 +1017,6 @@ class GeometricTransformer(BaseTower):
         compiler.introspect()
         structure = compiler.compile_towers()
 
-        # Build compilability map
         compilability = {}
         for i in range(self.n_layers):
             layer = self[f'layer_{i}']
@@ -1179,15 +1053,6 @@ class GeometricTransformer(BaseTower):
 
     def forward(self, x, attn_mask=None, key_padding_mask=None,
                 return_geo_state=False):
-        """
-        Returns:
-            out: (B, L, D) transformed hidden states (or logits if head attached)
-            geo_states: list of per-layer geo_state dicts (if return_geo_state)
-
-        Side effect:
-            self._last_geo_residual is set to the final geo_residual (B, L, pw_dim)
-            for use by infonce_loss() and update_nce_bank() without changing the return API.
-        """
         if self.has('embed') and x.dtype in (torch.long, torch.int32, torch.int64):
             pos = torch.arange(x.shape[1], device=x.device)
             x = self['embed'](x) + self['pos_embed'](pos)
@@ -1204,11 +1069,9 @@ class GeometricTransformer(BaseTower):
                 geo_states.append(geo_state)
             if has_xrot and i < self.n_layers - 1:
                 x = self[f'cross_rot_{i}'](x)
-                # geo_residual NOT rotated — lives in patchwork space, basis-independent
 
-        # Cache for cross-stream contrastive: content CLS vs geometry CLS
         self._last_geo_residual = geo_residual
-        self._last_hidden = x  # pre-norm hidden states — content representation
+        self._last_hidden = x
 
         x = self['final_norm'](x)
         if self.has('head'):
@@ -1219,15 +1082,6 @@ class GeometricTransformer(BaseTower):
     # ── Paired forward + observer loss ──────────────────────────────
 
     def _run_view(self, x, attn_mask=None, key_padding_mask=None):
-        """Run one view through the full pipeline.
-
-        Only retains the final layer's geo_state — intermediate layers'
-        states are freed, saving ~160MB per layer during backward.
-
-        Returns:
-            features: (B, L, D) transformed hidden states (post-norm)
-            final_geo_state: geo_state dict from the last layer only
-        """
         has_xrot = self.has('cross_rot_0')
         geo_residual = None
 
@@ -1248,29 +1102,12 @@ class GeometricTransformer(BaseTower):
 
     def forward_paired(self, x1, x2, cls_index=0,
                        attn_mask=None, key_padding_mask=None):
-        """Dual-view forward for observer loss training.
-
-        Concatenates both views along batch dim → single forward pass →
-        splits output. Same compute, half the batches, double GPU utilization.
-        Attention is per-sample (batch_first), so views don't cross-attend.
-
-        Args:
-            x1, x2: (B, L, D) two views of input hidden states
-            cls_index: position index for image-level outputs (default 0)
-
-        Returns:
-            output dict matching observer_loss spec:
-                embedding, embedding_aug, patchwork1, patchwork1_aug,
-                bridge1, bridge2, assign1, assign2, cos1, tri1, tri2
-            Plus: features1, features2, gate_values, cm_quality
-        """
         B = x1.shape[0]
-        x_cat = torch.cat([x1, x2], dim=0)  # (2B, L, D)
+        x_cat = torch.cat([x1, x2], dim=0)
         feat_cat, gs = self._run_view(x_cat, attn_mask, key_padding_mask)
 
         c = cls_index
         return {
-            # observe_paired format — what observer_loss reads
             'embedding':      gs['embedding'][:B, c],
             'embedding_aug':  gs['embedding'][B:, c],
             'patchwork1':     gs['patchwork'][:B, c],
@@ -1282,10 +1119,8 @@ class GeometricTransformer(BaseTower):
             'cos1':           gs['cos_to_anchors'][:B, c],
             'tri1':           gs['triangulation'][:B, c],
             'tri2':           gs['triangulation'][B:, c],
-            # Full features for task head
             'features1':      feat_cat[:B],
             'features2':      feat_cat[B:],
-            # Diagnostics
             'gate_values1':   gs['gate_values'][:B, c],
             'gate_values2':   gs['gate_values'][B:, c],
             'cm_quality1':    gs['cm_quality'][:B],
@@ -1294,35 +1129,13 @@ class GeometricTransformer(BaseTower):
 
     def compute_loss(self, output, targets, cls_index=0,
                      w_ce=1.0, head=None, **loss_kwargs):
-        """Three-domain observer loss through the CM-gated pipeline.
-
-        Follows ConstellationEncoder.compute_loss pattern:
-            observer_loss (geometric + internal) + CE (external)
-
-        The observer_loss reads patchwork, bridge, assign, tri, cos —
-        all of which flowed through the CM gate during forward_paired.
-
-        Args:
-            output: dict from forward_paired()
-            targets: (B,) class labels
-            cls_index: which position has the CLS token
-            w_ce: weight on cross-entropy loss
-            head: nn.Module mapping (B, D) → (B, num_classes), or None
-            **loss_kwargs: forwarded to observer_loss (w_nce_pw, w_bridge, etc.)
-
-        Returns:
-            (total_loss, loss_dict)
-        """
-        # Get anchors from final layer's constellation
         final_layer = self[f'layer_{self.n_layers - 1}']
         anchors = final_layer['observer'].association.constellation.anchors
 
-        # Observer self-organization loss (geometric + internal)
         obs_loss, ld = _geolip_observer_loss(
             output, anchors=anchors, targets=targets,
             **loss_kwargs)
 
-        # Task loss if head provided
         if head is not None:
             feat1 = output['features1'][:, cls_index]
             feat2 = output['features2'][:, cls_index]
@@ -1338,9 +1151,6 @@ class GeometricTransformer(BaseTower):
 
         ld['loss_observer'] = obs_loss.detach()
 
-        # Spread maintenance for non-final layers — observer_loss only
-        # covers the final layer's anchors. Without this, layers 0..N-2
-        # have zero repulsion pressure and their anchors can collapse.
         w_spread = loss_kwargs.get('w_spread', 0.01)
         if self.n_layers > 1 and w_spread > 0:
             other_spread = torch.tensor(0.0, device=anchors.device)
