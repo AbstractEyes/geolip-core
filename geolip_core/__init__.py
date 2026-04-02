@@ -15,3 +15,5 @@ Quick start:
 """
 
 __version__ = "0.1.0"
+import sys
+sys.modules['geolip'] = sys.modules[__name__]
