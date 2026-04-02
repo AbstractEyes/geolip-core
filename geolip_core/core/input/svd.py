@@ -5,7 +5,8 @@ SVDObserver:      Spatial features (B, C, H, W) → projects via 1×1 conv, deco
 SVDTokenObserver: Token sequences (B, seq, dim) → transposes, decomposes directly.
 
 Both extract: singular values, rotation structure (Vh), novelty (EMA deviation).
-Both use utils/kernel.py for the actual decomposition.
+Both use geolip_core.linalg for decomposition — dispatches to cuSOLVER for training
+(differentiable) or FL kernel for compiled inference (zero graph breaks).
 
 Usage:
     from geolip_core.core.input.svd import SVDObserver, SVDTokenObserver
@@ -21,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from geolip_core.utils.kernel import gram_eigh_svd
+import geolip_core.linalg as LA
 
 
 class _SVDFeatureMixin:
@@ -48,13 +49,17 @@ class _SVDFeatureMixin:
         return S - self.ema_s.clone().unsqueeze(0)
 
     def _decompose(self, matrix):
-        """Safe SVD via gram_eigh. (B, M, N) → S, Vh."""
+        """SVD via geolip_core.linalg. (B, M, N) → S, Vh.
+
+        Dispatches through LA.svd:
+            method='gram_eigh' → Gram matrix + eigh (default, differentiable)
+            Compiled inference automatically uses FL kernel (zero graph breaks).
+        """
         with torch.amp.autocast('cuda', enabled=False):
-            with torch.no_grad():
-                _, S, Vh = gram_eigh_svd(matrix.float())
-                S = S.clamp(min=1e-6)
-                S = torch.where(torch.isfinite(S), S, torch.ones_like(S))
-                Vh = torch.where(torch.isfinite(Vh), Vh, torch.zeros_like(Vh))
+            U, S, Vh = LA.svd(matrix.float(), method='gram_eigh')
+            S = S.clamp(min=1e-6)
+            S = torch.where(torch.isfinite(S), S, torch.ones_like(S))
+            Vh = torch.where(torch.isfinite(Vh), Vh, torch.zeros_like(Vh))
         return S, Vh
 
     @torch.no_grad()
