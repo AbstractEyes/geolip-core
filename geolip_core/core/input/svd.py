@@ -51,23 +51,22 @@ class _SVDFeatureMixin:
     def _decompose(self, matrix):
         """SVD via Gram matrix + FL eigh. (B, M, N) → S, Vh.
 
-        Manual decomposition using LA.eigh(method='fl') which is
-        pure tensor ops — CUDA-graph-safe for reduce-overhead compilation.
-        cuSOLVER's eigh can't be captured in CUDA graphs.
+        Uses LA.eigh(method='fl') — pure tensor ops, CUDA-graph-safe.
+        Outputs detached: FL kernel's Laguerre deflation has in-place
+        mutation that breaks autograd versioning. Conv frontend gets
+        gradient through patch_proj(feat), not through eigendecomposition.
         """
         with torch.amp.autocast('cuda', enabled=False):
             A = matrix.float()
-            # Gram matrix: (B, N, N) = A^T @ A
             G = A.transpose(-2, -1) @ A
-            # FL eigh: pure tensor ops, no cuSOLVER, CUDA-graph-safe
             eigenvalues, eigenvectors = LA.eigh(G, method='fl')
-            # eigenvalues → singular values (ascending from eigh)
+            # Detach — FL deflation loop mutates cl in-place (version conflict)
+            eigenvalues = eigenvalues.detach()
+            eigenvectors = eigenvectors.detach()
             S = eigenvalues.clamp(min=1e-12).sqrt()
             Vh = eigenvectors.transpose(-2, -1)
-            # Reverse to descending order
             S = S.flip(-1)
             Vh = Vh.flip(-2)
-            # Safety clamps
             S = S.clamp(min=1e-6)
             S = torch.where(torch.isfinite(S), S, torch.ones_like(S))
             Vh = torch.where(torch.isfinite(Vh), Vh, torch.zeros_like(Vh))

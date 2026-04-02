@@ -1,139 +1,129 @@
 """
-SVD observation — structural decomposition of feature maps and token sequences.
+Batched thin SVD with auto-dispatch and FL eigh integration.
 
-SVDObserver:      Spatial features (B, C, H, W) → projects via 1×1 conv, decomposes.
-SVDTokenObserver: Token sequences (B, seq, dim) → transposes, decomposes directly.
+Dispatch order:
+  N=2, Triton available:  Fused Triton kernel    ~0.02ms
+  N=3, Triton available:  Fused Triton kernel    ~0.02ms
+  N<=12, CUDA:            Gram + FL eigh          compilable, 70/72 purity
+  N>12 or CPU:            Gram + torch.linalg.eigh
+  Any fallback:           torch.linalg.svd
 
-Both extract: singular values, rotation structure (Vh), novelty (EMA deviation).
-Both use geolip_core.linalg for decomposition — dispatches to cuSOLVER for training
-(differentiable) or FL kernel for compiled inference (zero graph breaks).
+Toggle FL eigh globally:
+    from geolip.linalg import backend
+    backend.use_fl_eigh = False  # disables FL, uses cuSOLVER everywhere
 
 Usage:
-    from geolip_core.core.input.svd import SVDObserver, SVDTokenObserver
+    from geolip.linalg import svd
 
-    spatial_obs = SVDObserver(in_channels=384, svd_rank=24)
-    S, Vh, features, novelty = spatial_obs(conv_features)  # (B, C, H, W)
-
-    token_obs = SVDTokenObserver(seq_len=5)
-    S, Vh, features, novelty = token_obs(tokens)  # (B, 5, 512)
+    U, S, Vh = svd(A)                           # auto-dispatch
+    U, S, Vh = svd(A, method='fl')              # force FL eigh path
+    U, S, Vh = svd(A, method='torch')           # force torch.linalg.svd
 """
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import Tensor
+from typing import Tuple
 
-import geolip_core.linalg as LA
+from .eigh import FLEigh, _FL_MAX_N
+from ._backend import backend
 
-
-class _SVDFeatureMixin:
-    """Shared SVD feature extraction and EMA tracking."""
-
-    def _init_ema(self, rank):
-        self.register_buffer('ema_s', torch.ones(rank))
-        self.register_buffer('ema_vh_flat', torch.eye(rank).reshape(-1))
-        self.ema_momentum = 0.99
-
-    def extract_features(self, S, Vh):
-        """Compact SVD summary. (B, k), (B, k, k) → (B, 2k+2)."""
-        B, k = S.shape
-        S_safe = S.clamp(min=1e-6)
-        s_norm = S_safe / (S_safe.sum(dim=-1, keepdim=True) + 1e-8)
-        vh_diag = Vh.diagonal(dim1=-2, dim2=-1)
-        vh_offdiag = (Vh.pow(2).sum((-2, -1)) - vh_diag.pow(2).sum(-1)).unsqueeze(-1).clamp(min=0)
-        s_ent = -(s_norm * torch.log(s_norm.clamp(min=1e-8))).sum(-1, keepdim=True)
-        out = torch.cat([s_norm, vh_diag, vh_offdiag, s_ent], dim=-1)
-        return torch.where(torch.isfinite(out), out, torch.zeros_like(out))
-
-    def compute_novelty(self, S):
-        """Deviation from running average. (B, k) → (B, k)."""
-        return S - self.ema_s.clone().unsqueeze(0)
-
-    def _decompose(self, matrix):
-        """SVD via Gram matrix + FL eigh. (B, M, N) → S, Vh.
-
-        Uses LA.eigh(method='fl') — pure tensor ops, CUDA-graph-safe.
-        Outputs detached: FL kernel's Laguerre deflation has in-place
-        mutation that breaks autograd versioning. Conv frontend gets
-        gradient through patch_proj(feat), not through eigendecomposition.
-        """
-        with torch.amp.autocast('cuda', enabled=False):
-            A = matrix.float()
-            G = A.transpose(-2, -1) @ A
-            eigenvalues, eigenvectors = LA.eigh(G, method='fl')
-            # Detach — FL deflation loop mutates cl in-place (version conflict)
-            eigenvalues = eigenvalues.detach()
-            eigenvectors = eigenvectors.detach()
-            S = eigenvalues.clamp(min=1e-12).sqrt()
-            Vh = eigenvectors.transpose(-2, -1)
-            S = S.flip(-1)
-            Vh = Vh.flip(-2)
-            S = S.clamp(min=1e-6)
-            S = torch.where(torch.isfinite(S), S, torch.ones_like(S))
-            Vh = torch.where(torch.isfinite(Vh), Vh, torch.zeros_like(Vh))
-        return S, Vh
-
-    @torch.no_grad()
-    def update_ema(self, S, Vh):
-        """Update running averages. Call AFTER backward."""
-        m = self.ema_momentum
-        self.ema_s.mul_(m).add_(S.detach().mean(0), alpha=1-m)
-        self.ema_vh_flat.mul_(m).add_(Vh.detach().mean(0).reshape(-1), alpha=1-m)
+__all__ = ['batched_svd', 'gram_fl_eigh_svd', 'gram_eigh_svd']
 
 
-class SVDObserver(nn.Module, _SVDFeatureMixin):
-    """Observe spatial backbone features via SVD decomposition.
+def gram_fl_eigh_svd(A: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """Thin SVD via Gram matrix + FL eigendecomposition.
 
-    Projects in_channels to svd_rank via 1×1 conv, decomposes the
-    spatial structure, extracts compact features, tracks novelty via EMA.
+    Fully compilable for n <= 12. Zero graph breaks.
 
     Args:
-        in_channels: Backbone feature channels
-        svd_rank: SVD projection rank (≤32 for sub-ms)
+        A: (B, M, N) tensor, M >= N, N <= 12
+
+    Returns: U (B,M,N), S (B,N), Vh (B,N,N) — singular values descending.
     """
-
-    def __init__(self, in_channels, svd_rank=24):
-        super().__init__()
-        self.svd_rank = svd_rank
-        self.to_svd = nn.Conv2d(in_channels, svd_rank, 1, bias=False)
-        self._init_ema(svd_rank)
-
-    def forward(self, x):
-        """(B, C, H, W) → S, Vh, features, novelty."""
-        B, C, H, W = x.shape
-        h = self.to_svd(x)
-        h_flat = h.permute(0, 2, 3, 1).reshape(B, H * W, self.svd_rank)
-        S, Vh = self._decompose(h_flat)
-        return S, Vh, self.extract_features(S, Vh), self.compute_novelty(S)
-
-    @property
-    def feature_dim(self):
-        return 2 * self.svd_rank + 2
+    with torch.amp.autocast('cuda', enabled=False):
+        A_f = A.float()
+        G = torch.bmm(A_f.transpose(1, 2), A_f)
+        eigenvalues, V = FLEigh()(G)
+        eigenvalues = eigenvalues.flip(-1)
+        V = V.flip(-1)
+        S = torch.sqrt(eigenvalues.clamp(min=1e-12))
+        U = torch.bmm(A_f, V) / S.unsqueeze(1)
+        Vh = V.transpose(-2, -1).contiguous()
+    return U, S, Vh
 
 
-class SVDTokenObserver(nn.Module, _SVDFeatureMixin):
-    """Observe token sequence structure via SVD decomposition.
+def gram_eigh_svd(A: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """Thin SVD via Gram matrix + torch.linalg.eigh.
 
-    Transposes (B, seq, dim) → (B, dim, seq). The seq singular values
-    tell you how the token directions distribute variance. Vh (seq×seq)
-    tells you how token dimensions mix in feature space.
-
-    No learned projection — the raw token structure is the observation.
+    Fallback for N > 12 or when FL is disabled.
 
     Args:
-        seq_len: Number of tokens in input sequence
+        A: (B, M, N) tensor, M >= N
+
+    Returns: U (B,M,N), S (B,N), Vh (B,N,N) — singular values descending.
     """
+    with torch.amp.autocast('cuda', enabled=False):
+        A_f = A.float()
+        G = torch.bmm(A_f.transpose(1, 2), A_f)
+        eigenvalues, V = torch.linalg.eigh(G)
+        eigenvalues = eigenvalues.flip(-1)
+        V = V.flip(-1)
+        S = torch.sqrt(eigenvalues.clamp(min=1e-12))
+        U = torch.bmm(A_f, V) / S.unsqueeze(1)
+        Vh = V.transpose(-2, -1).contiguous()
+    return U, S, Vh
 
-    def __init__(self, seq_len):
-        super().__init__()
-        self.seq_len = seq_len
-        self._init_ema(seq_len)
 
-    def forward(self, x):
-        """(B, seq, dim) → S, Vh, features, novelty."""
-        x_t = x.transpose(1, 2).contiguous()
-        S, Vh = self._decompose(x_t)
-        return S, Vh, self.extract_features(S, Vh), self.compute_novelty(S)
+def batched_svd(
+    A: Tensor,
+    method: str = 'auto',
+    block_m: int = 128,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Batched thin SVD for (B, M, N) tensors. M >= N.
 
-    @property
-    def feature_dim(self):
-        return 2 * self.seq_len + 2
+    Methods:
+      'auto':       Best available for each N
+      'fl':         Force Gram + FL eigh (N <= 12)
+      'gram_eigh':  Force Gram + torch.linalg.eigh
+      'triton':     Force Triton kernel (N=2,3 only)
+      'torch':      Force torch.linalg.svd
+
+    Args:
+        A:        (B, M, N) tensor
+        method:   Dispatch method
+        block_m:  Tile size for Triton kernels
+
+    Returns: U (B,M,N), S (B,N), Vh (B,N,N) — singular values descending.
+    """
+    assert A.ndim == 3, f"Expected (B, M, N), got {A.shape}"
+    B, M, N = A.shape
+    assert M >= N, f"Thin SVD requires M >= N, got M={M}, N={N}"
+
+    if method == 'torch':
+        return torch.linalg.svd(A.float(), full_matrices=False)
+
+    if method == 'fl':
+        return gram_fl_eigh_svd(A)
+
+    if method == 'gram_eigh':
+        return gram_eigh_svd(A)
+
+    if method == 'triton':
+        if N == 2:
+            return backend.resolve_svd_n2(A, block_m)
+        elif N == 3:
+            return backend.resolve_svd_n3(A, block_m)
+        raise ValueError(f"Triton kernel only for N=2,3, got N={N}")
+
+    # method == 'auto'
+    if N == 2 and backend.use_triton and A.is_cuda:
+        return backend.resolve_svd_n2(A, block_m)
+    elif N == 3 and backend.use_triton and A.is_cuda:
+        return backend.resolve_svd_n3(A, block_m)
+    elif N <= _FL_MAX_N and backend.use_fl_eigh and A.is_cuda:
+        return gram_fl_eigh_svd(A)
+    elif A.is_cuda:
+        return gram_eigh_svd(A)
+    else:
+        backend.warn('svd')
+        return torch.linalg.svd(A.float(), full_matrices=False)
