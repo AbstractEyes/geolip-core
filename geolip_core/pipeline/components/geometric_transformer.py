@@ -58,6 +58,7 @@ from geolip_core.core.associate.constellation import (
 )
 from geolip_core.core.curate.gate import AnchorGate as _GeolipAnchorGate
 from geolip_core.core.curate.flows import FlowEnsemble
+import geolip_core.linalg as LA
 from geolip_core.pipeline.observer import (
     TorchComponent, BaseTower, Input, Curation, Distinction,
 )
@@ -67,12 +68,12 @@ from geolip_core.core.distinguish.losses import (
     spread_loss as _geolip_spread_loss,
 )
 
-# Optional: geofractal compiler for diagnostics
+# Optional: geofractal WideRouter for compilation
 try:
-    from geofractal.router.compiler.compile_router import CompileRouter
-    _HAS_COMPILE_ROUTER = True
+    from geofractal.router.wide_router import WideRouter
+    _HAS_WIDE_ROUTER = True
 except ImportError:
-    _HAS_COMPILE_ROUTER = False
+    _HAS_WIDE_ROUTER = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CAYLEY-MENGER VALIDITY — geometric quality measurement
@@ -97,7 +98,7 @@ def cayley_menger_det(points):
     M[:, 0, 1:] = 1.0
     M[:, 1:, 0] = 1.0
     M[:, 1:, 1:] = d2
-    raw = torch.linalg.det(M)
+    raw = LA.det(M)
     k = K - 1
     sign = (-1.0) ** (k + 1)
     return sign * raw
@@ -173,7 +174,8 @@ class CMValidatedGate(nn.Module):
             nn.Linear(16, 1),
         )
         # Init OPEN — learn to close. sigmoid(2.0) ≈ 0.88
-        nn.init.zeros_(self.gate_proj[2].weight)
+        # Small random weight so gradient flows back to gate_proj[0]
+        nn.init.normal_(self.gate_proj[2].weight, std=0.01)
         nn.init.constant_(self.gate_proj[2].bias, 2.0)
 
         # Anchor CM cache — invalidated after optimizer step
@@ -277,13 +279,16 @@ class GeoResidualBank(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class FiLMLayer(TorchComponent):
-    """Feature-wise Linear Modulation. Identity-initialized."""
+    """Feature-wise Linear Modulation. Near-identity-initialized.
+    gamma ≈ 1 + 0.01·geo_ctx, beta ≈ 0.01·geo_ctx at init.
+    Gradient flows through to geo_ctx from step 0.
+    """
     def __init__(self, name, feature_dim, context_dim):
         super().__init__(name)
         self.to_gamma = nn.Linear(context_dim, feature_dim)
         self.to_beta = nn.Linear(context_dim, feature_dim)
-        nn.init.zeros_(self.to_gamma.weight); nn.init.ones_(self.to_gamma.bias)
-        nn.init.zeros_(self.to_beta.weight); nn.init.zeros_(self.to_beta.bias)
+        nn.init.normal_(self.to_gamma.weight, std=0.01); nn.init.ones_(self.to_gamma.bias)
+        nn.init.normal_(self.to_beta.weight, std=0.01); nn.init.zeros_(self.to_beta.bias)
 
     def forward(self, x, ctx):
         return self.to_gamma(ctx) * x + self.to_beta(ctx)
@@ -305,7 +310,7 @@ class CayleyOrthogonal(TorchComponent):
         A = torch.zeros(d, d, device=self.A_upper.device, dtype=self.A_upper.dtype)
         A[self._triu_row, self._triu_col] = self.A_upper
         A = A - A.T
-        return torch.linalg.solve(self._eye + A, self._eye - A)
+        return LA.solve(self._eye + A, self._eye - A)
 
     def forward(self, x):
         return x @ self.get_rotation().T
@@ -405,10 +410,11 @@ class PositionGeometricContext(TorchComponent):
         # HOW TRUSTWORTHY — full per-anchor gate profile
         self.quality_mlp = nn.Sequential(
             nn.Linear(n_anchors, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
-        # FLOW OPINIONS — ensemble geometric predictions (zero-init → no disruption)
+        # FLOW OPINIONS — anchor-space flow ensemble [N, A] (same shape as gate_values)
+        # Small init: negligible contribution at start, nonzero gradient path
         self.flow_mlp = nn.Sequential(
-            nn.Linear(manifold_dim, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
-        nn.init.zeros_(self.flow_mlp[0].weight)
+            nn.Linear(n_anchors, context_dim), nn.GELU(), nn.LayerNorm(context_dim))
+        nn.init.normal_(self.flow_mlp[0].weight, std=0.01)
         nn.init.zeros_(self.flow_mlp[0].bias)
 
         # Fuse 5 streams
@@ -570,6 +576,9 @@ class GeometricTransformerLayer(BaseTower):
             self.attach('flows', FlowEnsemble(
                 f'{name}_flows', manifold_dim, n_anchors,
                 flow_keys=flow_keys, fusion=flow_fusion))
+            # Blend weight: how much flow opinions influence curation
+            # Starts small → flows fade in as they learn
+            self.flow_alpha = nn.Parameter(torch.tensor(0.01))
 
         # 4. Fuse observation into FiLM context (5 streams)
         pw_dim = self['observer'].curation.patchwork.output_dim
@@ -631,7 +640,20 @@ class GeometricTransformerLayer(BaseTower):
 
         # ════ 4. Gated curation — patchwork reads validated triangulation ════
         a_out_gated = dict(a_out)
-        a_out_gated['distances_weighted'] = a_out['distances'] * gate_values
+
+        # ════ 4.5 Flow ensemble — anchor-space geometric opinions ════
+        flow_opinion = None
+        if self.has('flows'):
+            flow_opinion = self['flows'](anchors_n, emb_flat, a_out['distances'])  # [N, A]
+            # Blend flow opinion into triangulation: raw + alpha*(flow - raw)
+            # flow_alpha starts at 0.01 → 99% raw, 1% flow opinion
+            # Gradient: observer_loss → patchwork → distances_weighted → flow_opinion → flows
+            alpha = self.flow_alpha.sigmoid()
+            blended_tri = a_out['distances'] + alpha * (flow_opinion - a_out['distances'])
+            a_out_gated['distances_weighted'] = blended_tri * gate_values
+        else:
+            a_out_gated['distances_weighted'] = a_out['distances'] * gate_values
+
         c_out = self['observer'].curation.curate_full(a_out_gated, emb=emb_flat)
 
         # Build observation dict for context
@@ -645,18 +667,11 @@ class GeometricTransformerLayer(BaseTower):
             'bridge': c_out['bridge'],
         }
 
-        # ════ 4.5 Flow ensemble — multi-opinion geometric predictions ════
-        flow_output_flat = None
-        if self.has('flows'):
-            anchors_for_flows = anchors_n.unsqueeze(0).expand(B, -1, -1)
-            flow_pred = self['flows'](anchors_for_flows, emb)  # [B, L, manifold_dim]
-            flow_output_flat = flow_pred.reshape(B * L, -1)
-
         # ════ 5. Build FiLM context — 5 streams ════
         geo_res_flat = geo_residual.reshape(B * L, -1) if geo_residual is not None else None
         geo_ctx_flat = self['context'](
             obs, gate_values=gate_values, geo_residual=geo_res_flat,
-            flow_output=flow_output_flat)
+            flow_output=flow_opinion)
         geo_ctx = geo_ctx_flat.reshape(B, L, -1)
 
         # ════ 6. Stream A: content attention ════
@@ -714,6 +729,7 @@ class GeometricTransformerLayer(BaseTower):
             'geometric':      b_out,
             'composed':       composed,
             'geo_residual':   geo_residual_out,
+            'flow_opinion':   _unflatten(flow_opinion) if flow_opinion is not None else None,
         }
 
         return x_out, geo_residual_out, geo_state
@@ -906,150 +922,6 @@ class GeometricTransformer(BaseTower):
         print(f"  {'TOTAL':<35s}  {total:>12,}")
         return total
 
-    # ── Tower compiler integration ──────────────────────────────────
-
-    _COMPILABLE_LAYER_KEYS = (
-        'projection', 'context', 'content', 'geometric',
-        'compose', 'decode', 'gate', 'geo_proj', 'flows',
-    )
-    _EXCLUDED_LAYER_KEYS = ('cm_gate', 'observer')
-    _CONDITIONAL_LAYER_KEYS = ('rotation',)
-
-    def enable_compilation(self, mode='selective', backend='inductor',
-                           compile_rotations=False, **compile_kwargs):
-        """Apply torch.compile to compilable submodules."""
-        if not hasattr(self, '_compiled_originals'):
-            self._compiled_originals = {}
-
-        compiled_count = 0
-        skipped_count = 0
-
-        for i in range(self.n_layers):
-            layer = self[f'layer_{i}']
-
-            for key in self._COMPILABLE_LAYER_KEYS:
-                if layer.has(key):
-                    original = layer[key]
-                    if not getattr(original, '_is_compiled', False):
-                        path = f'layer_{i}.{key}'
-                        self._compiled_originals[path] = original
-                        compiled = torch.compile(
-                            original, backend=backend, **compile_kwargs)
-                        compiled._is_compiled = True
-                        layer.attach(key, compiled)
-                        compiled_count += 1
-
-            if compile_rotations:
-                for key in self._CONDITIONAL_LAYER_KEYS:
-                    if layer.has(key):
-                        original = layer[key]
-                        if not getattr(original, '_is_compiled', False):
-                            path = f'layer_{i}.{key}'
-                            self._compiled_originals[path] = original
-                            compiled = torch.compile(
-                                original, backend=backend, **compile_kwargs)
-                            compiled._is_compiled = True
-                            layer.attach(key, compiled)
-                            compiled_count += 1
-
-            for key in self._EXCLUDED_LAYER_KEYS:
-                if layer.has(key):
-                    skipped_count += 1
-
-        if compile_rotations:
-            for i in range(self.n_layers - 1):
-                key = f'cross_rot_{i}'
-                if self.has(key):
-                    original = self[key]
-                    if not getattr(original, '_is_compiled', False):
-                        self._compiled_originals[key] = original
-                        compiled = torch.compile(
-                            original, backend=backend, **compile_kwargs)
-                        compiled._is_compiled = True
-                        self.attach(key, compiled)
-                        compiled_count += 1
-
-        if self.has('final_norm'):
-            original = self['final_norm']
-            if not getattr(original, '_is_compiled', False):
-                self._compiled_originals['final_norm'] = original
-                compiled = torch.compile(
-                    original, backend=backend, **compile_kwargs)
-                compiled._is_compiled = True
-                self.attach('final_norm', compiled)
-                compiled_count += 1
-
-        self._compile_mode = mode
-        stats = {
-            'compiled': compiled_count,
-            'skipped': skipped_count,
-            'mode': mode,
-            'backend': backend,
-            'compile_rotations': compile_rotations,
-        }
-        return stats
-
-    def disable_compilation(self):
-        """Revert all compiled submodules to their originals."""
-        if not hasattr(self, '_compiled_originals'):
-            return 0
-
-        reverted = 0
-        for path, original in self._compiled_originals.items():
-            if '.' in path:
-                layer_name, key = path.split('.', 1)
-                layer = self[layer_name]
-                layer.attach(key, original)
-            else:
-                self.attach(path, original)
-            reverted += 1
-
-        self._compiled_originals.clear()
-        self._compile_mode = None
-        return reverted
-
-    def compilation_report(self):
-        """Analyze module tree using geofractal CompileRouter."""
-        if not _HAS_COMPILE_ROUTER:
-            return {'error': 'geofractal not installed — CompileRouter unavailable'}
-
-        compiler = CompileRouter.from_module(self, name=f'compiled_{self.name}')
-        compiler.introspect()
-        structure = compiler.compile_towers()
-
-        compilability = {}
-        for i in range(self.n_layers):
-            layer = self[f'layer_{i}']
-            for key in self._COMPILABLE_LAYER_KEYS:
-                if layer.has(key):
-                    is_compiled = getattr(layer[key], '_is_compiled', False)
-                    compilability[f'layer_{i}.{key}'] = {
-                        'status': 'compiled' if is_compiled else 'compilable',
-                    }
-            for key in self._EXCLUDED_LAYER_KEYS:
-                if layer.has(key):
-                    compilability[f'layer_{i}.{key}'] = {
-                        'status': 'excluded',
-                        'reason': 'contains @torch.compiler.disable methods',
-                    }
-            for key in self._CONDITIONAL_LAYER_KEYS:
-                if layer.has(key):
-                    is_compiled = getattr(layer[key], '_is_compiled', False)
-                    compilability[f'layer_{i}.{key}'] = {
-                        'status': 'compiled' if is_compiled else 'conditional',
-                        'reason': 'linalg.solve — safe in inductor, risky in CUDA graphs',
-                    }
-
-        return {
-            'total_stages': structure.total_stages,
-            'batchable_stages': structure.batchable_stages,
-            'total_params': structure.total_params,
-            'signature_groups': {
-                sig: len(nodes) for sig, nodes in structure.signature_groups.items()
-            },
-            'compilability': compilability,
-            'compile_mode': getattr(self, '_compile_mode', None),
-        }
 
     def forward(self, x, attn_mask=None, key_padding_mask=None,
                 return_geo_state=False):
@@ -1082,6 +954,9 @@ class GeometricTransformer(BaseTower):
     # ── Paired forward + observer loss ──────────────────────────────
 
     def _run_view(self, x, attn_mask=None, key_padding_mask=None):
+        """Run one view through the full pipeline.
+        Retains ALL layers' geo_states — every layer needs gradient.
+        """
         has_xrot = self.has('cross_rot_0')
         geo_residual = None
 
@@ -1089,42 +964,69 @@ class GeometricTransformer(BaseTower):
             pos = torch.arange(x.shape[1], device=x.device)
             x = self['embed'](x) + self['pos_embed'](pos)
 
-        geo_state = None
+        geo_states = []
         for i in range(self.n_layers):
             x, geo_residual, geo_state = self[f'layer_{i}'](
                 x, geo_residual=geo_residual,
                 attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+            geo_states.append(geo_state)
             if has_xrot and i < self.n_layers - 1:
                 x = self[f'cross_rot_{i}'](x)
 
         x = self['final_norm'](x)
-        return x, geo_state
+        return x, geo_states
 
     def forward_paired(self, x1, x2, cls_index=0,
                        attn_mask=None, key_padding_mask=None):
+        """Dual-view forward for observer loss training.
+
+        Aggregates geometric observations from ALL layers so every
+        layer's observer/constellation/flows receive gradient.
+        Patchwork, bridge, triangulation, etc. are summed across layers —
+        the observer loss sees the full-stack geometric observation.
+        """
         B = x1.shape[0]
         x_cat = torch.cat([x1, x2], dim=0)
-        feat_cat, gs = self._run_view(x_cat, attn_mask, key_padding_mask)
+        feat_cat, geo_states = self._run_view(x_cat, attn_mask, key_padding_mask)
 
         c = cls_index
+        n_layers = len(geo_states)
+
+        # Aggregate geometric observations across all layers
+        def _agg(key):
+            """Sum across layers — every layer gets gradient."""
+            vals = [gs[key] for gs in geo_states if gs.get(key) is not None]
+            if not vals:
+                return None
+            return sum(vals)
+
+        emb_agg = _agg('embedding')
+        pw_agg = _agg('patchwork')
+        br_agg = _agg('bridge')
+        asgn_agg = _agg('assignment')
+        cos_agg = _agg('cos_to_anchors')
+        tri_agg = _agg('triangulation')
+        gv_agg = _agg('gate_values')
+        cm_agg = _agg('cm_quality')
+
         return {
-            'embedding':      gs['embedding'][:B, c],
-            'embedding_aug':  gs['embedding'][B:, c],
-            'patchwork1':     gs['patchwork'][:B, c],
-            'patchwork1_aug': gs['patchwork'][B:, c],
-            'bridge1':        gs['bridge'][:B, c],
-            'bridge2':        gs['bridge'][B:, c],
-            'assign1':        gs['assignment'][:B, c],
-            'assign2':        gs['assignment'][B:, c],
-            'cos1':           gs['cos_to_anchors'][:B, c],
-            'tri1':           gs['triangulation'][:B, c],
-            'tri2':           gs['triangulation'][B:, c],
+            'embedding':      emb_agg[:B, c],
+            'embedding_aug':  emb_agg[B:, c],
+            'patchwork1':     pw_agg[:B, c],
+            'patchwork1_aug': pw_agg[B:, c],
+            'bridge1':        br_agg[:B, c],
+            'bridge2':        br_agg[B:, c],
+            'assign1':        asgn_agg[:B, c],
+            'assign2':        asgn_agg[B:, c],
+            'cos1':           cos_agg[:B, c],
+            'tri1':           tri_agg[:B, c],
+            'tri2':           tri_agg[B:, c],
             'features1':      feat_cat[:B],
             'features2':      feat_cat[B:],
-            'gate_values1':   gs['gate_values'][:B, c],
-            'gate_values2':   gs['gate_values'][B:, c],
-            'cm_quality1':    gs['cm_quality'][:B],
-            'cm_quality2':    gs['cm_quality'][B:],
+            'gate_values1':   gv_agg[:B, c],
+            'gate_values2':   gv_agg[B:, c],
+            'cm_quality1':    cm_agg[:B],
+            'cm_quality2':    cm_agg[B:],
         }
 
     def compute_loss(self, output, targets, cls_index=0,
@@ -1328,136 +1230,181 @@ if __name__ == '__main__':
 
     # Verify backward through observer loss
     loss.backward()
-    alive, dead = 0, 0
+    alive_base, dead_base = [], []
     for n, p in model.named_parameters():
         if p.grad is not None and p.grad.norm() > 0:
-            alive += 1
+            alive_base.append(n)
         else:
-            dead += 1
-    print(f"\n    Gradient flow: {alive} params alive, {dead} dead")
-
-    # Check critical components
-    for i in range(model.n_layers):
-        layer = model[f'layer_{i}']
-        for comp_name in ['cm_gate', 'observer']:
-            has = any(p.grad is not None and p.grad.norm() > 0
-                      for p in layer[comp_name].parameters())
-            print(f"    layer_{i}.{comp_name}: {'LIVE' if has else 'DEAD'}")
-
-    # Bridge specifically — was never used in loss before
-    for i in range(model.n_layers):
-        layer = model[f'layer_{i}']
-        bridge = layer['observer'].curation.bridge
-        has = any(p.grad is not None and p.grad.norm() > 0
-                  for p in bridge.parameters())
-        print(f"    layer_{i}.bridge: {'LIVE' if has else 'DEAD'}")
+            dead_base.append(n)
+    print(f"\n    Gradient flow: {len(alive_base)} params alive, {len(dead_base)} dead")
+    if dead_base:
+        print(f"\n    DEAD parameters (base model, paired+observer):")
+        for n in dead_base:
+            print(f"      {n}")
 
     # ══════════════════════════════════════════════════════════════
-    # TOWER COMPILER INTEGRATION TESTS
+    # WIDE ROUTER COMPILATION
     # ══════════════════════════════════════════════════════════════
 
     print(f"\n{'='*60}")
-    print(f"  Tower Compiler Integration")
+    print(f"  WideRouter Compilation")
     print(f"{'='*60}")
 
-    # ── Baseline forward (uncompiled) ──
-    # Use seeded input in eval mode for deterministic comparison
-    model.eval()
-    torch.manual_seed(42)
-    model.zero_grad()
-    model.invalidate_caches()
-    x_baseline = torch.randn(B, L, D, device=device)
-    with torch.no_grad():
-        out_baseline = model(x_baseline)
-    # CM cache is now warm — do NOT invalidate before compiled run
+    if _HAS_WIDE_ROUTER:
+        # Wrap transformer in WideRouter (same pattern as GeoViTClassifier)
+        router = WideRouter('test_router', strict=False)
+        router.attach('transformer', model)
+        router.register_tower('transformer')
+        router.network_to(device=device, strict=False)
 
-    # ── CompileRouter diagnostics ──
-    report = model.compilation_report()
-    if 'error' not in report:
-        print(f"\n  CompileRouter analysis:")
-        print(f"    total stages:     {report['total_stages']}")
-        print(f"    batchable stages: {report['batchable_stages']}")
-        print(f"    total params:     {report['total_params']:,}")
-        print(f"    signature groups: {len(report['signature_groups'])}")
-        print(f"\n  Compilability map:")
-        for path, info in sorted(report['compilability'].items()):
-            reason = info.get('reason', '')
-            tag = f" ({reason})" if reason else ''
-            print(f"    {path:<30s} {info['status']}{tag}")
+        # Discover towers and compile
+        router.discover_towers()
+        print(f"\n  Towers discovered: {router.tower_names}")
+        print(f"  Analyzed: {router.objects.get('_analyzed', False)}")
+
+        try:
+            compiled_router = router.compile(mode='default')
+            print(f"  WideRouter.compile(mode='default'): OK")
+        except Exception as e:
+            print(f"  WideRouter.compile: {str(e)[:60]}")
+
+        # Forward through the registered tower directly
+        with torch.no_grad():
+            out_via_router = router['transformer'](x)
+        print(f"  Forward via router['transformer']: {out_via_router.shape}  OK")
+
+        del router
     else:
-        print(f"\n  CompileRouter: {report['error']}")
-
-    # ── Detect best available backend ──
-    # inductor needs a C++ compiler (cl/gcc); fall back to aot_eager if absent
-    _test_backend = 'inductor'
-    try:
-        _test_mod = torch.compile(nn.Linear(2, 2), backend='inductor')
-        _test_mod(torch.randn(1, 2))
-    except Exception:
-        _test_backend = 'aot_eager'
-        print(f"\n  inductor unavailable — falling back to aot_eager backend")
-
-    # ── Enable selective compilation ──
-    print(f"\n  Enabling selective compilation...")
-    stats = model.enable_compilation(
-        mode='selective', backend=_test_backend, compile_rotations=False)
-    print(f"    compiled:  {stats['compiled']} submodules")
-    print(f"    skipped:   {stats['skipped']} submodules (non-compilable)")
-    print(f"    backend:   {stats['backend']}")
-
-    # ── Compiled forward (same input, same cached CM — deterministic) ──
-    with torch.no_grad():
-        out_compiled = model(x_baseline)
-
-    # ── Numerical equivalence ──
-    # Note: first compiled run triggers tracing, so values may differ
-    # slightly due to operator fusion reordering. We use relaxed tolerance.
-    max_diff = (out_compiled - out_baseline).abs().max().item()
-    mean_diff = (out_compiled - out_baseline).abs().mean().item()
-    print(f"\n  Numerical equivalence (compiled vs baseline):")
-    print(f"    max diff:  {max_diff:.2e}")
-    print(f"    mean diff: {mean_diff:.2e}")
-    if max_diff < 1e-3:
-        print(f"    STATUS: PASS (within tolerance)")
-    else:
-        print(f"    STATUS: WARN — diff > 1e-3 (may be expected on first trace)")
-
-    # ── Compiled gradient flow ──
-    model.train()
-    model.zero_grad()
-    model.invalidate_caches()
-    x_cgrad = torch.randn(B, L, D, device=device, requires_grad=True)
-    out_cgrad = model(x_cgrad)
-    out_cgrad.sum().backward()
-
-    alive_c, dead_c = 0, 0
-    for n, p in model.named_parameters():
-        if p.grad is not None and p.grad.norm() > 0:
-            alive_c += 1
-        else:
-            dead_c += 1
-    print(f"\n  Compiled gradient flow: {alive_c} alive, {dead_c} dead")
-
-    # CM gate must still receive gradients through the compiler boundary
-    for i in range(model.n_layers):
-        layer = model[f'layer_{i}']
-        gate_grads_c = [p.grad is not None and p.grad.abs().sum() > 0
-                        for p in layer['cm_gate'].parameters()]
-        print(f"    layer_{i} cm_gate grad (compiled): {'YES' if all(gate_grads_c) else 'NO'}")
-
-    # ── Disable compilation ──
-    reverted = model.disable_compilation()
-    print(f"\n  Disabled compilation: reverted {reverted} submodules")
-
-    # ── Post-revert diagnostics ──
-    report_after = model.compilation_report()
-    if 'error' not in report_after:
-        compiled_after = sum(
-            1 for v in report_after['compilability'].values()
-            if v['status'] == 'compiled')
-        print(f"    compiled modules after revert: {compiled_after} (should be 0)")
+        print(f"\n  WideRouter: geofractal not installed")
 
     print(f"\n{'='*60}")
     print(f"  PASSED — CM-validated pipeline operational")
-    print(f"  PASSED — Tower compiler integration verified")
+    print(f"{'='*60}")
+
+    # ══════════════════════════════════════════════════════════════
+    # FLOW ENSEMBLE INTEGRATION TESTS
+    # ══════════════════════════════════════════════════════════════
+
+    print(f"\n{'='*60}")
+    print(f"  Flow Ensemble Integration")
+    print(f"{'='*60}")
+
+    del model, optimizer
+    torch.cuda.empty_cache() if device.type == 'cuda' else None
+
+    model_f = geo_transformer_small('test_flows', n_layers=2,
+                                     flow_keys=['quat_lite', 'velocity', 'orbital'])
+    if hasattr(model_f, 'network_to'):
+        model_f.network_to(device=device, strict=False)
+    else:
+        model_f = model_f.to(device)
+
+    total_f = model_f.param_report()
+    print(f"\n  Total params (with flows): {total_f:,}")
+
+    print(f"\n  Flow ensemble per layer:")
+    for i in range(model_f.n_layers):
+        layer = model_f[f'layer_{i}']
+        if layer.has('flows'):
+            flows = layer['flows']
+            names = flows.active_flow_names
+            params = sum(p.numel() for p in flows.parameters())
+            print(f"    layer_{i}: {names}  ({params:,} params)")
+        else:
+            print(f"    layer_{i}: no flows attached")
+
+    x_f = torch.randn(B, L, D, device=device)
+    out_f, geos_f = model_f(x_f, return_geo_state=True)
+    assert out_f.shape == (B, L, D)
+    print(f"\n  Forward with flows: {out_f.shape}  OK")
+
+    geo_ctx_0 = geos_f[0]['geo_ctx']
+    print(f"  Geo context shape: {geo_ctx_0.shape}  norm={geo_ctx_0.norm(dim=-1).mean():.4f}")
+
+    print(f"\n  Flow gradient test (out.sum().backward()):")
+    model_f.zero_grad()
+    x_fg = torch.randn(B, L, D, device=device, requires_grad=True)
+    out_fg = model_f(x_fg)
+    out_fg.sum().backward()
+
+    alive_simple, dead_simple = [], []
+    for n, p in model_f.named_parameters():
+        if p.grad is not None and p.grad.abs().sum() > 0:
+            alive_simple.append(n)
+        else:
+            dead_simple.append(n)
+    print(f"    {len(alive_simple)} alive, {len(dead_simple)} dead")
+    if dead_simple:
+        print(f"\n    DEAD parameters (out.sum):")
+        for n in dead_simple:
+            print(f"      {n}")
+
+    print(f"\n  Paired forward + observer loss (with flows):")
+    model_f.zero_grad()
+    x1_f = torch.randn(B, L, D, device=device)
+    x2_f = x1_f + 0.1 * torch.randn_like(x1_f)
+    targets_f = torch.randint(0, 10, (B,), device=device)
+
+    output_f = model_f.forward_paired(x1_f, x2_f)
+    head_f = nn.Linear(D, num_classes).to(device)
+    loss_f, ld_f = model_f.compute_loss(output_f, targets_f, head=head_f)
+    print(f"    total loss: {loss_f.item():.4f}")
+    loss_f.backward()
+
+    alive_paired, dead_paired = [], []
+    for n, p in model_f.named_parameters():
+        if p.grad is not None and p.grad.abs().sum() > 0:
+            alive_paired.append(n)
+        else:
+            dead_paired.append(n)
+    print(f"    {len(alive_paired)} alive, {len(dead_paired)} dead")
+    if dead_paired:
+        print(f"\n    DEAD parameters (paired+observer):")
+        for n in dead_paired:
+            print(f"      {n}")
+
+    print(f"\n  Runtime flow management:")
+    layer0 = model_f['layer_0']
+    flows_0 = layer0['flows']
+    print(f"    Before:           {flows_0.active_flow_names}")
+
+    flows_0.attach_flow('alignment')
+    print(f"    +alignment:       {flows_0.active_flow_names}")
+
+    flows_0.detach_flow('velocity')
+    print(f"    -velocity:        {flows_0.active_flow_names}")
+
+    out_swapped = model_f(x_f)
+    assert out_swapped.shape == (B, L, D)
+    print(f"    Forward after swap: {out_swapped.shape}  OK")
+
+    layer1 = model_f['layer_1']
+    if layer1.has('flows'):
+        for fn in list(layer1['flows'].active_flow_names):
+            key = fn.replace('flow_', '')
+            layer1['flows'].detach_flow(key)
+        print(f"    Layer 1 after clear: {layer1['flows'].active_flow_names}")
+        out_partial = model_f(x_f)
+        assert out_partial.shape == (B, L, D)
+        print(f"    Forward (L0 flows, L1 empty): {out_partial.shape}  OK")
+
+    print(f"\n  Backward compatibility (no flows):")
+    model_nf = geo_transformer_small('test_noflows', n_layers=2)
+    if hasattr(model_nf, 'network_to'):
+        model_nf.network_to(device=device, strict=False)
+    else:
+        model_nf = model_nf.to(device)
+    out_nf = model_nf(torch.randn(B, L, D, device=device))
+    assert out_nf.shape == (B, L, D)
+    print(f"    Forward (no flows): {out_nf.shape}  OK")
+    for i in range(model_nf.n_layers):
+        assert not model_nf[f'layer_{i}'].has('flows'), f"layer_{i} should not have flows"
+    print(f"    No flows attached:  OK")
+    del model_nf
+
+    print(f"\n{'='*60}")
+    print(f"  PASSED — CM-validated pipeline operational")
+    print(f"  PASSED — Flow ensemble integration verified")
+    print(f"  PASSED — Flow attach/detach verified")
+    print(f"  PASSED — Backward compatibility verified")
     print(f"{'='*60}")
