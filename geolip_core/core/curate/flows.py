@@ -1,30 +1,23 @@
 """
-geolip_core.core.curate.flows — Multi-opinion geometric flow ensemble.
+geolip_core.core.curate.flows — Anchor-space geometric flow opinions.
 
-Each flow is a TorchComponent producing a geometric prediction from
-(anchors, queries) using a distinct mathematical formulation.
-The FlowEnsemble is a BaseTower managing attached flows via the
-standard router attach/detach pattern.
+Each flow produces a [N, A] opinion tensor: its mathematical perspective
+on query-anchor relevance. Same shape as triangulation. Same interface.
+The pipeline already knows how to consume it.
 
-Flows are optional, compartmentalizable, and replaceable at runtime:
-    ensemble.detach('velocity')
-    ensemble.attach('velocity', FlowVelocity('velocity', d, k))
+Flow opinions feed into PositionGeometricContext as the 5th stream,
+alongside triangulation, assignment, patchwork, gate_values, and
+geometric residual. The context fuse learns to weight flow opinions
+against the other geometric signals.
 
-Integration:
-    Baked into GeometricTransformerLayer as an optional 5th context stream
-    in PositionGeometricContext. Configured via the CONFIG dict.
+Each flow answers: "from MY mathematical perspective, how relevant
+is anchor j for query i?"
 
-    config = {
-        ...
-        'flow_classes': ['quat_lite', 'velocity', 'orbital'],
-        'flow_fusion': 'weighted',
-        ...
-    }
-
-Architecture (geofractal):
-    core/curate/flows.py          THIS FILE — TorchComponents doing the math
-    pipeline/components/           wired via BaseTower.attach()
-    pipeline/layer.py              GeometricTransformerLayer owns a FlowEnsemble
+  QuaternionFlow:   rotate query, re-triangulate → rotated relevance
+  VelocityFlow:     move query along tangent velocity → predicted relevance
+  MagnitudeFlow:    Gram eigenvalue spectrum → spectral anchor weights
+  OrbitalFlow:      eigenbasis CV-band resonance → resonance-weighted relevance
+  AlignmentFlow:    Procrustes-aligned frame → aligned relevance
 
 Author: AbstractPhil + Claude Opus 4.6
 License: Apache 2.0
@@ -50,219 +43,250 @@ from geolip_core.pipeline.observer import TorchComponent, BaseTower
 # ═══════════════════════════════════════════════════════════════════
 
 class BaseFlow(TorchComponent):
-    """Base class for geometric flows.
+    """Base class for anchor-space geometric flows.
 
-    Interface contract:
-        Input:  anchors [B, k, d], queries [B, n, d]
-        Output: prediction [B, n, d], confidence [B, n, 1]
+    Interface:
+        Input:  anchors [A, d], queries [N, d], tri [N, A]
+        Output: opinion [N, A]
 
-    Subclasses implement _flow(anchors, queries) → [B, n, d].
-    Confidence head is shared across all flows.
+    Each flow produces a [N, A] tensor representing its view of
+    query-anchor relevance. Subclasses implement _opinion().
     """
     def __init__(self, name: str, d_model: int, n_anchors: int):
         super().__init__(name)
         self.d_model = d_model
         self.n_anchors = n_anchors
-        self.confidence = nn.Sequential(
-            nn.Linear(d_model, d_model // 4),
-            nn.GELU(),
-            nn.Linear(d_model // 4, 1),
-        )
 
-    def forward(self, anchors: Tensor, queries: Tensor) -> Tuple[Tensor, Tensor]:
-        pred = self._flow(anchors, queries)
-        conf = torch.sigmoid(self.confidence(pred))
-        return pred, conf
+    def forward(self, anchors: Tensor, queries: Tensor, tri: Tensor) -> Tensor:
+        """
+        Args:
+            anchors: [A, d] constellation anchors on S^(d-1)
+            queries: [N, d] query embeddings on S^(d-1)
+            tri:     [N, A] triangulation distances (1 - cos)
 
-    def _flow(self, anchors: Tensor, queries: Tensor) -> Tensor:
+        Returns:
+            opinion: [N, A] this flow's view of query-anchor relevance
+        """
+        return self._opinion(anchors, queries, tri)
+
+    def _opinion(self, anchors: Tensor, queries: Tensor, tri: Tensor) -> Tensor:
         raise NotImplementedError
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FlowQuaternion — Full MHA quaternion rotation
+# FlowQuaternion — Rotate query, re-triangulate
 # ═══════════════════════════════════════════════════════════════════
 
 class FlowQuaternion(BaseFlow):
-    """Full multi-head attention → quaternion rotation of queries."""
-    def __init__(self, name: str, d_model: int, n_anchors: int, n_heads: int = 4):
+    """Predict quaternion rotation per query, measure new anchor distances.
+
+    The rotated query has different triangulation to the anchors.
+    This opinion says: "if the query WERE rotated to better fit the
+    constellation geometry, here's what the triangulation would look like."
+    """
+    def __init__(self, name: str, d_model: int, n_anchors: int):
         super().__init__(name, d_model, n_anchors)
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.quat_proj = nn.Linear(d_model, 4)
+        self.quat_head = nn.Sequential(
+            nn.Linear(d_model + n_anchors, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 4),
+        )
 
-    def _flow(self, anchors, queries):
-        B, n, d = queries.shape
-        k = anchors.shape[1]
-        h, hd = self.n_heads, self.head_dim
-
-        Q = self.q_proj(queries).view(B, n, h, hd).transpose(1, 2)
-        K = self.k_proj(anchors).view(B, k, h, hd).transpose(1, 2)
-        V = self.v_proj(anchors).view(B, k, h, hd).transpose(1, 2)
-
-        attn = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(hd)
-        attn = F.softmax(attn, dim=-1)
-        ctx = torch.matmul(attn, V).transpose(1, 2).reshape(B, n, d)
-
-        q = F.normalize(self.quat_proj(ctx), dim=-1)
-        rotated = self._quat_rotate(queries, q)
-        return self.out_proj(ctx + rotated)
-
-    @staticmethod
-    def _quat_rotate(v, q):
-        w, x, y, z = q[..., 0:1], q[..., 1:2], q[..., 2:3], q[..., 3:4]
-        v3 = v[..., :3]
+    def _opinion(self, anchors, queries, tri):
+        N, d = queries.shape
+        A = anchors.shape[0]
+        # Predict rotation from query + current triangulation
+        q = F.normalize(self.quat_head(torch.cat([queries, tri], dim=-1)), dim=-1)
+        # Apply rotation to first 3 dims
+        w, x, y, z = q[:, 0:1], q[:, 1:2], q[:, 2:3], q[:, 3:4]
+        v3 = queries[:, :3]
         xyz = torch.cat([x, y, z], dim=-1)
         t = 2.0 * torch.cross(xyz, v3, dim=-1)
         v3_rot = v3 + w * t + torch.cross(xyz, t, dim=-1)
-        return torch.cat([v3_rot, v[..., 3:]], dim=-1) if v.shape[-1] > 3 else v3_rot
+        q_rot = queries.clone()
+        q_rot[:, :3] = v3_rot
+        q_rot = F.normalize(q_rot, dim=-1)
+        # Re-triangulate: distance from rotated query to each anchor
+        return 1.0 - q_rot @ anchors.T  # [N, A]
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FlowQuaternionLite — Centroid-based lightweight quaternion
+# FlowQuaternionLite — Lightweight centroid-based rotation
 # ═══════════════════════════════════════════════════════════════════
 
 class FlowQuaternionLite(BaseFlow):
-    """Anchor centroid → direct quaternion prediction. No MHA."""
+    """Centroid-directed quaternion rotation. No attention, no MHA."""
     def __init__(self, name: str, d_model: int, n_anchors: int):
         super().__init__(name, d_model, n_anchors)
-        self.anchor_compress = nn.Linear(d_model, d_model)
-        self.query_proj = nn.Linear(d_model, d_model)
         self.quat_head = nn.Sequential(
-            nn.Linear(d_model * 2, d_model), nn.GELU(), nn.Linear(d_model, 4))
-        self.out_proj = nn.Linear(d_model, d_model)
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 4),
+        )
 
-    def _flow(self, anchors, queries):
-        B, n, d = queries.shape
-        anchor_ctx = self.anchor_compress(anchors.mean(dim=1, keepdim=True)).expand(B, n, d)
-        combined = torch.cat([self.query_proj(queries), anchor_ctx], dim=-1)
-        q = F.normalize(self.quat_head(combined), dim=-1)
-        return self.out_proj(FlowQuaternion._quat_rotate(queries, q))
+    def _opinion(self, anchors, queries, tri):
+        # Direction toward anchor centroid
+        centroid = F.normalize(anchors.mean(dim=0, keepdim=True), dim=-1)
+        diff = centroid.expand_as(queries) - queries
+        q = F.normalize(self.quat_head(diff), dim=-1)
+        w, x, y, z = q[:, 0:1], q[:, 1:2], q[:, 2:3], q[:, 3:4]
+        v3 = queries[:, :3]
+        xyz = torch.cat([x, y, z], dim=-1)
+        t = 2.0 * torch.cross(xyz, v3, dim=-1)
+        v3_rot = v3 + w * t + torch.cross(xyz, t, dim=-1)
+        q_rot = queries.clone()
+        q_rot[:, :3] = v3_rot
+        q_rot = F.normalize(q_rot, dim=-1)
+        return 1.0 - q_rot @ anchors.T
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FlowVelocity — Tangent-space angular velocity
+# FlowVelocity — Tangent velocity → predicted future triangulation
 # ═══════════════════════════════════════════════════════════════════
 
 class FlowVelocity(BaseFlow):
-    """Angular velocity on the tangent bundle. Euler integration."""
+    """Move query along learned tangent velocity, re-triangulate.
+
+    "If the query moves in its natural direction on the manifold,
+    here's what the anchor distances will become."
+    """
     def __init__(self, name: str, d_model: int, n_anchors: int):
         super().__init__(name, d_model, n_anchors)
-        self.anchor_proj = nn.Linear(d_model, d_model)
-        self.query_proj = nn.Linear(d_model, d_model)
         self.vel_head = nn.Sequential(
-            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model))
+            nn.Linear(d_model + n_anchors, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
         self.dt = nn.Parameter(torch.tensor(0.1))
 
-    def _flow(self, anchors, queries):
-        B, n, d = queries.shape
-        a_proj = self.anchor_proj(anchors)
-        q_proj = self.query_proj(queries)
-        sim = torch.bmm(q_proj, a_proj.transpose(-2, -1))
-        weights = F.softmax(sim / math.sqrt(d), dim=-1)
-        direction = torch.bmm(weights, a_proj)
-        velocity = self.vel_head(direction - q_proj)
+    def _opinion(self, anchors, queries, tri):
+        velocity = self.vel_head(torch.cat([queries, tri], dim=-1))
+        # Project to tangent space (remove radial component)
         q_norm = F.normalize(queries, dim=-1)
         radial = (velocity * q_norm).sum(dim=-1, keepdim=True) * q_norm
         tangent_vel = velocity - radial
-        return queries + self.dt * tangent_vel
+        # Euler step + renormalize to S^(d-1)
+        q_moved = F.normalize(queries + self.dt * tangent_vel, dim=-1)
+        return 1.0 - q_moved @ anchors.T
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FlowMagnitude — Gram eigenvalue spectrum modulation
+# FlowMagnitude — Gram eigenvalue spectrum → anchor weights
 # ═══════════════════════════════════════════════════════════════════
 
 class FlowMagnitude(BaseFlow):
-    """Gram eigenvalue magnitude spectrum → gated query modulation."""
+    """Gram eigenspectrum tells which geometric modes carry energy.
+    Projects this into per-anchor weights that modulate triangulation.
+
+    "From the spectral perspective, how much energy does each anchor
+    contribute to the constellation's geometry?"
+    """
     def __init__(self, name: str, d_model: int, n_anchors: int):
         super().__init__(name, d_model, n_anchors)
         self.geom_dim = min(n_anchors, 12)
         self.anchor_proj = nn.Linear(d_model, self.geom_dim)
-        self.spec_proj = nn.Sequential(
-            nn.Linear(self.geom_dim, d_model), nn.GELU(), nn.Linear(d_model, d_model))
-        self.query_proj = nn.Linear(d_model, d_model)
-        self.gate = nn.Linear(d_model * 2, d_model)
+        self.spec_to_anchor = nn.Sequential(
+            nn.Linear(self.geom_dim, n_anchors),
+            nn.GELU(),
+            nn.Linear(n_anchors, n_anchors),
+        )
 
-    def _flow(self, anchors, queries):
-        B, n, d = queries.shape
-        a_geom = self.anchor_proj(anchors)
-        G = torch.bmm(a_geom.transpose(-2, -1), a_geom)
-        eigenvalues, _ = LA.eigh(G, method='torch')
-        magnitudes = eigenvalues.abs().sqrt()
-        spec_embed = self.spec_proj(magnitudes).unsqueeze(1).expand(B, n, d)
-        q_proj = self.query_proj(queries)
-        g = torch.sigmoid(self.gate(torch.cat([q_proj, spec_embed], dim=-1)))
-        return queries + g * spec_embed
+    def _opinion(self, anchors, queries, tri):
+        A = anchors.shape[0]
+        a_geom = self.anchor_proj(anchors)  # [A, geom_dim]
+        G = a_geom.T @ a_geom  # [gd, gd]
+        G = G.unsqueeze(0)  # [1, gd, gd]
+        eigenvalues, _ = LA.eigh(G, method='torch')  # [1, gd]
+        magnitudes = eigenvalues.abs().sqrt().squeeze(0)  # [gd]
+        # Spectral profile → per-anchor weight
+        anchor_weights = torch.sigmoid(self.spec_to_anchor(magnitudes))  # [A]
+        # Modulate triangulation
+        return tri * anchor_weights.unsqueeze(0)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FlowOrbital — Omega resonance via eigendecomposition
+# FlowOrbital — CV-band resonance → mode-aware anchor relevance
 # ═══════════════════════════════════════════════════════════════════
 
 class FlowOrbital(BaseFlow):
-    """Orbital resonance: project into eigenbasis, modulate by CV band, project back."""
+    """Eigendecomposition of anchor Gram → CV-band-aware relevance.
+
+    Projects queries into eigenbasis, checks which modes are in the
+    CV band [0.20, 0.23], derives per-anchor resonance weight.
+
+    "From the ω resonance perspective, which anchors participate in
+    the geometrically valid modes?"
+    """
     def __init__(self, name: str, d_model: int, n_anchors: int,
                  cv_lo: float = 0.20, cv_hi: float = 0.23):
         super().__init__(name, d_model, n_anchors)
         self.geom_dim = min(n_anchors, 12)
         self.cv_lo, self.cv_hi = cv_lo, cv_hi
         self.anchor_proj = nn.Linear(d_model, self.geom_dim)
-        self.mode_response = nn.Parameter(torch.ones(self.geom_dim))
-        self.query_to_geom = nn.Linear(d_model, self.geom_dim)
-        self.geom_to_query = nn.Linear(self.geom_dim, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.mode_to_anchor = nn.Linear(self.geom_dim, n_anchors)
 
-    def _flow(self, anchors, queries):
-        B, n, d = queries.shape
-        a_geom = self.anchor_proj(anchors)
-        G = torch.bmm(a_geom.transpose(-2, -1), a_geom)
-        eigenvalues, eigenvectors = LA.eigh(G, method='torch')
+    def _opinion(self, anchors, queries, tri):
+        A = anchors.shape[0]
+        a_geom = self.anchor_proj(anchors)  # [A, gd]
+        G = (a_geom.T @ a_geom).unsqueeze(0)  # [1, gd, gd]
+        eigenvalues, eigenvectors = LA.eigh(G, method='torch')  # [1, gd], [1, gd, gd]
+        eigenvalues = eigenvalues.squeeze(0)  # [gd]
+        eigenvectors = eigenvectors.squeeze(0)  # [gd, gd]
 
+        # CV band resonance: modes in [0.20, 0.23] are geometrically valid
         in_band = ((eigenvalues >= self.cv_lo) & (eigenvalues <= self.cv_hi)).float()
         near_binding = torch.exp(-10.0 * (eigenvalues - 0.29154).pow(2))
-        mode_weight = self.mode_response.unsqueeze(0) * (1.0 + in_band + near_binding)
+        mode_weight = 1.0 + in_band + near_binding  # [gd]
 
-        q_geom = self.query_to_geom(queries)
-        q_eigen = torch.bmm(q_geom, eigenvectors)
-        q_modulated = q_eigen * mode_weight.unsqueeze(1)
-        q_out = torch.bmm(q_modulated, eigenvectors.transpose(-2, -1))
-        return self.out_proj(self.geom_to_query(q_out) + queries)
+        # Per-anchor resonance: how much each anchor participates in valid modes
+        # a_geom @ V gives anchor projections into eigenbasis
+        anchor_in_basis = a_geom @ eigenvectors  # [A, gd]
+        # Weight by mode validity, sum across modes
+        resonance = (anchor_in_basis.abs() * mode_weight.unsqueeze(0)).sum(dim=-1)  # [A]
+        anchor_resonance = torch.sigmoid(self.mode_to_anchor(mode_weight))  # [A]
+
+        return tri * anchor_resonance.unsqueeze(0)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FlowAlignment — SVD Procrustes in projected space
+# FlowAlignment — Procrustes-aligned triangulation
 # ═══════════════════════════════════════════════════════════════════
 
 class FlowAlignment(BaseFlow):
-    """SVD Procrustes rotation in geom_dim projected space."""
+    """SVD alignment: find optimal rotation from queries to anchors,
+    measure triangulation in the aligned frame.
+
+    "If the query frame were optimally rotated to match the anchor
+    frame, here's what the triangulation would look like."
+    """
     def __init__(self, name: str, d_model: int, n_anchors: int):
         super().__init__(name, d_model, n_anchors)
         self.geom_dim = min(n_anchors, 12)
-        self.anchor_proj = nn.Linear(d_model, self.geom_dim)
-        self.query_proj = nn.Linear(d_model, self.geom_dim)
-        self.geom_to_query = nn.Linear(self.geom_dim, d_model)
-        self.strength = nn.Parameter(torch.tensor(0.1))
+        self.q_proj = nn.Linear(d_model, self.geom_dim)
+        self.a_proj = nn.Linear(d_model, self.geom_dim)
+        self.strength = nn.Parameter(torch.tensor(0.5))
 
-    def _flow(self, anchors, queries):
-        B, n, d = queries.shape
-        a_proj = self.anchor_proj(anchors)
-        q_proj = self.query_proj(queries)
-        sim = torch.bmm(q_proj, a_proj.transpose(-2, -1)) / math.sqrt(self.geom_dim)
-        weights = F.softmax(sim, dim=-1)
-        targets = torch.bmm(weights, a_proj)
-        C = torch.bmm(q_proj.transpose(-2, -1), targets)
+    def _opinion(self, anchors, queries, tri):
+        N = queries.shape[0]
+        A = anchors.shape[0]
+        q_g = self.q_proj(queries)   # [N, gd]
+        a_g = self.a_proj(anchors)   # [A, gd]
+        # Cross-covariance [gd, gd]
+        C = (q_g.T @ q_g) + (a_g.T @ a_g)  # symmetric, stable for eigh path
+        C = C.unsqueeze(0)
         U, _, Vh = LA.svd(C, method='gram_eigh')
-        R = torch.bmm(U, Vh)
-        q_rotated = torch.bmm(q_proj, R)
-        delta = self.geom_to_query(q_rotated - q_proj)
-        return queries + self.strength * delta
+        R = (U @ Vh).squeeze(0)  # [gd, gd]
+        # Align queries in projected space
+        q_aligned = q_g @ R  # [N, gd]
+        # Distance in aligned space → anchor relevance
+        # Use original anchors in projected space for triangulation
+        aligned_tri = 1.0 - F.normalize(q_aligned, dim=-1) @ F.normalize(a_g, dim=-1).T
+        # Blend with original triangulation
+        return self.strength * aligned_tri + (1 - self.strength) * tri
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Flow Registry — string-key lookup for config-driven construction
+# Flow Registry
 # ═══════════════════════════════════════════════════════════════════
 
 FLOW_REGISTRY: Dict[str, type] = {
@@ -276,47 +300,27 @@ FLOW_REGISTRY: Dict[str, type] = {
 
 
 def build_flow(key: str, name: str, d_model: int, n_anchors: int, **kwargs) -> BaseFlow:
-    """Construct a flow from registry key.
-
-    Args:
-        key: registry key ('quaternion', 'orbital', etc.)
-        name: TorchComponent name for router
-        d_model: embedding dimension
-        n_anchors: constellation anchor count
-        **kwargs: forwarded to flow constructor
-    """
     if key not in FLOW_REGISTRY:
         raise ValueError(f"Unknown flow '{key}'. Available: {list(FLOW_REGISTRY.keys())}")
     return FLOW_REGISTRY[key](name, d_model, n_anchors, **kwargs)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FlowEnsemble (BaseTower) — manages flows via attach/detach
+# FlowEnsemble (BaseTower)
 # ═══════════════════════════════════════════════════════════════════
 
 class FlowEnsemble(BaseTower):
-    """Multi-flow ensemble as a BaseTower.
+    """Fuses multiple anchor-space flow opinions into one [N, A] tensor.
 
-    Each flow is a named TorchComponent, attachable and detachable
-    at runtime via the standard router pattern:
+    Each flow produces [N, A] — its view of query-anchor relevance.
+    The ensemble learns per-flow weights to combine them.
 
-        ensemble.attach('orbital', FlowOrbital('orbital', 128, 32))
-        ensemble.detach('orbital')
+    Config-driven:
+        FlowEnsemble.from_config('flows', config)
 
-    Fusion modes:
-        weighted: confidence-softmax weighted average
-        gated:    concatenate → learned projection
-        residual: confidence-weighted residual sum
-
-    Config-driven construction:
-        ensemble = FlowEnsemble.from_config('flows', config)
-
-    Args:
-        name: BaseTower name for router
-        d_model: embedding dimension
-        flow_keys: list of registry keys to instantiate
-        n_anchors: constellation anchor count
-        fusion: 'weighted' | 'gated' | 'residual'
+    Runtime swappable:
+        ensemble.attach_flow('alignment')
+        ensemble.detach_flow('velocity')
     """
     def __init__(self, name: str, d_model: int, n_anchors: int,
                  flow_keys: List[str] = None, fusion: str = 'weighted'):
@@ -335,27 +339,12 @@ class FlowEnsemble(BaseTower):
             self.attach(flow_name, flow)
             self._flow_names.append(flow_name)
 
-        # Per-flow learnable temperature
-        self.temperature = nn.Parameter(torch.ones(max(len(flow_keys), 1)))
-
-        # Gated fusion needs a projection
-        if fusion == 'gated' and len(flow_keys) > 0:
-            self.gate_proj = nn.Sequential(
-                nn.Linear(d_model * len(flow_keys), d_model),
-                nn.GELU(),
-                nn.Linear(d_model, d_model),
-            )
+        # Learnable per-flow weight (softmax → fusion weights)
+        n_init = max(len(flow_keys), 1)
+        self.flow_weights = nn.Parameter(torch.zeros(n_init))
 
     @classmethod
     def from_config(cls, name: str, config: dict) -> 'FlowEnsemble':
-        """Build from training config dict.
-
-        Expected config keys:
-            flow_classes: list of str ('quat_lite', 'velocity', 'orbital', ...)
-            flow_fusion: str ('weighted', 'gated', 'residual')
-            manifold_dim: int (used as d_model for flows)
-            n_anchors: int
-        """
         flow_keys = config.get('flow_classes', [])
         fusion = config.get('flow_fusion', 'weighted')
         d_model = config.get('manifold_dim', 128)
@@ -371,88 +360,63 @@ class FlowEnsemble(BaseTower):
         return [n for n in self._flow_names if self.has(n)]
 
     def attach_flow(self, key: str, **kwargs):
-        """Attach a new flow by registry key. Inherits device from ensemble."""
+        """Attach a new flow by registry key. Inherits device."""
         flow_name = f'flow_{key}'
         flow = build_flow(key, flow_name, self.d_model, self.n_anchors, **kwargs)
-        # Inherit device from existing parameters
         try:
             device = next(self.parameters()).device
             flow = flow.to(device)
         except StopIteration:
-            pass  # no existing params — leave on default device
+            pass
         self.attach(flow_name, flow)
         if flow_name not in self._flow_names:
             self._flow_names.append(flow_name)
-        # Resize temperature
+        # Resize weights
         n = len(self.active_flow_names)
-        if n > self.temperature.shape[0]:
-            old = self.temperature.data
-            self.temperature = nn.Parameter(torch.ones(n, device=old.device))
-            self.temperature.data[:old.shape[0]] = old
+        if n > self.flow_weights.shape[0]:
+            old = self.flow_weights.data
+            self.flow_weights = nn.Parameter(torch.zeros(n, device=old.device))
+            self.flow_weights.data[:old.shape[0]] = old
 
     def detach_flow(self, key: str):
-        """Detach a flow by registry key."""
         flow_name = f'flow_{key}'
         if self.has(flow_name):
             self.detach(flow_name)
 
-    def forward(self, anchors: Tensor, queries: Tensor) -> Tensor:
-        """Run all active flows, fuse predictions.
-
+    def forward(self, anchors: Tensor, queries: Tensor, tri: Tensor) -> Tensor:
+        """
         Args:
-            anchors: [B, k, d] constellation anchors
-            queries: [B, n, d] query embeddings on S^(d-1)
+            anchors: [A, d] constellation anchors
+            queries: [N, d] query embeddings
+            tri:     [N, A] triangulation distances
 
         Returns:
-            fused: [B, n, d] ensemble prediction
+            opinion: [N, A] fused flow opinion
         """
         active = self.active_flow_names
         if not active:
-            return queries  # no flows attached — identity
+            return tri  # identity: return original triangulation
 
-        predictions = []
-        confidences = []
+        opinions = []
+        for flow_name in active:
+            opinion = self[flow_name](anchors, queries, tri)
+            opinions.append(opinion)
 
-        for idx, flow_name in enumerate(active):
-            pred, conf = self[flow_name](anchors, queries)
-            predictions.append(pred)
-            temp_idx = min(idx, self.temperature.shape[0] - 1)
-            confidences.append(conf * self.temperature[temp_idx])
+        if len(opinions) == 1:
+            return opinions[0]
 
-        if self.fusion_mode == 'weighted':
-            return self._weighted_fusion(predictions, confidences)
-        elif self.fusion_mode == 'gated':
-            return self._gated_fusion(predictions)
-        elif self.fusion_mode == 'residual':
-            return self._residual_fusion(predictions, confidences, queries)
-        else:
-            return self._weighted_fusion(predictions, confidences)
+        # Weighted fusion: learned per-flow weights
+        weights = F.softmax(self.flow_weights[:len(opinions)], dim=0)
+        stacked = torch.stack(opinions, dim=0)  # [n_flows, N, A]
+        return (stacked * weights[:, None, None]).sum(dim=0)  # [N, A]
 
-    def _weighted_fusion(self, preds, confs):
-        conf_stack = torch.cat(confs, dim=-1)
-        weights = F.softmax(conf_stack, dim=-1)
-        pred_stack = torch.stack(preds, dim=-1)
-        return (pred_stack * weights.unsqueeze(-2)).sum(dim=-1)
-
-    def _gated_fusion(self, preds):
-        cat = torch.cat(preds, dim=-1)
-        return self.gate_proj(cat)
-
-    def _residual_fusion(self, preds, confs, queries):
-        conf_stack = torch.cat(confs, dim=-1)
-        weights = F.softmax(conf_stack, dim=-1)
-        residuals = torch.stack([p - queries for p in preds], dim=-1)
-        return queries + (residuals * weights.unsqueeze(-2)).sum(dim=-1)
-
-    def diagnostics(self, anchors: Tensor, queries: Tensor) -> dict:
-        """Per-flow diagnostics. Pure tensor ops — compile safe."""
+    def diagnostics(self, anchors: Tensor, queries: Tensor, tri: Tensor) -> dict:
         diag = {}
         for flow_name in self.active_flow_names:
-            pred, conf = self[flow_name](anchors, queries)
+            opinion = self[flow_name](anchors, queries, tri)
             diag[flow_name] = {
-                'pred_norm': pred.norm(dim=-1).mean(),
-                'confidence_mean': conf.mean(),
-                'confidence_std': conf.std(),
-                'residual_norm': (pred - queries).norm(dim=-1).mean(),
+                'opinion_mean': opinion.mean(),
+                'opinion_std': opinion.std(),
+                'diff_from_tri': (opinion - tri).abs().mean(),
             }
         return diag
