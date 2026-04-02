@@ -290,7 +290,11 @@ class FiLMLayer(TorchComponent):
 
 
 class CayleyOrthogonal(TorchComponent):
-    """Guaranteed SO(d) rotation via Cayley map. det(Q) = 1 always."""
+    """Guaranteed SO(d) rotation via Cayley map. det(Q) = 1 always.
+
+    precompute() caches the rotation matrix outside the compile graph.
+    forward() reads the cached rotation — pure tensor ops, CUDA-graph-safe.
+    """
     def __init__(self, name, dim):
         super().__init__(name)
         self.dim = dim
@@ -299,16 +303,27 @@ class CayleyOrthogonal(TorchComponent):
         self.register_buffer('_triu_row', idx[0], persistent=False)
         self.register_buffer('_triu_col', idx[1], persistent=False)
         self.register_buffer('_eye', torch.eye(dim), persistent=False)
+        self._cached_rotation = None
 
     def get_rotation(self):
+        """Compute rotation via Cayley map. Uses cuSOLVER (LA.solve)."""
         d = self.dim
         A = torch.zeros(d, d, device=self.A_upper.device, dtype=self.A_upper.dtype)
         A[self._triu_row, self._triu_col] = self.A_upper
         A = A - A.T
         return LA.solve(self._eye + A, self._eye - A)
 
+    def precompute(self):
+        """Cache rotation matrix. Call outside compiled graph."""
+        if self._cached_rotation is None:
+            self._cached_rotation = self.get_rotation()
+
+    def invalidate_cache(self):
+        self._cached_rotation = None
+
     def forward(self, x):
-        return x @ self.get_rotation().T
+        R = self._cached_rotation if self._cached_rotation is not None else self.get_rotation()
+        return x @ R.T
 
 
 def quaternion_multiply_batched(q1, q2):
@@ -809,25 +824,37 @@ class GeometricTransformer(BaseTower):
         return self._config.copy()
 
     def invalidate_caches(self):
-        """Invalidate all CM gate caches. Call after optimizer.step()."""
+        """Invalidate all cuSOLVER-dependent caches. Call after optimizer.step()."""
         for i in range(self.n_layers):
             self[f'layer_{i}']['cm_gate'].invalidate_cache()
+            self[f'layer_{i}']['rotation'].invalidate_cache()
+        # Cross-layer rotations
+        for name in list(self.components.keys()):
+            if name.startswith('cross_rot'):
+                self[name].invalidate_cache()
 
     @torch.compiler.disable
     def precompute_cm_gates(self):
-        """Precompute CM gate anchor quality for all layers.
+        """Precompute ALL cuSOLVER-dependent operations for all layers.
 
+        Caches: CM gate anchor quality (det) + Cayley rotations (solve).
         Must be called BEFORE the compiled forward pass. CUDA graph
-        capture cannot contain module attribute mutations (precompute
-        writes to self._cached_cm_norm). This runs outside the graph.
+        capture cannot contain cuSOLVER calls.
 
-        Idempotent: skips layers with warm caches.
+        Idempotent: skips components with warm caches.
         """
         for i in range(self.n_layers):
             layer = self[f'layer_{i}']
+            # CM gate — uses det
             anchors_n = F.normalize(
                 layer['observer'].association.constellation.anchors, dim=-1)
             layer['cm_gate'].precompute(anchors_n.detach())
+            # Per-layer Cayley rotation — uses solve
+            layer['rotation'].precompute()
+        # Cross-layer rotations — uses solve
+        for name in list(self.components.keys()):
+            if name.startswith('cross_rot'):
+                self[name].precompute()
 
     def geometric_losses(self, cv_target=0.215, cv_weight=0.1, spread_weight=0.01):
         """Compute geometric regularization from current anchor geometry."""
