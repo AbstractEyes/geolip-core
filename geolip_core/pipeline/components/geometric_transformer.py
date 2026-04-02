@@ -630,9 +630,8 @@ class GeometricTransformerLayer(BaseTower):
         # ════ 3. CM Gate — validate anchor measurements ════
         anchors_n = F.normalize(
             self['observer'].association.constellation.anchors, dim=-1)
-        # Precompute CM quality outside compile graph (idempotent, uses cache)
-        self['cm_gate'].precompute(anchors_n.detach())
-        # Compilable gate forward — pure tensor ops
+        # CM gate forward — precompute() must have been called before entering
+        # the compiled graph (by GeometricTransformer.precompute_cm_gates())
         gate_values, gate_info = self['cm_gate'](a_out['distances'])
 
         # ════ 4. Gated curation — patchwork reads validated triangulation ════
@@ -813,6 +812,22 @@ class GeometricTransformer(BaseTower):
         """Invalidate all CM gate caches. Call after optimizer.step()."""
         for i in range(self.n_layers):
             self[f'layer_{i}']['cm_gate'].invalidate_cache()
+
+    @torch.compiler.disable
+    def precompute_cm_gates(self):
+        """Precompute CM gate anchor quality for all layers.
+
+        Must be called BEFORE the compiled forward pass. CUDA graph
+        capture cannot contain module attribute mutations (precompute
+        writes to self._cached_cm_norm). This runs outside the graph.
+
+        Idempotent: skips layers with warm caches.
+        """
+        for i in range(self.n_layers):
+            layer = self[f'layer_{i}']
+            anchors_n = F.normalize(
+                layer['observer'].association.constellation.anchors, dim=-1)
+            layer['cm_gate'].precompute(anchors_n.detach())
 
     def geometric_losses(self, cv_target=0.215, cv_weight=0.1, spread_weight=0.01):
         """Compute geometric regularization from current anchor geometry."""
