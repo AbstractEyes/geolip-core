@@ -51,9 +51,14 @@ class Patchwork(nn.Module):
         ])
 
     def forward(self, tri):
-        """tri: (B, n_anchors) → (B, n_comp * d_comp)."""
+        """tri: (B, n_anchors) → (B, n_comp * d_comp).
+
+        Uses stride slicing (k::n_comp) instead of boolean masking
+        for CUDA graph compatibility. Round-robin assignment means
+        compartment k owns every n_comp-th anchor starting at k.
+        """
         return torch.cat([
-            self.comps[k](tri[:, self.asgn == k])
+            self.comps[k](tri[:, k::self.n_comp])
             for k in range(self.n_comp)
         ], dim=-1)
 
