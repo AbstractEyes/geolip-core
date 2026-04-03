@@ -319,6 +319,7 @@ class CayleyOrthogonal(TorchComponent):
         A = A - A.T
         return LA.solve(self._eye + A, self._eye - A)
 
+    @torch.no_grad()
     def precompute(self):
         """Update cached rotation in-place. Call outside compiled graph."""
         self._cached_rotation.copy_(self.get_rotation())
@@ -329,7 +330,8 @@ class CayleyOrthogonal(TorchComponent):
 
     def forward(self, x):
         if not self._cache_warm:
-            self._cached_rotation.copy_(self.get_rotation())
+            with torch.no_grad():
+                self._cached_rotation.copy_(self.get_rotation())
             self._cache_warm = True
         return x @ self._cached_rotation.T
 
@@ -758,7 +760,7 @@ class GeometricTransformerLayer(BaseTower):
 # FULL MODEL — stack of layers + geometric regularization
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class GeometricTransformer(WideRouter):
+class GeometricTransformer(BaseTower):
     """Geometric Transformer — CM-validated dual-stream with optional flows.
 
     Stack of GeometricTransformerLayers with:
@@ -841,6 +843,7 @@ class GeometricTransformer(WideRouter):
             if name.startswith('cross_rot'):
                 self[name].invalidate_cache()
 
+    @torch.no_grad()
     @torch.compiler.disable
     def precompute_cm_gates(self):
         """Precompute ALL cuSOLVER-dependent operations for all layers.
