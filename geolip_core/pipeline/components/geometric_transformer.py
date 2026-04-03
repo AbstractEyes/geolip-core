@@ -758,7 +758,7 @@ class GeometricTransformerLayer(BaseTower):
 # FULL MODEL — stack of layers + geometric regularization
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class GeometricTransformer(BaseTower):
+class GeometricTransformer(WideRouter):
     """Geometric Transformer — CM-validated dual-stream with optional flows.
 
     Stack of GeometricTransformerLayers with:
