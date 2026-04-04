@@ -2,9 +2,9 @@
 
 A geometric support system for deep learning models.
 
-Models train blind. They get a loss signal and a gradient. They have no structural self-awareness — they can't see their representations collapsing, their features going redundant, or their capacity dying.
+Models train blind. They get a loss signal and a gradient. They have no structural self-awareness -- they can't see their representations collapsing, their features going redundant, or their capacity dying.
 
-This package gives them that. Not by adding losses that punish problems after they happen, but by architecturally making those problems observable, measurable, and correctable in real time. A model hospital — diagnostics, monitoring, intervention, and support for models that can't diagnose themselves.
+This package gives them that. Not by adding losses that punish problems after they happen, but by architecturally making those problems observable, measurable, and correctable in real time. A model hospital -- diagnostics, monitoring, intervention, and support for models that can't diagnose themselves.
 
 Built on the [geofractal](https://github.com/AbstractEyes/geofractal) router system. Part of the [GeoLIP](https://github.com/AbstractEyes/glip-autoencoder) ecosystem.
 
@@ -15,7 +15,7 @@ pip install "git+https://github.com/AbstractEyes/geofractal.git"
 pip install "git+https://github.com/AbstractEyes/geolip-core.git"
 ```
 
-Triton is optional — fused SVD kernels activate automatically if installed. CuPy is optional — CUDA eigendecomposition kernels activate if installed. Everything falls back to PyTorch without either.
+Triton is optional -- fused SVD kernels activate automatically if installed. CuPy is optional -- CUDA eigendecomposition kernels activate if installed. Everything falls back to PyTorch without either.
 
 ## Architecture
 
@@ -38,25 +38,62 @@ pipeline/                     THE COMPOSITIONS (BaseTower)
 
 A model is what you build FROM a pipeline. The pipeline composes behaviors. The behaviors live in core.
 
+### The Six-Stage Observer Paradigm
+
+```
+Input -> Mutation -> Association -> Curation -> Distinction -> Loss
+  |         |           |            |            |          |
+  SVD    FlowAttn   Constellation  Patchwork   ClassHead  observer_loss
+  |         |        + CM Gate       + Bridge              + cv_loss
+  |         |           |            |                     + spread_loss
+  +---------+-----------+------------+
+        All observe a SHARED constellation
+```
+
+| Stage | Directory | Purpose |
+|---|---|---|
+| **Input** | `core/input/` | Ingest and decompose external signals into geometric primitives |
+| **Mutation** | `core/associate/` | Transform position on manifold (FlowAttention, Relay) |
+| **Association** | `core/associate/` | Measure relationships to a reference frame (Constellation) |
+| **Curation** | `core/curate/` | Select what matters from those measurements (Patchwork, CM Gate, Flows) |
+| **Alignment** | `core/align/` | Relate two geometric spaces (Procrustes, Cayley, Crystallization) |
+| **Distinction** | `core/distinguish/` | Task-specific output and loss functions |
+
+### Design Principle: Architecture Before Loss
+
+When a problem arises:
+
+1. First ask: can the architecture prevent this?
+2. If yes: structural fix -- gate, projection, initialization, detach boundary.
+3. If no: then introduce a loss, minimal and targeted.
+
+The CM gate doesn't need a validity loss. It architecturally suppresses degenerate anchors. Subspace Procrustes doesn't need an alignment loss. The rotation is exact by construction.
+
 ## Package Structure
 
 ```
 geolip_core/
-├── core/                          Geometric behaviors (five stages)
+├── core/                          Geometric behaviors (six stages)
 │   ├── input/                         Data-type ingestion and observation
-│   │   └── svd.py                         SVDObserver, SVDTokenObserver
+│   │   ├── svd.py                         SVDObserver, SVDTokenObserver
+│   │   ├── scatter.py                     Scattering transform features
+│   │   └── spectral.py                    Spectral feature extraction
 │   ├── associate/                     Measure relationships to reference frame
-│   │   ├── constellation.py               Constellation, ConstellationAssociation
+│   │   ├── constellation.py               Constellation, ConstellationAssociation,
+│   │   │                                  ConstellationCuration, ConstellationObserver
 │   │   ├── relay.py                       ConstellationRelay (O(S) mutation)
 │   │   └── route.py                       FlowAttention (ODE mutation)
 │   ├── curate/                        Select what matters
 │   │   ├── gate.py                        AnchorGate, GatedPatchwork (CM validity)
-│   │   └── patchwork.py                   Patchwork, MagnitudeFlow
+│   │   ├── patchwork.py                   Patchwork, MagnitudeFlow, AnchorPush
+│   │   └── flows.py                       FlowEnsemble (6 flow types), FLOW_REGISTRY
 │   ├── align/                         How spaces relate
-│   │   └── procrustes.py                  ProcrustesAlignment (subspace-preserving)
+│   │   ├── procrustes.py                  ProcrustesAlignment (subspace-preserving)
+│   │   ├── crystallize.py                 CrystallizationEngine (constellation from embeddings)
+│   │   └── stage_align.py                 StageAligner (Procrustes between training stages)
 │   ├── distinguish/                   Task-specific output
-│   │   └── losses.py                      CE, CV, spread, observer_loss
-│   └── util.py                        Activations, autograd, constants
+│   │   └── losses.py                      CE, CV, NCE, spread, bridge, observer_loss
+│   └── util.py                        Activations, autograd, validated constants
 │
 ├── pipeline/                      Composed geometric substrates
 │   ├── components/                    TorchComponent wrappers (cache adapters)
@@ -67,12 +104,28 @@ geolip_core/
 │   │   ├── curate_gate.py                 CurateCMGate
 │   │   ├── curate_patchwork.py            CuratePatchwork, CurateGatedPatchwork
 │   │   ├── curate_magnitude.py            CurateMagnitude
+│   │   ├── curate_cm_validated.py         CMValidatedGate (transformer-scale CM gate)
 │   │   ├── align_procrustes.py            AlignProcrustes
-│   │   └── fuse.py                        FuseGeometric
+│   │   ├── align_cayley.py                CayleyOrthogonal (SO(d) rotation)
+│   │   ├── fuse.py                        FuseGeometric
+│   │   ├── context_film.py                FiLMLayer (feature-wise linear modulation)
+│   │   ├── context_position_geometric.py  PositionGeometricContext (5-stream fusion)
+│   │   ├── compose_quaternion.py          QuaternionCompose (Hamilton product)
+│   │   ├── project_manifold.py            ManifoldProjection (h -> S^(d-1))
+│   │   ├── attend_geometric.py            GeometricAttention (FiLM on Q,K)
+│   │   ├── attend_content.py              ContentAttention (standard MHA)
+│   │   ├── distinguish_nce_bank.py        GeoResidualBank (CLIP-style contrastive)
+│   │   ├── layer_geometric.py             GeometricTransformerLayer (one layer)
+│   │   ├── transformer_geometric.py       GeometricTransformer + factory functions
+│   │   └── geometric_transformer.py       Backward-compatible re-export shim
 │   ├── observer.py                    Stage interfaces (Input, Association, ...)
-│   ├── arbitrary_feature.py           GeometricPipeline (token → geo feature)
+│   ├── arbitrary_feature.py           GeometricPipeline (token -> geo feature)
+│   ├── esm2_geometric.py             ESM-2 protein geometric pipeline
 │   ├── layer.py                       ConstellationLayer (one depth)
 │   └── backbone.py                    GeometricBackbone (multi-depth)
+│
+├── training/                      Training orchestration
+│   └── curriculum.py                  CurriculumTrainer (episodic crystallization)
 │
 ├── linalg/                        Geometric linear algebra primitives
 │   ├── __init__.py                    Drop-in torch.linalg replacement
@@ -83,40 +136,57 @@ geolip_core/
 │   └── procrustes.py                  Subspace-preserving Procrustes alignment
 │
 ├── example/                       Working models built with the pipeline
+│   ├── constellation_encoder.py       Reference: MagnitudeFlow + ConstellationObserver
+│   ├── conv_encoder.py                Conv2d -> (emb, magnitude)
+│   ├── conv_svd_encoder.py            Conv2d + SVD features
+│   ├── conv_scatter_encoder.py        Conv2d + Scattering transform
+│   ├── spectral_encoder.py            Spectral features
+│   └── transformer_svd_encoder.py     Transformer + SVD
+│
 ├── analysis/                      Diagnostic tools
-└── utils/                         Engineering infrastructure
-    ├── kernel.py                      Triton SVD N=2,3, gram_eigh, Procrustes math
-    ├── cuda/                          CuPy/NVRTC eigendecomposition kernels
-    │   └── fl_eigh_cuda.py                Per-N generated CUDA kernels (n=3-16)
-    ├── triton/                        Generated Triton kernels (experimental)
-    │   ├── fl_eigh_gen.py                 Kernel source generator
-    │   └── fl_eigh_n6.py                 Pre-generated n=6 kernel (7465 lines)
-    └── memory.py                      EmbeddingBuffer
+│   └── geometric.py                   cv_metric, knn_accuracy, analyze_svd_model
+│
+├── utils/                         Engineering infrastructure
+│   ├── kernel.py                      Triton SVD N=2,3, gram_eigh, Procrustes math
+│   ├── cuda/                          CuPy/NVRTC eigendecomposition kernels
+│   ├── triton/                        Generated Triton kernels (experimental)
+│   └── memory.py                      EmbeddingBuffer
+│
+└── SYSTEM.md                      Comprehensive system reference
 ```
 
-### The Five Stages
-
-Every component in `core/` lives in the directory matching its primary purpose. A component may perform hundreds of internal steps. It is classified by what it exists to accomplish, not by what it computes along the way.
-
-| Stage | Directory | Purpose |
-|---|---|---|
-| **Input** | `core/input/` | Ingest and decompose external signals into geometric primitives |
-| **Associate** | `core/associate/` | Measure relationships to a reference frame |
-| **Curate** | `core/curate/` | Select what matters from those measurements |
-| **Align** | `core/align/` | Relate two geometric spaces to each other |
-| **Distinguish** | `core/distinguish/` | Task-specific output |
-
-### Design Principle: Architecture Before Loss
-
-When a problem arises:
-
-1. First ask: can the architecture prevent this?
-2. If yes: structural fix — gate, projection, initialization, detach boundary.
-3. If no: then introduce a loss, minimal and targeted.
-
-The CM gate doesn't need a validity loss. It architecturally suppresses degenerate anchors. Subspace Procrustes doesn't need an alignment loss. The rotation is exact by construction.
-
 ## Quick Start
+
+### Geometric Transformer
+
+The main working model. CM-validated dual-stream with constellation routing and optional FlowEnsemble.
+
+```python
+from geolip_core.pipeline.components import (
+    GeometricTransformer, geo_transformer_small)
+
+# Factory: d=256, 8 heads, 4 layers, 16 anchors
+model = geo_transformer_small('my_model', n_layers=4)
+model.network_to(device='cuda', strict=False)
+
+# Forward
+x = torch.randn(B, L, 256, device='cuda')
+out = model(x)                              # (B, L, 256)
+out, geo_states = model(x, return_geo_state=True)  # + per-layer geometric state
+
+# Training with observer loss
+model.invalidate_caches()
+model.precompute_cm_gates()     # cache CM det + Cayley solve (every 10-20 batches)
+output = model.forward_paired(x1, x2)
+loss, ld = model.compute_loss(output, targets, head=classifier_head)
+loss.backward()
+
+# Geometric regularization (call every step)
+geo_losses = model.geometric_losses()
+total = task_loss + geo_losses['geo_total']
+```
+
+Available factories: `geo_transformer_esm2` (d=1280, ESM-2 scale), `geo_transformer_small` (d=256, prototyping), `geo_transformer_vision` (d=384, vision patches).
 
 ### Composable Pipeline (geofractal router)
 
@@ -124,7 +194,7 @@ The CM gate doesn't need a validity loss. It architecturally suppresses degenera
 from geolip_core.pipeline.arbitrary_feature import GeometricPipeline
 from geolip_core.pipeline.components import CurateCMGate
 
-# Build pipeline: (B, 5, 512) → (B, feature_dim)
+# Build pipeline: (B, 5, 512) -> (B, feature_dim)
 pipe = GeometricPipeline('geo', seq_len=5, input_dim=512, n_anchors=32)
 features = pipe(x)
 
@@ -141,14 +211,14 @@ pipe.attach('curate_gate', CurateCMGate('curate_gate', 32, 256, strategy='top_k'
 
 ### Geometric Linear Algebra
 
-`geolip.linalg` is a drop-in replacement for `torch.linalg`. Our implementations override where we have something better. Everything else transparently proxies to PyTorch.
+`geolip_core.linalg` is a drop-in replacement for `torch.linalg`. Our implementations override where we have something better. Everything else transparently proxies to PyTorch.
 
 ```python
-import geolip.linalg as LA
+import geolip_core.linalg as LA
 
 # Our implementations (auto-dispatch to best available)
-vals, vecs = LA.eigh(A)           # FL pipeline n≤12, cuSOLVER n>12
-U, S, Vh = LA.svd(A)              # Triton n=2,3 → FL n≤12 → cuSOLVER
+vals, vecs = LA.eigh(A)           # FL pipeline n<=12, cuSOLVER n>12
+U, S, Vh = LA.svd(A)              # Triton n=2,3 -> FL n<=12 -> cuSOLVER
 
 # These pass through to torch.linalg (zero overhead)
 x = LA.solve(A, b)
@@ -160,62 +230,40 @@ LA.backend.status()               # print available features
 LA.backend.use_fl_eigh = False    # disable FL, use cuSOLVER everywhere
 ```
 
-**FL Hybrid Eigendecomposition** — Faddeev-LeVerrier characteristic polynomial → Laguerre root-finding → Newton-Schulz orthogonalization → Rayleigh quotient refinement. Wins 84/84 mathematical purity metrics against cuSOLVER across n=3-12. Zero graph breaks under `torch.compile(fullgraph=True)`. 40× less memory.
-
-```python
-from geolip.linalg import FLEigh
-
-# Compiled training loop — zero graph breaks
-solver = torch.compile(FLEigh(), fullgraph=True)
-eigenvalues, eigenvectors = solver(cm_matrices)  # [B, 6, 6] → [B, 6], [B, 6, 6]
-```
-
-**CUDA Eigendecomposition Kernel** — Per-matrix CUDA kernel via CuPy/NVRTC. One thread per matrix, entire pipeline in registers. Flat batch scaling — 1.73× cuSOLVER at B=16,384, runs where cuSOLVER OOMs at B=32,768.
-
-```python
-from geolip.utils.cuda.fl_eigh_cuda import fl_eigh_cuda
-
-# High-batch: 0.7MB vs cuSOLVER's 1,099MB
-eigenvalues, eigenvectors = fl_eigh_cuda(A)  # any n in 3-16
-```
-
-### Individual Components
-
-```python
-from geolip_core.pipeline.components import (
-    ObserveSVDTokens, AssociateConstellation,
-    CurateCMGate, CuratePatchwork, AlignProcrustes,
-)
-
-# Each wraps a core module + provides cache wiring
-observe = ObserveSVDTokens('obs', seq_len=5)
-assoc = AssociateConstellation('assoc', dim=256, n_anchors=32)
-gate = CurateCMGate('gate', n_anchors=32, embed_dim=256, strategy='cm_gate')
-```
-
 ### Core Modules Directly
 
 ```python
-from geolip_core.core import SVDObserver, SVDTokenObserver, Constellation, AnchorGate, Patchwork
+from geolip_core.core.associate.constellation import ConstellationObserver
+from geolip_core.core.curate.patchwork import Patchwork, AnchorPush
 
-# No router, no cache — just PyTorch modules
-svd = SVDObserver(in_channels=384, svd_rank=24)
-S, Vh, features, novelty = svd(conv_features)
+# No router, no cache -- just PyTorch modules
+obs = ConstellationObserver(dim=256, n_anchors=32, n_comp=8, d_comp=32)
+result = obs.observe(embedding)   # dict: embedding, triangulation, assignment, patchwork, ...
 
-gate = AnchorGate(n_anchors=32, dim=256, strategy='cm_gate')
-gate_values, assignment, info = gate(embedding, anchors, triangulation)
+# Non-gradient anchor repositioning
+push = AnchorPush('momentum', n_anchors=32, dim=256, alpha=0.05, beta=0.02)
+push.push(obs, embedding_buffer, label_buffer)
 ```
 
-### Engineering Utilities
+### Curriculum Training (Episodic Crystallization)
 
 ```python
-from geolip_core.utils import gram_eigh_svd, batched_procrustes
+from geolip_core.training import CurriculumTrainer
 
-# 5000× faster than torch.linalg.svd for small N
-U, S, Vh = gram_eigh_svd(features)
+trainer = CurriculumTrainer(model, config={
+    'manifold_dim': 256, 'n_anchors': 128, 'n_classes': 100,
+    'project_fn': my_project_fn,          # model, inputs -> (B, 256)
+    'get_constellation_fn': get_const,     # model -> Constellation
+    'set_constellation_fn': set_const,     # model, Constellation -> None
+    'train_fn': my_train_fn,               # model, loader, epochs, loss_config -> metrics
+})
 
-# Subspace-preserving alignment
-aligned, info = batched_procrustes(source, target, rank=24)
+# Stage 0: CE only -> crystallize constellation from stable embeddings
+# Stage 1: Full observer losses with crystallized constellation
+history = trainer.train_curriculum(loader, stages=[
+    {'epochs': 50, 'losses': ['ce']},
+    {'epochs': 50, 'losses': 'all'},
+])
 ```
 
 ## Component Catalog
@@ -238,14 +286,32 @@ Each reads from and writes to the parent router's cache. Core modules do the mat
 | `AlignProcrustes` | `ProcrustesAlignment` | Align | `aligned`, `alignment_info` |
 | `FuseGeometric` | (pipeline-specific) | Fuse | `svd_context`, `geo_features` |
 
+### Geometric Transformer Components
+
+Extracted from the CM-validated dual-stream geometric transformer. Each is a standalone file.
+
+| Component | Parent | Purpose |
+|---|---|---|
+| `CMValidatedGate` | `nn.Module` | Anchor gating via Cayley-Menger validity (cached precompute) |
+| `GeoResidualBank` | `nn.Module` | Cross-stream contrastive memory bank (CLIP-style) |
+| `FiLMLayer` | `TorchComponent` | Feature-wise Linear Modulation (near-identity init) |
+| `CayleyOrthogonal` | `TorchComponent` | SO(d) rotation via Cayley map (det=1 always) |
+| `QuaternionCompose` | `TorchComponent` | Four-arm Hamilton product composition |
+| `ManifoldProjection` | `TorchComponent` | Project hidden states to S^(d-1) |
+| `PositionGeometricContext` | `TorchComponent` | 5-stream fusion -> FiLM context |
+| `GeometricAttention` | `TorchComponent` | FiLM on Q,K (geometry routes attention, V stays pure) |
+| `ContentAttention` | `TorchComponent` | Standard self-attention (Stream A, no geometry) |
+| `GeometricTransformerLayer` | `BaseTower` | One layer: project -> associate -> gate -> curate -> dual-stream -> compose |
+| `GeometricTransformer` | `BaseTower` | Full model: layer stack + cross-layer rotation + NCE bank |
+
 ### Geometric Linear Algebra (`linalg/`)
 
 Drop-in `torch.linalg` replacement with geometric optimizations. Anything not overridden proxies transparently to PyTorch.
 
 | Function | Implementation | Performance |
 |---|---|---|
-| `eigh(A)` | FL Hybrid (n≤12), cuSOLVER fallback | 84/84 purity, 40× less memory, zero graph breaks |
-| `svd(A)` | Triton N=2,3 → FL eigh N≤12 → cuSOLVER | 3,850× at N=2, compilable |
+| `eigh(A)` | FL Hybrid (n<=12), cuSOLVER fallback | 84/84 purity, 40x less memory, zero graph breaks |
+| `svd(A)` | Triton N=2,3 -> FL eigh N<=12 -> cuSOLVER | 3,850x at N=2, compilable |
 | `newton_schulz_invsqrt(G)` | Pure bmm iteration | Zero eigensolvers, quadratic convergence |
 | `procrustes(src, tgt)` | Subspace-preserving rotation | 1.000 NN agreement at N=32-128 |
 | Everything else | `torch.linalg` passthrough | Zero overhead |
@@ -253,9 +319,9 @@ Drop-in `torch.linalg` replacement with geometric optimizations. Anything not ov
 Backend auto-detection with single warning on first fallback:
 
 ```python
-from geolip.linalg import backend
+from geolip_core.linalg import backend
 backend.status()
-# geolip.linalg backend:
+# geolip_core.linalg backend:
 #   CUDA:       yes
 #   Triton:     3.6.0
 #   FL eigh:    enabled
@@ -263,60 +329,47 @@ backend.status()
 #   GPU:        NVIDIA RTX PRO 6000 Blackwell Server Edition
 ```
 
-| Dispatch condition | Implementation | Why |
-|---|---|---|
-| n≤4, CuPy available, B≥512 | CUDA kernel | 2-7× cuSOLVER |
-| n≤6, CuPy available, B≥8,192 | CUDA kernel | 1.7× cuSOLVER, flat scaling |
-| n≤12, CUDA | FL Precise (compiled) | 84/84 purity, 40× less memory |
-| n>12 | `torch.linalg.eigh` | FL conditioning degrades |
+**FL Hybrid Eigendecomposition** -- Faddeev-LeVerrier characteristic polynomial -> Laguerre root-finding -> Newton-Schulz orthogonalization -> Rayleigh quotient refinement. Wins 84/84 mathematical purity metrics against cuSOLVER across n=3-12. Zero graph breaks under `torch.compile(fullgraph=True)`. 40x less memory.
 
-### Key Core Modules
-
-**SVD Kernel** (`utils/kernel.py`) — Fused Triton kernels for batched thin SVD:
-
-| N | Time | vs torch |
-|---|---|---|
-| 2 | 0.021ms | 3,850× |
-| 3 | 0.022ms | 5,488× |
-| 8 | 0.290ms | 584× |
-| 32 | 0.781ms | 388× |
-
-**FL Hybrid Eigh** (`linalg/eigh.py`) — Five-phase compilable eigendecomposition:
-
-| Phase | Method | Precision |
-|---|---|---|
-| 1. Characteristic polynomial | Faddeev-LeVerrier recurrence | fp64 |
-| 2. Root-finding | Laguerre + synthetic deflation | fp32/fp64 adaptive |
-| 3. Eigenvectors | FL adjugate Horner evaluation | fp64, chunked for n>6 |
-| 4. Orthogonalization | Newton-Schulz polar iteration | fp32, 2 iterations |
-| 5. Eigenvalue refinement | Rayleigh quotient | fp32, 2 bmm |
+**CUDA Eigendecomposition Kernel** -- Per-matrix CUDA kernel via CuPy/NVRTC. One thread per matrix, entire pipeline in registers. Flat batch scaling -- 1.73x cuSOLVER at B=16,384, runs where cuSOLVER OOMs at B=32,768.
 
 Benchmarked on NVIDIA RTX PRO 6000 Blackwell (B=4,096, n=6):
 
 | Method | Time | vs cuSOLVER | Memory |
 |---|---|---|---|
-| cuSOLVER | 241 µs | 1.00× | 1,099 MB |
-| FL Precise compiled | 350 µs | 0.69× | 32 MB |
-| FL Precise + CUDA Graph | 287 µs | 0.84× | 32 MB |
-| CUDA kernel (n=6, B=16K) | 429 µs | 1.73× | 0.7 MB |
-| CUDA kernel (n=3, B=4K) | 45 µs | 3.06× | 0.7 MB |
+| cuSOLVER | 241 us | 1.00x | 1,099 MB |
+| FL Precise compiled | 350 us | 0.69x | 32 MB |
+| FL Precise + CUDA Graph | 287 us | 0.84x | 32 MB |
+| CUDA kernel (n=6, B=16K) | 429 us | 1.73x | 0.7 MB |
+| CUDA kernel (n=3, B=4K) | 45 us | 3.06x | 0.7 MB |
 
-**CUDA Eigh Kernel** (`utils/cuda/fl_eigh_cuda.py`) — Generated per matrix size via Python template, compiled by NVRTC at runtime, cached at `~/.cupy/kernel_cache/`. One thread per matrix, zero intermediate memory, flat batch scaling.
+## Empirical Results
 
-**CM Validity Gate** (`core/curate/gate.py`) — Cayley-Menger determinant as geometric attention. Simplex volume is the relevance score. Strategies: `round_robin`, `cm_gate`, `top_k`, `top_p`.
-
-**Subspace Procrustes** (`core/align/procrustes.py`) — For N > 32, projects to rank-24, aligns, lifts back preserving orthogonal complement exactly. 1.000 NN agreement.
-
-**Constellation** (`core/associate/constellation.py`) — Learned anchors on S^(d-1). The primary state. Repulsion-initialized, detached from task gradients.
+| System | Metric | Value |
+|---|---|---|
+| **GeoTransformer Redux v8** | CIFAR-100 accuracy | 61%, 6.8M params, 4 layers |
+| | CV_anc | 0.212 (in pentachoron band) |
+| | Active anchors | 126/128 |
+| | Speed | 19s/epoch on RTX PRO 6000 Blackwell |
+| **Ryan Spearman** | ProteinGym benchmark (84 unseen assays) | rho=0.309 (Procrustes matched) |
+| | Wins vs GeoQuat | 76/84 (90%) |
+| | Beta-lactamase | rho=0.550 approaching SOTA from zero training data |
+| **FL Eigh** | Mathematical purity | 84/84 |
+| | vs cuSOLVER speed | 1.73x faster (CUDA kernel) |
+| | vs cuSOLVER memory | 40x less |
+| **Procrustes survey** | Models analyzed | 17 |
+| | QK eigenvalue lock | 0.500 universal |
+| **GEOLIP-Bertenstein** | Retrieval | Perfect on 40K+ pairs, 1 epoch, 1 layer |
 
 ## Empirical Constants
 
 | Constant | Value | Observed across |
 |---|---|---|
-| CV pentachoron band | 0.20–0.23 | 17+ architectures, all modalities |
+| CV pentachoron band | 0.20-0.23 | 17+ architectures, all modalities |
 | Binding/separation boundary | 0.29154 / 0.70846 | MinimalShunts, CLIP, T5, alpha convergence |
 | Effective geometric dimension | 16 (S^15) | Validated in patchwork and anchor experiments |
 | Irreducible CV minimum | 0.125 | Theoretical lower bound on sphere |
+| Cross-modal QK eigenvalue lock | 0.500 | Universal across 17+ models |
 
 ## Requirements
 
@@ -326,20 +379,23 @@ geofractal @ git+https://github.com/AbstractEyes/geofractal.git
 ```
 
 Optional:
-- `triton >= 2.1` — fused SVD kernels for N=2,3
-- `cupy-cuda12x` — CUDA eigendecomposition kernels via NVRTC
-- `kymatio` — scattering transforms
+- `triton >= 2.1` -- fused SVD kernels for N=2,3
+- `cupy-cuda12x` -- CUDA eigendecomposition kernels via NVRTC
+- `kymatio` -- scattering transforms
 
 ## Ecosystem
 
-- [geofractal](https://github.com/AbstractEyes/geofractal) — Router/tower/component composition framework
-- [wide-compiler](https://github.com/AbstractEyes/wide-compiler) — N-model batched fusion via grouped operations
-- [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) — Full GeoLIP package
-- [FL Eigh Article](https://huggingface.co/blog/AbstractPhil/linalg-eigh-rehaul-ft1) — Compilable eigendecomposition beating cuSOLVER
-- [SVD Kernel Article](https://huggingface.co/blog/AbstractPhil/svd-triton-kernel-optimization) — Engineering specification
-- [SVD Experiment Journey](https://huggingface.co/blog/AbstractPhil/svd-experiment-journey) — Development map
-- [geolip-bertenstein](https://huggingface.co/AbstractPhil/geolip-bertenstein) — Multi-expert geometric fusion
-- [procrustes-analysis](https://huggingface.co/AbstractPhil/procrustes-analysis) — Cross-model alignment study
+- [geofractal](https://github.com/AbstractEyes/geofractal) -- Router/tower/component composition framework
+- [wide-compiler](https://github.com/AbstractEyes/wide-compiler) -- N-model batched fusion via grouped operations
+- [glip-autoencoder](https://github.com/AbstractEyes/glip-autoencoder) -- Full GeoLIP package
+- [geolip-bertenstein](https://huggingface.co/AbstractPhil/geolip-bertenstein) -- Multi-expert geometric fusion
+- [procrustes-analysis](https://huggingface.co/AbstractPhil/procrustes-analysis) -- Cross-model alignment study
+- [ryan-spearman](https://huggingface.co/AbstractPhil/ryan-spearman-prepared-features) -- Variant effect prediction heads + features
+- [FL Eigh Article](https://huggingface.co/blog/AbstractPhil/linalg-eigh-rehaul-ft1) -- Compilable eigendecomposition beating cuSOLVER
+- [SVD Kernel Article](https://huggingface.co/blog/AbstractPhil/svd-triton-kernel-optimization) -- Engineering specification
+- [SVD Experiment Journey](https://huggingface.co/blog/AbstractPhil/svd-experiment-journey) -- Development map
+
+See `geolip_core/SYSTEM.md` for the comprehensive system reference.
 
 ---
 
