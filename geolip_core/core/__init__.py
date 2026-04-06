@@ -11,6 +11,7 @@ Five stages, five directories:
 Usage:
     from geolip_core.core import Constellation, Patchwork, AnchorGate
     from geolip_core.core import cv_loss, ce_loss, knn_accuracy
+    from geolip_core.core import compute_target_cv, soft_hand_loss
     from geolip_core.core import SVDObserver, ProcrustesAlignment
     from geolip_core.core import make_activation, param_count
 """
@@ -53,4 +54,6 @@ from .distinguish import (
     assign_bce_loss, assign_nce_loss,
     attraction_loss, spread_loss, knn_accuracy,
     three_domain_loss, observer_loss,
+    compute_target_cv, compute_target_cv_with_stats,
+    cv_proximity, soft_hand_weights, soft_hand_loss,
 )
