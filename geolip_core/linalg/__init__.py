@@ -23,6 +23,7 @@ import torch.linalg as _torch_linalg
 
 from ._backend import backend
 from .eigh import FLEigh, eigh
+from .conduit import FLEighConduit, ConduitPacket, canonicalize_eigenvectors, verify_parity
 from .svd import batched_svd, gram_eigh_svd, gram_fl_eigh_svd
 from .newton_schulz import newton_schulz_invsqrt
 from .procrustes import batched_procrustes
@@ -37,6 +38,11 @@ __all__ = [
     # Eigendecomposition (ours)
     'FLEigh',
     'eigh',
+    # Conduit — evidence-emitting eigendecomposition
+    'FLEighConduit',
+    'ConduitPacket',
+    'canonicalize_eigenvectors',
+    'verify_parity',
     # SVD (ours)
     'batched_svd',
     'gram_eigh_svd',
