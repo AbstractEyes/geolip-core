@@ -86,7 +86,7 @@ class _Backend:
     def resolve_svd_n2(self, A, block_m=128):
         """Triton SVD for N=2, or torch fallback."""
         if self.use_triton and self._triton and A.is_cuda:
-            from geolip.kernel import batched_svd2
+            from geolip_core.utils.kernel import batched_svd2
             return batched_svd2(A, block_m)
         if not self._triton:
             self.warn('svd2')
@@ -95,7 +95,7 @@ class _Backend:
     def resolve_svd_n3(self, A, block_m=128):
         """Triton SVD for N=3, or torch fallback."""
         if self.use_triton and self._triton and A.is_cuda:
-            from geolip.kernel import batched_svd3
+            from geolip_core.utils.kernel import batched_svd3
             return batched_svd3(A, block_m)
         if not self._triton:
             self.warn('svd3')
