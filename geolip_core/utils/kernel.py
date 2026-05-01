@@ -1749,7 +1749,10 @@ if __name__ == '__main__':
 
     try:
         from geolip_core.linalg._backend import backend as _be
-        from geolip_core.linalg import svd as _LA_svd
+        # NB: `geolip_core.linalg.__init__` rebinds `svd = batched_svd`, so
+        # `from geolip_core.linalg import svd` returns the FUNCTION, not the
+        # submodule. Import the function from the submodule directly.
+        from geolip_core.linalg.svd import batched_svd as _LA_batched_svd
         import geolip_core as _gc
         print(f"  geolip_core package: {getattr(_gc, '__file__', '?')}", flush=True)
         _be.status()
@@ -1769,7 +1772,7 @@ if __name__ == '__main__':
                 M_used_set = (m, M_OUTER) if m >= n else (m,)
                 for M_used in M_used_set:
                     A = torch.randn(B_T, M_used, n, device=device, dtype=torch_dt)
-                    U, S, Vh = _LA_svd.batched_svd(A, method='auto', compute_dtype=cdt)
+                    U, S, Vh = _LA_batched_svd(A, method='auto', compute_dtype=cdt)
                     _check(f"  {cdt} {M_used}x{n} dtype",
                            U.dtype == torch_dt and S.dtype == torch_dt and Vh.dtype == torch_dt)
                     _validate_svd(A, U, S, Vh, f"  {cdt} {M_used}x{n}")
@@ -1807,7 +1810,7 @@ if __name__ == '__main__':
                 torch_dt = torch.float32 if cdt == 'fp32' else torch.float64
                 for (m, n) in SHAPES:
                     A = torch.randn(B_T, m, n, device=device, dtype=torch_dt)
-                    U, S, Vh = _LA_svd.batched_svd(A, method='auto', compute_dtype=cdt)
+                    U, S, Vh = _LA_batched_svd(A, method='auto', compute_dtype=cdt)
                     _validate_svd(A, U, S, Vh, f"  off/{cdt} {m}x{n}")
         finally:
             _be.use_triton = saved_triton
