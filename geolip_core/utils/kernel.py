@@ -1296,6 +1296,21 @@ def _triton_dtype(A):
     raise TypeError(f"Triton SVD kernels support fp32/fp64 only, got {A.dtype}")
 
 
+def _torch_svd_fallback(A):
+    """torch.linalg.svd that works for any input dtype.
+
+    `torch.linalg.svd` on CUDA goes through gesvdj which only implements fp32 /
+    fp64 / complex. For fp16 / bf16 inputs it raises NotImplementedError. We
+    upcast to fp32, run the SVD, and cast results back so the wrapper contract
+    (output dtype matches input dtype) holds for the fallback path.
+    """
+    if A.dtype in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+        return _torch_svd_fallback(A)
+    orig = A.dtype
+    U, S, Vh = torch.linalg.svd(A.to(torch.float32), full_matrices=False)
+    return U.to(orig), S.to(orig), Vh.to(orig)
+
+
 def batched_svd2(A, block_m=128):
     """Fused Triton SVD for (B, M, 2) tensors. Falls back to torch if no Triton.
 
@@ -1303,7 +1318,7 @@ def batched_svd2(A, block_m=128):
     Returns: U (B,M,2), S (B,2), Vh (B,2,2)
     """
     if not HAS_TRITON or not A.is_cuda or A.dtype not in (torch.float32, torch.float64):
-        return torch.linalg.svd(A, full_matrices=False)
+        return _torch_svd_fallback(A)
     assert A.ndim == 3 and A.shape[2] == 2
     B, M, _ = A.shape
     A_c = A.contiguous()
@@ -1321,7 +1336,7 @@ def batched_svd3(A, block_m=128, jacobi_iters=6):
     Returns: U (B,M,3), S (B,3), Vh (B,3,3)
     """
     if not HAS_TRITON or not A.is_cuda or A.dtype not in (torch.float32, torch.float64):
-        return torch.linalg.svd(A, full_matrices=False)
+        return _torch_svd_fallback(A)
     assert A.ndim == 3 and A.shape[2] == 3
     B, M, _ = A.shape
     A_c = A.contiguous()
@@ -1340,7 +1355,7 @@ def batched_svd4(A, block_m=128, jacobi_iters=6):
     Returns: U (B,M,4), S (B,4), Vh (B,4,4)
     """
     if not HAS_TRITON or not A.is_cuda or A.dtype not in (torch.float32, torch.float64):
-        return torch.linalg.svd(A, full_matrices=False)
+        return _torch_svd_fallback(A)
     assert A.ndim == 3 and A.shape[2] == 4
     B, M, _ = A.shape
     A_c = A.contiguous()
@@ -1359,7 +1374,7 @@ def batched_svd5(A, block_m=128, jacobi_iters=6):
     Returns: U (B,M,5), S (B,5), Vh (B,5,5)
     """
     if not HAS_TRITON or not A.is_cuda or A.dtype not in (torch.float32, torch.float64):
-        return torch.linalg.svd(A, full_matrices=False)
+        return _torch_svd_fallback(A)
     assert A.ndim == 3 and A.shape[2] == 5
     B, M, _ = A.shape
     A_c = A.contiguous()
@@ -1384,7 +1399,7 @@ def batched_svd6(A, block_m=128, jacobi_iters=12):
     Returns: U (B,M,6), S (B,6), Vh (B,6,6)
     """
     if not HAS_TRITON or not A.is_cuda or A.dtype not in (torch.float32, torch.float64):
-        return torch.linalg.svd(A, full_matrices=False)
+        return _torch_svd_fallback(A)
     assert A.ndim == 3 and A.shape[2] == 6
     B, M, _ = A.shape
     A_c = A.contiguous()
@@ -1467,7 +1482,7 @@ def batched_svd(A, method='auto', block_m=128):
     elif method == 'gram_eigh':
         return gram_eigh_svd(A)
     elif method == 'torch':
-        return torch.linalg.svd(A, full_matrices=False)
+        return _torch_svd_fallback(A)
     raise ValueError(f"Unknown method '{method}'. Use: auto, triton, gram_eigh, torch")
 
 
