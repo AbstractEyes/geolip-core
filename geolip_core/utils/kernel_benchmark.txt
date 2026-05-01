@@ -1,0 +1,524 @@
+<frozen runpy>:128: RuntimeWarning: 'geolip_core.utils.kernel' found in sys.modules after import of package 'geolip_core.utils', but prior to execution of 'geolip_core.utils.kernel'; this may result in unpredictable behaviour
+kernel.py — validation on cuda
+  HAS_TRITON: True
+  GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition
+
+batched_svd (auto-dispatch):
+  [PASS]   N= 2 shapes
+  [PASS]   N= 2 recon
+  [PASS]   N= 2 orth
+  [PASS]   N= 2 desc
+  [PASS]   N= 3 shapes
+  [PASS]   N= 3 recon
+  [PASS]   N= 3 orth
+  [PASS]   N= 3 desc
+  [PASS]   N= 8 shapes
+  [PASS]   N= 8 recon
+  [PASS]   N= 8 orth
+  [PASS]   N= 8 desc
+  [PASS]   N=16 shapes
+  [PASS]   N=16 recon
+  [PASS]   N=16 orth
+  [PASS]   N=16 desc
+  [PASS]   N=32 shapes
+  [PASS]   N=32 recon
+  [PASS]   N=32 orth
+  [PASS]   N=32 desc
+
+batched_svd2 (Triton):
+  [PASS]   N=2 triton recon
+  [PASS]   N=2 triton orth
+  [PASS]   N=2 triton desc
+
+batched_svd3 (Triton):
+  [PASS]   N=3 triton recon
+  [PASS]   N=3 triton orth
+  [PASS]   N=3 triton desc
+
+batched_svd4 (Triton):
+  [PASS]   N=4 triton fp32 dtype
+  [PASS]   N=4 triton fp32 recon
+  [PASS]   N=4 triton fp32 orth
+  [PASS]   N=4 triton fp32 desc
+  [PASS]   N=4 triton fp64 dtype
+  [PASS]   N=4 triton fp64 recon
+  [PASS]   N=4 triton fp64 orth
+  [PASS]   N=4 triton fp64 desc
+  [PASS]   N=4 triton fp32 JI=12 recon
+  [PASS]   N=4 triton fp32 JI=12 orth
+  [PASS]   N=4 triton fp32 JI=12 desc
+  [PASS]   N=4 fp16 fallback dtype
+  [PASS]   N=4 fp16 fallback recon
+
+batched_svd5 (Triton):
+  [PASS]   N=5 triton fp32 dtype
+  [PASS]   N=5 triton fp32 recon
+  [PASS]   N=5 triton fp32 orth
+  [PASS]   N=5 triton fp32 desc
+  [PASS]   N=5 triton fp64 dtype
+  [PASS]   N=5 triton fp64 recon
+  [PASS]   N=5 triton fp64 orth
+  [PASS]   N=5 triton fp64 desc
+  [PASS]   N=5 triton fp32 JI=12 recon
+  [PASS]   N=5 triton fp32 JI=12 orth
+  [PASS]   N=5 triton fp32 JI=12 desc
+  [PASS]   N=5 fp16 fallback dtype
+  [PASS]   N=5 fp16 fallback recon
+
+batched_svd6 (Triton):
+  [PASS]   N=6 triton fp32 dtype
+  [PASS]   N=6 triton fp32 recon
+  [PASS]   N=6 triton fp32 orth
+  [PASS]   N=6 triton fp32 desc
+  [PASS]   N=6 triton fp64 dtype
+  [PASS]   N=6 triton fp64 recon
+  [PASS]   N=6 triton fp64 orth
+  [PASS]   N=6 triton fp64 desc
+  [PASS]   N=6 triton fp32 JI=12 recon
+  [PASS]   N=6 triton fp32 JI=12 orth
+  [PASS]   N=6 triton fp32 JI=12 desc
+  [PASS]   N=6 fp16 fallback dtype
+  [PASS]   N=6 fp16 fallback recon
+
+gram_eigh_svd:
+  [PASS]   N=4 recon
+  [PASS]   N=4 orth
+  [PASS]   N=4 desc
+  [PASS]   N=24 recon
+  [PASS]   N=24 orth
+  [PASS]   N=24 desc
+  [PASS]   N=48 recon
+  [PASS]   N=48 orth
+  [PASS]   N=48 desc
+
+newton_schulz_invsqrt:
+  [PASS]   invsqrt identity
+  [PASS]   invsqrt shape
+
+batched_procrustes (full):
+  [PASS]   full method
+  [PASS]   full shape
+  [PASS]   full improved
+
+batched_procrustes (subspace):
+  [PASS]   subspace method
+  [PASS]   subspace rank
+  [PASS]   subspace shape
+  [PASS]   subspace improved
+
+batched_procrustes (batched):
+  [PASS]   batched shape
+  [PASS]   batched method
+
+==================================================
+SVD Triton size-sweep battery
+==================================================
+  loaded from: /usr/local/lib/python3.12/dist-packages/geolip_core/utils/kernel.py
+  python: 3.12.13
+  geolip_core package: /usr/local/lib/python3.12/dist-packages/geolip_core/__init__.py
+geolip.linalg backend:
+  CUDA:       yes
+  Triton:     3.6.0
+  FL eigh:    enabled
+  Triton SVD: enabled
+  GPU:        NVIDIA RTX PRO 6000 Blackwell Server Edition
+
+[auto / fp32]
+  [PASS]   fp32 2x2 dtype
+  [PASS]   fp32 2x2 recon
+  [PASS]   fp32 2x2 orth
+  [PASS]   fp32 2x2 desc
+  [PASS]   fp32 1024x2 dtype
+  [PASS]   fp32 1024x2 recon
+  [PASS]   fp32 1024x2 orth
+  [PASS]   fp32 1024x2 desc
+  [PASS]   fp32 2x3 dtype
+  [PASS]   fp32 2x3 recon
+  [PASS]   fp32 2x3 orth
+  [PASS]   fp32 2x3 desc
+  [PASS]   fp32 3x2 dtype
+  [PASS]   fp32 3x2 recon
+  [PASS]   fp32 3x2 orth
+  [PASS]   fp32 3x2 desc
+  [PASS]   fp32 1024x2 dtype
+  [PASS]   fp32 1024x2 recon
+  [PASS]   fp32 1024x2 orth
+  [PASS]   fp32 1024x2 desc
+  [PASS]   fp32 3x3 dtype
+  [PASS]   fp32 3x3 recon
+  [PASS]   fp32 3x3 orth
+  [PASS]   fp32 3x3 desc
+  [PASS]   fp32 1024x3 dtype
+  [PASS]   fp32 1024x3 recon
+  [PASS]   fp32 1024x3 orth
+  [PASS]   fp32 1024x3 desc
+  [PASS]   fp32 4x2 dtype
+  [PASS]   fp32 4x2 recon
+  [PASS]   fp32 4x2 orth
+  [PASS]   fp32 4x2 desc
+  [PASS]   fp32 1024x2 dtype
+  [PASS]   fp32 1024x2 recon
+  [PASS]   fp32 1024x2 orth
+  [PASS]   fp32 1024x2 desc
+  [PASS]   fp32 4x3 dtype
+  [PASS]   fp32 4x3 recon
+  [PASS]   fp32 4x3 orth
+  [PASS]   fp32 4x3 desc
+  [PASS]   fp32 1024x3 dtype
+  [PASS]   fp32 1024x3 recon
+  [PASS]   fp32 1024x3 orth
+  [PASS]   fp32 1024x3 desc
+  [PASS]   fp32 4x4 dtype
+  [PASS]   fp32 4x4 recon
+  [PASS]   fp32 4x4 orth
+  [PASS]   fp32 4x4 desc
+  [PASS]   fp32 1024x4 dtype
+  [PASS]   fp32 1024x4 recon
+  [PASS]   fp32 1024x4 orth
+  [PASS]   fp32 1024x4 desc
+  [PASS]   fp32 5x2 dtype
+  [PASS]   fp32 5x2 recon
+  [PASS]   fp32 5x2 orth
+  [PASS]   fp32 5x2 desc
+  [PASS]   fp32 1024x2 dtype
+  [PASS]   fp32 1024x2 recon
+  [PASS]   fp32 1024x2 orth
+  [PASS]   fp32 1024x2 desc
+  [PASS]   fp32 5x3 dtype
+  [PASS]   fp32 5x3 recon
+  [PASS]   fp32 5x3 orth
+  [PASS]   fp32 5x3 desc
+  [PASS]   fp32 1024x3 dtype
+  [PASS]   fp32 1024x3 recon
+  [PASS]   fp32 1024x3 orth
+  [PASS]   fp32 1024x3 desc
+  [PASS]   fp32 5x4 dtype
+  [PASS]   fp32 5x4 recon
+  [PASS]   fp32 5x4 orth
+  [PASS]   fp32 5x4 desc
+  [PASS]   fp32 1024x4 dtype
+  [PASS]   fp32 1024x4 recon
+  [PASS]   fp32 1024x4 orth
+  [PASS]   fp32 1024x4 desc
+  [PASS]   fp32 5x5 dtype
+  [PASS]   fp32 5x5 recon
+  [PASS]   fp32 5x5 orth
+  [PASS]   fp32 5x5 desc
+  [PASS]   fp32 1024x5 dtype
+  [PASS]   fp32 1024x5 recon
+  [PASS]   fp32 1024x5 orth
+  [PASS]   fp32 1024x5 desc
+  [PASS]   fp32 6x2 dtype
+  [PASS]   fp32 6x2 recon
+  [PASS]   fp32 6x2 orth
+  [PASS]   fp32 6x2 desc
+  [PASS]   fp32 1024x2 dtype
+  [PASS]   fp32 1024x2 recon
+  [PASS]   fp32 1024x2 orth
+  [PASS]   fp32 1024x2 desc
+  [PASS]   fp32 6x3 dtype
+  [PASS]   fp32 6x3 recon
+  [PASS]   fp32 6x3 orth
+  [PASS]   fp32 6x3 desc
+  [PASS]   fp32 1024x3 dtype
+  [PASS]   fp32 1024x3 recon
+  [PASS]   fp32 1024x3 orth
+  [PASS]   fp32 1024x3 desc
+  [PASS]   fp32 6x4 dtype
+  [PASS]   fp32 6x4 recon
+  [PASS]   fp32 6x4 orth
+  [PASS]   fp32 6x4 desc
+  [PASS]   fp32 1024x4 dtype
+  [PASS]   fp32 1024x4 recon
+  [PASS]   fp32 1024x4 orth
+  [PASS]   fp32 1024x4 desc
+  [PASS]   fp32 6x5 dtype
+  [PASS]   fp32 6x5 recon
+  [PASS]   fp32 6x5 orth
+  [PASS]   fp32 6x5 desc
+  [PASS]   fp32 1024x5 dtype
+  [PASS]   fp32 1024x5 recon
+  [PASS]   fp32 1024x5 orth
+  [PASS]   fp32 1024x5 desc
+  [PASS]   fp32 6x6 dtype
+  [PASS]   fp32 6x6 recon
+  [PASS]   fp32 6x6 orth
+  [PASS]   fp32 6x6 desc
+  [PASS]   fp32 1024x6 dtype
+  [PASS]   fp32 1024x6 recon
+  [PASS]   fp32 1024x6 orth
+  [PASS]   fp32 1024x6 desc
+
+[auto / fp64]
+  [PASS]   fp64 2x2 dtype
+  [PASS]   fp64 2x2 recon
+  [PASS]   fp64 2x2 orth
+  [PASS]   fp64 2x2 desc
+  [PASS]   fp64 1024x2 dtype
+  [PASS]   fp64 1024x2 recon
+  [PASS]   fp64 1024x2 orth
+  [PASS]   fp64 1024x2 desc
+  [PASS]   fp64 2x3 dtype
+  [PASS]   fp64 2x3 recon
+  [PASS]   fp64 2x3 orth
+  [PASS]   fp64 2x3 desc
+  [PASS]   fp64 3x2 dtype
+  [PASS]   fp64 3x2 recon
+  [PASS]   fp64 3x2 orth
+  [PASS]   fp64 3x2 desc
+  [PASS]   fp64 1024x2 dtype
+  [PASS]   fp64 1024x2 recon
+  [PASS]   fp64 1024x2 orth
+  [PASS]   fp64 1024x2 desc
+  [PASS]   fp64 3x3 dtype
+  [PASS]   fp64 3x3 recon
+  [PASS]   fp64 3x3 orth
+  [PASS]   fp64 3x3 desc
+  [PASS]   fp64 1024x3 dtype
+  [PASS]   fp64 1024x3 recon
+  [PASS]   fp64 1024x3 orth
+  [PASS]   fp64 1024x3 desc
+  [PASS]   fp64 4x2 dtype
+  [PASS]   fp64 4x2 recon
+  [PASS]   fp64 4x2 orth
+  [PASS]   fp64 4x2 desc
+  [PASS]   fp64 1024x2 dtype
+  [PASS]   fp64 1024x2 recon
+  [PASS]   fp64 1024x2 orth
+  [PASS]   fp64 1024x2 desc
+  [PASS]   fp64 4x3 dtype
+  [PASS]   fp64 4x3 recon
+  [PASS]   fp64 4x3 orth
+  [PASS]   fp64 4x3 desc
+  [PASS]   fp64 1024x3 dtype
+  [PASS]   fp64 1024x3 recon
+  [PASS]   fp64 1024x3 orth
+  [PASS]   fp64 1024x3 desc
+  [PASS]   fp64 4x4 dtype
+  [PASS]   fp64 4x4 recon
+  [PASS]   fp64 4x4 orth
+  [PASS]   fp64 4x4 desc
+  [PASS]   fp64 1024x4 dtype
+  [PASS]   fp64 1024x4 recon
+  [PASS]   fp64 1024x4 orth
+  [PASS]   fp64 1024x4 desc
+  [PASS]   fp64 5x2 dtype
+  [PASS]   fp64 5x2 recon
+  [PASS]   fp64 5x2 orth
+  [PASS]   fp64 5x2 desc
+  [PASS]   fp64 1024x2 dtype
+  [PASS]   fp64 1024x2 recon
+  [PASS]   fp64 1024x2 orth
+  [PASS]   fp64 1024x2 desc
+  [PASS]   fp64 5x3 dtype
+  [PASS]   fp64 5x3 recon
+  [PASS]   fp64 5x3 orth
+  [PASS]   fp64 5x3 desc
+  [PASS]   fp64 1024x3 dtype
+  [PASS]   fp64 1024x3 recon
+  [PASS]   fp64 1024x3 orth
+  [PASS]   fp64 1024x3 desc
+  [PASS]   fp64 5x4 dtype
+  [PASS]   fp64 5x4 recon
+  [PASS]   fp64 5x4 orth
+  [PASS]   fp64 5x4 desc
+  [PASS]   fp64 1024x4 dtype
+  [PASS]   fp64 1024x4 recon
+  [PASS]   fp64 1024x4 orth
+  [PASS]   fp64 1024x4 desc
+  [PASS]   fp64 5x5 dtype
+  [PASS]   fp64 5x5 recon
+  [PASS]   fp64 5x5 orth
+  [PASS]   fp64 5x5 desc
+  [PASS]   fp64 1024x5 dtype
+  [PASS]   fp64 1024x5 recon
+  [PASS]   fp64 1024x5 orth
+  [PASS]   fp64 1024x5 desc
+  [PASS]   fp64 6x2 dtype
+  [PASS]   fp64 6x2 recon
+  [PASS]   fp64 6x2 orth
+  [PASS]   fp64 6x2 desc
+  [PASS]   fp64 1024x2 dtype
+  [PASS]   fp64 1024x2 recon
+  [PASS]   fp64 1024x2 orth
+  [PASS]   fp64 1024x2 desc
+  [PASS]   fp64 6x3 dtype
+  [PASS]   fp64 6x3 recon
+  [PASS]   fp64 6x3 orth
+  [PASS]   fp64 6x3 desc
+  [PASS]   fp64 1024x3 dtype
+  [PASS]   fp64 1024x3 recon
+  [PASS]   fp64 1024x3 orth
+  [PASS]   fp64 1024x3 desc
+  [PASS]   fp64 6x4 dtype
+  [PASS]   fp64 6x4 recon
+  [PASS]   fp64 6x4 orth
+  [PASS]   fp64 6x4 desc
+  [PASS]   fp64 1024x4 dtype
+  [PASS]   fp64 1024x4 recon
+  [PASS]   fp64 1024x4 orth
+  [PASS]   fp64 1024x4 desc
+  [PASS]   fp64 6x5 dtype
+  [PASS]   fp64 6x5 recon
+  [PASS]   fp64 6x5 orth
+  [PASS]   fp64 6x5 desc
+  [PASS]   fp64 1024x5 dtype
+  [PASS]   fp64 1024x5 recon
+  [PASS]   fp64 1024x5 orth
+  [PASS]   fp64 1024x5 desc
+  [PASS]   fp64 6x6 dtype
+  [PASS]   fp64 6x6 recon
+  [PASS]   fp64 6x6 orth
+  [PASS]   fp64 6x6 desc
+  [PASS]   fp64 1024x6 dtype
+  [PASS]   fp64 1024x6 recon
+  [PASS]   fp64 1024x6 orth
+  [PASS]   fp64 1024x6 desc
+
+[convergence sweep — backend.resolve_svd_nN]
+  fp32 N=3: it=2:9.66e-09 it=4:9.82e-09 it=6:9.82e-09 it=8:9.82e-09 it=12:9.82e-09
+  [PASS]   fp32 N=3 convergence monotone
+  fp32 N=4: it=2:1.57e-08 it=4:1.86e-08 it=6:1.86e-08 it=8:1.86e-08 it=12:1.86e-08
+  [PASS]   fp32 N=4 convergence monotone
+  fp32 N=5: it=2:1.66e-08 it=4:2.40e-08 it=6:2.40e-08 it=8:2.40e-08 it=12:2.40e-08
+  [PASS]   fp32 N=5 convergence monotone
+  fp32 N=6: it=2:1.98e-08 it=4:2.94e-08 it=6:2.95e-08 it=8:2.95e-08 it=12:2.95e-08
+  [PASS]   fp32 N=6 convergence monotone
+  fp64 N=3: it=2:3.12e-14 it=4:3.12e-14 it=6:3.12e-14 it=8:3.12e-14 it=12:3.12e-14
+  [PASS]   fp64 N=3 convergence monotone
+  fp64 N=4: it=2:3.13e-14 it=4:3.12e-14 it=6:3.12e-14 it=8:3.12e-14 it=12:3.12e-14
+  [PASS]   fp64 N=4 convergence monotone
+  fp64 N=5: it=2:3.13e-14 it=4:3.12e-14 it=6:3.12e-14 it=8:3.12e-14 it=12:3.12e-14
+  [PASS]   fp64 N=5 convergence monotone
+  fp64 N=6: it=2:3.13e-14 it=4:3.12e-14 it=6:3.12e-14 it=8:3.12e-14 it=12:3.12e-14
+  [PASS]   fp64 N=6 convergence monotone
+
+[backend toggle — Triton OFF, FL OFF]
+  [PASS]   off/fp32 2x2 recon
+  [PASS]   off/fp32 2x2 orth
+  [PASS]   off/fp32 2x2 desc
+  [PASS]   off/fp32 2x3 recon
+  [PASS]   off/fp32 2x3 orth
+  [PASS]   off/fp32 2x3 desc
+  [PASS]   off/fp32 3x2 recon
+  [PASS]   off/fp32 3x2 orth
+  [PASS]   off/fp32 3x2 desc
+  [PASS]   off/fp32 3x3 recon
+  [PASS]   off/fp32 3x3 orth
+  [PASS]   off/fp32 3x3 desc
+  [PASS]   off/fp32 4x2 recon
+  [PASS]   off/fp32 4x2 orth
+  [PASS]   off/fp32 4x2 desc
+  [PASS]   off/fp32 4x3 recon
+  [PASS]   off/fp32 4x3 orth
+  [PASS]   off/fp32 4x3 desc
+  [PASS]   off/fp32 4x4 recon
+  [PASS]   off/fp32 4x4 orth
+  [PASS]   off/fp32 4x4 desc
+  [PASS]   off/fp32 5x2 recon
+  [PASS]   off/fp32 5x2 orth
+  [PASS]   off/fp32 5x2 desc
+  [PASS]   off/fp32 5x3 recon
+  [PASS]   off/fp32 5x3 orth
+  [PASS]   off/fp32 5x3 desc
+  [PASS]   off/fp32 5x4 recon
+  [PASS]   off/fp32 5x4 orth
+  [PASS]   off/fp32 5x4 desc
+  [PASS]   off/fp32 5x5 recon
+  [PASS]   off/fp32 5x5 orth
+  [PASS]   off/fp32 5x5 desc
+  [PASS]   off/fp32 6x2 recon
+  [PASS]   off/fp32 6x2 orth
+  [PASS]   off/fp32 6x2 desc
+  [PASS]   off/fp32 6x3 recon
+  [PASS]   off/fp32 6x3 orth
+  [PASS]   off/fp32 6x3 desc
+  [PASS]   off/fp32 6x4 recon
+  [PASS]   off/fp32 6x4 orth
+  [PASS]   off/fp32 6x4 desc
+  [PASS]   off/fp32 6x5 recon
+  [PASS]   off/fp32 6x5 orth
+  [PASS]   off/fp32 6x5 desc
+  [PASS]   off/fp32 6x6 recon
+  [PASS]   off/fp32 6x6 orth
+  [PASS]   off/fp32 6x6 desc
+  [PASS]   off/fp64 2x2 recon
+  [PASS]   off/fp64 2x2 orth
+  [PASS]   off/fp64 2x2 desc
+  [PASS]   off/fp64 2x3 recon
+  [PASS]   off/fp64 2x3 orth
+  [PASS]   off/fp64 2x3 desc
+  [PASS]   off/fp64 3x2 recon
+  [PASS]   off/fp64 3x2 orth
+  [PASS]   off/fp64 3x2 desc
+  [PASS]   off/fp64 3x3 recon
+  [PASS]   off/fp64 3x3 orth
+  [PASS]   off/fp64 3x3 desc
+  [PASS]   off/fp64 4x2 recon
+  [PASS]   off/fp64 4x2 orth
+  [PASS]   off/fp64 4x2 desc
+  [PASS]   off/fp64 4x3 recon
+  [PASS]   off/fp64 4x3 orth
+  [PASS]   off/fp64 4x3 desc
+  [PASS]   off/fp64 4x4 recon
+  [PASS]   off/fp64 4x4 orth
+  [PASS]   off/fp64 4x4 desc
+  [PASS]   off/fp64 5x2 recon
+  [PASS]   off/fp64 5x2 orth
+  [PASS]   off/fp64 5x2 desc
+  [PASS]   off/fp64 5x3 recon
+  [PASS]   off/fp64 5x3 orth
+  [PASS]   off/fp64 5x3 desc
+  [PASS]   off/fp64 5x4 recon
+  [PASS]   off/fp64 5x4 orth
+  [PASS]   off/fp64 5x4 desc
+  [PASS]   off/fp64 5x5 recon
+  [PASS]   off/fp64 5x5 orth
+  [PASS]   off/fp64 5x5 desc
+  [PASS]   off/fp64 6x2 recon
+  [PASS]   off/fp64 6x2 orth
+  [PASS]   off/fp64 6x2 desc
+  [PASS]   off/fp64 6x3 recon
+  [PASS]   off/fp64 6x3 orth
+  [PASS]   off/fp64 6x3 desc
+  [PASS]   off/fp64 6x4 recon
+  [PASS]   off/fp64 6x4 orth
+  [PASS]   off/fp64 6x4 desc
+  [PASS]   off/fp64 6x5 recon
+  [PASS]   off/fp64 6x5 orth
+  [PASS]   off/fp64 6x5 desc
+  [PASS]   off/fp64 6x6 recon
+  [PASS]   off/fp64 6x6 orth
+  [PASS]   off/fp64 6x6 desc
+
+[bench / fp32]  B=512 M=1024
+       shape |   cuSOLVER |       auto |     triton |  speedup
+  ----------------------------------------------------------------
+  1024x2  |    79.83ms |     16.0us |     15.8us | 5038.8x
+  1024x3  |   121.90ms |     16.1us |     16.1us | 7586.9x
+  1024x4  |   128.28ms |     22.6us |     22.6us | 5674.6x
+  1024x5  |   147.76ms |     30.8us |     30.8us | 4796.2x
+  1024x6  |   156.36ms |     57.4us |     57.4us | 2724.4x
+
+[bench / fp64]  B=512 M=1024
+       shape |   cuSOLVER |       auto |     triton |  speedup
+  ----------------------------------------------------------------
+  1024x2  |   292.32ms |     37.0us |     37.0us | 7897.5x
+  1024x3  |   506.73ms |    190.6us |    190.5us | 2659.8x
+  1024x4  |   546.93ms |    376.3us |    376.3us | 1453.4x
+  1024x5  |   631.52ms |    647.2us |    647.4us |  975.4x
+  1024x6  |   693.55ms |     1.94ms |     1.94ms |  356.8x
+
+[bench / batch scaling — fp32, M=1024, N=6]
+       B |   cuSOLVER |     triton |  speedup
+  --------------------------------------------
+     256 |    78.14ms |     46.2us | 1692.7x
+     512 |   155.61ms |     57.7us | 2694.9x
+    1024 |   311.46ms |    101.0us | 3084.1x
+    2048 |   624.57ms |    166.2us | 3757.2x
+    4096 |     1.248s |    307.3us | 4060.8x
+    8192 |     2.502s |    567.0us | 4413.6x
+
+==================================================
+  437/437 passed  — all clear
+==================================================
