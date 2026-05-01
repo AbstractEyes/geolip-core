@@ -14,6 +14,6 @@ Quick start:
     from geolip_core.utils import gram_eigh_svd, batched_procrustes
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 import sys
 sys.modules['geolip'] = sys.modules[__name__]
