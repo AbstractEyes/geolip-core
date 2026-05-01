@@ -84,22 +84,49 @@ class _Backend:
         return torch.linalg.eigh(A)
 
     def resolve_svd_n2(self, A, block_m=128):
-        """Triton SVD for N=2, or torch fallback."""
+        """Triton SVD for N=2 (fp32/fp64), or torch fallback."""
         if self.use_triton and self._triton and A.is_cuda:
             from geolip_core.utils.kernel import batched_svd2
             return batched_svd2(A, block_m)
         if not self._triton:
             self.warn('svd2')
-        return torch.linalg.svd(A.float(), full_matrices=False)
+        return torch.linalg.svd(A, full_matrices=False)
 
-    def resolve_svd_n3(self, A, block_m=128):
-        """Triton SVD for N=3, or torch fallback."""
+    def resolve_svd_n3(self, A, block_m=128, jacobi_iters=6):
+        """Triton SVD for N=3 (fp32/fp64), or torch fallback."""
         if self.use_triton and self._triton and A.is_cuda:
             from geolip_core.utils.kernel import batched_svd3
-            return batched_svd3(A, block_m)
+            return batched_svd3(A, block_m, jacobi_iters)
         if not self._triton:
             self.warn('svd3')
-        return torch.linalg.svd(A.float(), full_matrices=False)
+        return torch.linalg.svd(A, full_matrices=False)
+
+    def resolve_svd_n4(self, A, block_m=128, jacobi_iters=6):
+        """Triton SVD for N=4 (fp32/fp64), or torch fallback."""
+        if self.use_triton and self._triton and A.is_cuda:
+            from geolip_core.utils.kernel import batched_svd4
+            return batched_svd4(A, block_m, jacobi_iters)
+        if not self._triton:
+            self.warn('svd4')
+        return torch.linalg.svd(A, full_matrices=False)
+
+    def resolve_svd_n5(self, A, block_m=128, jacobi_iters=6):
+        """Triton SVD for N=5 (fp32/fp64), or torch fallback."""
+        if self.use_triton and self._triton and A.is_cuda:
+            from geolip_core.utils.kernel import batched_svd5
+            return batched_svd5(A, block_m, jacobi_iters)
+        if not self._triton:
+            self.warn('svd5')
+        return torch.linalg.svd(A, full_matrices=False)
+
+    def resolve_svd_n6(self, A, block_m=128, jacobi_iters=6):
+        """Triton SVD for N=6 (fp32/fp64), or torch fallback."""
+        if self.use_triton and self._triton and A.is_cuda:
+            from geolip_core.utils.kernel import batched_svd6
+            return batched_svd6(A, block_m, jacobi_iters)
+        if not self._triton:
+            self.warn('svd6')
+        return torch.linalg.svd(A, full_matrices=False)
 
     def status(self):
         """Print backend status."""
