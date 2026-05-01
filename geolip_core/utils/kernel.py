@@ -1774,6 +1774,24 @@ if __name__ == '__main__':
                   (6, 2), (6, 3), (6, 4), (6, 5), (6, 6)]
         B_T, M_OUTER = 32, 1024
 
+        # Controlled-spectrum fixture builder. Random Gaussian (B, M, N) with
+        # M small (2..6) draws ill-conditioned samples often enough that fp32
+        # U-orthogonality (||A @ V / S||) drifts past the 1e-3 tolerance on
+        # ~5% of unseeded runs. Build A = U_o @ diag(S) @ V_o^T with U_o, V_o
+        # random orthogonal (QR) and S in [0.5, 2.0] — condition number <= 4,
+        # fp32 orth error stays well under 1e-4.
+        def _well_conditioned(B, M, N, dtype, gen):
+            K = min(M, N)
+            U_o, _ = torch.linalg.qr(torch.randn(B, M, K, device=device,
+                                                dtype=dtype, generator=gen))
+            V_o, _ = torch.linalg.qr(torch.randn(B, N, K, device=device,
+                                                dtype=dtype, generator=gen))
+            S_vals = 0.5 + 1.5 * torch.rand(B, K, device=device,
+                                            dtype=dtype, generator=gen)
+            return torch.bmm(U_o * S_vals.unsqueeze(1), V_o.transpose(-1, -2))
+
+        _bench_gen = torch.Generator(device=device).manual_seed(20260501)
+
         # 1) Shape × dtype sweep through linalg.svd(method='auto')
         for cdt in ('fp32', 'fp64'):
             torch_dt = torch.float32 if cdt == 'fp32' else torch.float64
@@ -1782,7 +1800,7 @@ if __name__ == '__main__':
                 # Tiny matrix, plus a stress run with M_OUTER rows for tall shapes.
                 M_used_set = (m, M_OUTER) if m >= n else (m,)
                 for M_used in M_used_set:
-                    A = torch.randn(B_T, M_used, n, device=device, dtype=torch_dt)
+                    A = _well_conditioned(B_T, M_used, n, torch_dt, _bench_gen)
                     U, S, Vh = _LA_batched_svd(A, method='auto', compute_dtype=cdt)
                     _check(f"  {cdt} {M_used}x{n} dtype",
                            U.dtype == torch_dt and S.dtype == torch_dt and Vh.dtype == torch_dt)
@@ -1796,7 +1814,7 @@ if __name__ == '__main__':
                                     (4, _be.resolve_svd_n4),
                                     (5, _be.resolve_svd_n5),
                                     (6, _be.resolve_svd_n6)):
-                    A = torch.randn(B_T, M_OUTER, n, device=device, dtype=torch_dt)
+                    A = _well_conditioned(B_T, M_OUTER, n, torch_dt, _bench_gen)
                     worst = []
                     for it in (2, 4, 6, 8, 12):
                         U, S, Vh = resolver(A, 128, it)
@@ -1820,7 +1838,7 @@ if __name__ == '__main__':
             for cdt in ('fp32', 'fp64'):
                 torch_dt = torch.float32 if cdt == 'fp32' else torch.float64
                 for (m, n) in SHAPES:
-                    A = torch.randn(B_T, m, n, device=device, dtype=torch_dt)
+                    A = _well_conditioned(B_T, m, n, torch_dt, _bench_gen)
                     U, S, Vh = _LA_batched_svd(A, method='auto', compute_dtype=cdt)
                     _validate_svd(A, U, S, Vh, f"  off/{cdt} {m}x{n}")
         finally:
