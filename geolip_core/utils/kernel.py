@@ -1640,13 +1640,18 @@ if __name__ == '__main__':
             print(f"  [FAIL] {name}  {detail}")
 
     def _validate_svd(A, U, S, Vh, label):
-        """Check reconstruction, orthogonality, descending S."""
+        """Check reconstruction, orthogonality, descending S.
+
+        Thin SVD: U is (B, M, K), S is (B, K), Vh is (B, K, N) where K = min(M, N).
+        Orthogonality: U^T U = I_K (M >= N case) and Vh Vh^T = I_K (M < N case).
+        """
         B, M, N = A.shape
+        K = U.shape[-1]
         recon = torch.bmm(U * S.unsqueeze(1), Vh)
         recon_err = (A.float() - recon).pow(2).mean().sqrt().item()
         UtU = torch.bmm(U.transpose(1, 2), U)
-        I_N = torch.eye(N, device=A.device).unsqueeze(0)
-        orth_err = (UtU - I_N).pow(2).mean().sqrt().item()
+        I_K = torch.eye(K, device=A.device, dtype=UtU.dtype).unsqueeze(0)
+        orth_err = (UtU - I_K).pow(2).mean().sqrt().item()
         desc = (S[:, :-1] >= S[:, 1:] - 1e-5).all().item()
         _check(f"{label} recon",  recon_err < 1e-3, f"err={recon_err:.2e}")
         _check(f"{label} orth",   orth_err < 1e-3,  f"err={orth_err:.2e}")
