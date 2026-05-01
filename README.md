@@ -15,7 +15,7 @@ pip install "git+https://github.com/AbstractEyes/geofractal.git"
 pip install "git+https://github.com/AbstractEyes/geolip-core.git"
 ```
 
-Triton is optional -- fused SVD kernels activate automatically if installed. CuPy is optional -- CUDA eigendecomposition kernels activate if installed. Everything falls back to PyTorch without either.
+Triton is optional -- fused SVD kernels (N=2..6, fp32 and fp64) activate automatically if installed. CuPy is optional -- CUDA eigendecomposition kernels activate if installed. Everything falls back to PyTorch without either.
 
 ## Architecture
 
@@ -147,7 +147,7 @@ geolip_core/
 │   └── geometric.py                   cv_metric, knn_accuracy, analyze_svd_model
 │
 ├── utils/                         Engineering infrastructure
-│   ├── kernel.py                      Triton SVD N=2,3, gram_eigh, Procrustes math
+│   ├── kernel.py                      Triton SVD N=2..6 (fp32 + fp64), gram_eigh, Procrustes math
 │   ├── cuda/                          CuPy/NVRTC eigendecomposition kernels
 │   ├── triton/                        Generated Triton kernels (experimental)
 │   └── memory.py                      EmbeddingBuffer
@@ -217,8 +217,14 @@ pipe.attach('curate_gate', CurateCMGate('curate_gate', 32, 256, strategy='top_k'
 import geolip_core.linalg as LA
 
 # Our implementations (auto-dispatch to best available)
-vals, vecs = LA.eigh(A)           # FL pipeline n<=12, cuSOLVER n>12
-U, S, Vh = LA.svd(A)              # Triton n=2,3 -> FL n<=12 -> cuSOLVER
+vals, vecs = LA.eigh(A)                        # FL pipeline n<=12, cuSOLVER n>12
+U, S, Vh = LA.svd(A)                           # Triton N=2..6 (fp32 / fp64) -> FL N<=12 -> cuSOLVER
+U, S, Vh = LA.svd(A, compute_dtype='fp64')     # fp64 honored end-to-end on the Triton path
+U, S, Vh = LA.svd(A_wide_2x3)                  # wide shapes (M < N) handled transparently
+
+# Direct kernel access (skip the dispatcher)
+from geolip_core.utils.kernel import batched_svd2, batched_svd3, batched_svd4, batched_svd5, batched_svd6
+U, S, Vh = batched_svd6(A, jacobi_iters=12)    # one program per batch, fp32 / fp64
 
 # These pass through to torch.linalg (zero overhead)
 x = LA.solve(A, b)
@@ -227,7 +233,8 @@ n = LA.norm(x)
 
 # Configuration
 LA.backend.status()               # print available features
-LA.backend.use_fl_eigh = False    # disable FL, use cuSOLVER everywhere
+LA.backend.use_triton  = False    # force the eigh-based fallback path
+LA.backend.use_fl_eigh = False    # disable FL, use cuSOLVER (torch.linalg.eigh)
 ```
 
 ### Core Modules Directly
@@ -311,7 +318,7 @@ Drop-in `torch.linalg` replacement with geometric optimizations. Anything not ov
 | Function | Implementation | Performance |
 |---|---|---|
 | `eigh(A)` | FL Hybrid (n<=12), cuSOLVER fallback | 84/84 purity, 40x less memory, zero graph breaks |
-| `svd(A)` | Triton N=2,3 -> FL eigh N<=12 -> cuSOLVER | 3,850x at N=2, compilable |
+| `svd(A)` | Triton N=2..6 (fp32 + fp64) -> FL eigh N<=12 -> cuSOLVER | up to 7,587x vs cuSOLVER (N=3 fp32, B=512, M=1024); fp64 path 357x-7898x |
 | `newton_schulz_invsqrt(G)` | Pure bmm iteration | Zero eigensolvers, quadratic convergence |
 | `procrustes(src, tgt)` | Subspace-preserving rotation | 1.000 NN agreement at N=32-128 |
 | Everything else | `torch.linalg` passthrough | Zero overhead |
@@ -343,6 +350,65 @@ Benchmarked on NVIDIA RTX PRO 6000 Blackwell (B=4,096, n=6):
 | CUDA kernel (n=6, B=16K) | 429 us | 1.73x | 0.7 MB |
 | CUDA kernel (n=3, B=4K) | 45 us | 3.06x | 0.7 MB |
 
+### Triton SVD Kernels (N=2..6)
+
+Fused per-batch Triton kernels for thin SVD on small N. One program per
+batch element. Single-pass cyclic Jacobi on the N x N Gram with scalar
+register accumulators -- 1 pair (closed form) for N=2, 3 pairs/sweep for
+N=3, up to 15 pairs/sweep for N=6. fp32 and fp64 share the same kernel
+body via a `DTYPE: tl.constexpr`. Wide shapes (M < N) are handled by a
+transparent transpose shim. Default `jacobi_iters` is 6 for N<=5 and 12
+for N=6.
+
+Public API:
+
+```python
+from geolip_core.utils.kernel import (
+    batched_svd2, batched_svd3, batched_svd4, batched_svd5, batched_svd6,
+)
+# All accept (B, M, N) with M >= N, fp32 or fp64. Output dtype matches input.
+U, S, Vh = batched_svd5(A, block_m=128, jacobi_iters=6)
+
+# Or via the dispatcher (also handles N <= 12 fallback):
+import geolip_core.linalg as LA
+U, S, Vh = LA.svd(A, method='auto', compute_dtype='fp64')
+```
+
+Throughput on NVIDIA RTX PRO 6000 Blackwell, B=512, M=1024, mean over 200 iterations:
+
+| Shape | cuSOLVER fp32 | Triton fp32 | speedup | cuSOLVER fp64 | Triton fp64 | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| 1024x2 | 79.83ms | **15.8us** | 5,039x | 292.32ms | **37.0us** | 7,898x |
+| 1024x3 | 121.90ms | **16.1us** | 7,587x | 506.73ms | **190.5us** | 2,660x |
+| 1024x4 | 128.28ms | **22.6us** | 5,675x | 546.93ms | **376.3us** | 1,453x |
+| 1024x5 | 147.76ms | **30.8us** | 4,796x | 631.52ms | **647.4us** | 975x |
+| 1024x6 | 156.36ms | **57.4us** | 2,724x | 693.55ms | **1.94ms** | 357x |
+
+Batch scaling (M=1024, N=6, fp32):
+
+| B | cuSOLVER | Triton | speedup |
+|---:|---:|---:|---:|
+| 256 | 78.14ms | 46.2us | 1,693x |
+| 512 | 155.61ms | 57.7us | 2,695x |
+| 1,024 | 311.46ms | 101.0us | 3,084x |
+| 2,048 | 624.57ms | 166.2us | 3,757x |
+| 4,096 | 1.248s | 307.3us | 4,061x |
+| 8,192 | 2.502s | 567.0us | **4,414x** |
+
+Numerical floor (Jacobi at machine epsilon, M=1024, B=32):
+
+| dtype | recon RMS at iter=12 |
+|---|---:|
+| fp32 | ~1e-8 (machine eps) |
+| fp64 | ~3e-14 (machine eps) |
+
+Convergence saturates by iter=4 in both precisions; default `jacobi_iters`
+is set conservatively above the saturation point. The fp64 path runs
+fully in fp64 -- no fp32 round-trip -- so error stays at machine epsilon.
+
+Reproduce: `python -m geolip_core.utils.kernel` (runs the full battery
+of 437 correctness checks plus the throughput tables).
+
 ## Empirical Results
 
 | System | Metric | Value |
@@ -357,6 +423,11 @@ Benchmarked on NVIDIA RTX PRO 6000 Blackwell (B=4,096, n=6):
 | **FL Eigh** | Mathematical purity | 84/84 |
 | | vs cuSOLVER speed | 1.73x faster (CUDA kernel) |
 | | vs cuSOLVER memory | 40x less |
+| **Triton SVD (N=2..6)** | Coverage | N=2..6, fp32 + fp64, wide shapes |
+| | vs cuSOLVER (N=3 fp32) | 7,587x at B=512, M=1024 |
+| | vs cuSOLVER (N=6 fp32, B=8192) | 4,414x |
+| | vs cuSOLVER (N=2 fp64) | 7,898x |
+| | Numerical floor | machine epsilon (~1e-8 fp32, ~3e-14 fp64) |
 | **Procrustes survey** | Models analyzed | 17 |
 | | QK eigenvalue lock | 0.500 universal |
 | **GEOLIP-Bertenstein** | Retrieval | Perfect on 40K+ pairs, 1 epoch, 1 layer |
@@ -379,7 +450,7 @@ geofractal @ git+https://github.com/AbstractEyes/geofractal.git
 ```
 
 Optional:
-- `triton >= 2.1` -- fused SVD kernels for N=2,3
+- `triton >= 2.1` -- fused SVD kernels for N=2..6, fp32 and fp64
 - `cupy-cuda12x` -- CUDA eigendecomposition kernels via NVRTC
 - `kymatio` -- scattering transforms
 
