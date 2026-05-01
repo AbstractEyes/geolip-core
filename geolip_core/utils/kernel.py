@@ -140,9 +140,9 @@ try:
             a2 = tl.load(A_ptr + base + row_idx * 3 + 2, mask=mask, other=0.0).to(DTYPE)
             g00 += tl.sum(a0 * a0); g01 += tl.sum(a0 * a1); g02 += tl.sum(a0 * a2)
             g11 += tl.sum(a1 * a1); g12 += tl.sum(a1 * a2); g22 += tl.sum(a2 * a2)
-        v00 = 1.0; v01 = 0.0; v02 = 0.0
-        v10 = 0.0; v11 = 1.0; v12 = 0.0
-        v20 = 0.0; v21 = 0.0; v22 = 1.0
+        v00 = tl.full([], 1.0, dtype=DTYPE); v01 = tl.zeros([], dtype=DTYPE); v02 = tl.zeros([], dtype=DTYPE)
+        v10 = tl.zeros([], dtype=DTYPE); v11 = tl.full([], 1.0, dtype=DTYPE); v12 = tl.zeros([], dtype=DTYPE)
+        v20 = tl.zeros([], dtype=DTYPE); v21 = tl.zeros([], dtype=DTYPE); v22 = tl.full([], 1.0, dtype=DTYPE)
         for _ in range(JACOBI_ITERS):
             # pair (0,1)
             off_diag = g01; diag_diff = g11 - g00; abs_off = tl.abs(off_diag)
@@ -151,7 +151,7 @@ try:
             c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
             ng00 = c*c*g00 - 2.0*s*c*g01 + s*s*g11; ng11 = s*s*g00 + 2.0*s*c*g01 + c*c*g11
             ng02 = c*g02 - s*g12; ng12 = s*g02 + c*g12
-            g00 = ng00; g11 = ng11; g01 = 0.0; g02 = ng02; g12 = ng12
+            g00 = ng00; g11 = ng11; g01 = tl.zeros([], dtype=DTYPE); g02 = ng02; g12 = ng12
             nv00 = c*v00 - s*v01; nv01 = s*v00 + c*v01
             nv10 = c*v10 - s*v11; nv11 = s*v10 + c*v11
             nv20 = c*v20 - s*v21; nv21 = s*v20 + c*v21
@@ -163,7 +163,7 @@ try:
             c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
             ng00 = c*c*g00 - 2.0*s*c*g02 + s*s*g22; ng22 = s*s*g00 + 2.0*s*c*g02 + c*c*g22
             ng01 = c*g01 - s*g12; ng12b = s*g01 + c*g12
-            g00 = ng00; g22 = ng22; g02 = 0.0; g01 = ng01; g12 = ng12b
+            g00 = ng00; g22 = ng22; g02 = tl.zeros([], dtype=DTYPE); g01 = ng01; g12 = ng12b
             nv00 = c*v00 - s*v02; nv02 = s*v00 + c*v02
             nv10 = c*v10 - s*v12; nv12 = s*v10 + c*v12
             nv20 = c*v20 - s*v22; nv22 = s*v20 + c*v22
@@ -175,7 +175,7 @@ try:
             c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
             ng11 = c*c*g11 - 2.0*s*c*g12 + s*s*g22; ng22 = s*s*g11 + 2.0*s*c*g12 + c*c*g22
             ng01 = c*g01 - s*g02; ng02b = s*g01 + c*g02
-            g11 = ng11; g22 = ng22; g12 = 0.0; g01 = ng01; g02 = ng02b
+            g11 = ng11; g22 = ng22; g12 = tl.zeros([], dtype=DTYPE); g01 = ng01; g02 = ng02b
             nv01 = c*v01 - s*v02; nv02 = s*v01 + c*v02
             nv11 = c*v11 - s*v12; nv12 = s*v11 + c*v12
             nv21 = c*v21 - s*v22; nv22 = s*v21 + c*v22
@@ -1372,8 +1372,14 @@ def batched_svd5(A, block_m=128, jacobi_iters=6):
     return U, S, Vh
 
 
-def batched_svd6(A, block_m=128, jacobi_iters=6):
+def batched_svd6(A, block_m=128, jacobi_iters=12):
     """Fused Triton SVD for (B, M, 6) tensors. fp32/fp64.
+
+    Default jacobi_iters=12: N=6 has 15 pairs/sweep; at fp32 the
+    accumulated rotation error from 6 sweeps left U^T U with ~4e-3
+    deviation on Blackwell (above the 1e-3 orth tolerance). 12 sweeps
+    (180 rotations) puts orth error well under 1e-3 with negligible
+    runtime cost vs. eigh fallback.
 
     Returns: U (B,M,6), S (B,6), Vh (B,6,6)
     """
