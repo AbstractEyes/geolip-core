@@ -1830,10 +1830,18 @@ if __name__ == '__main__':
         else:
             print("  (skipped — Triton disabled or CPU device)", flush=True)
 
-        # 3) Backend toggle: triton-off must still pass via torch.linalg.svd fallback
-        print("\n[backend toggle — Triton OFF]", flush=True)
+        # 3) Backend toggle: with BOTH specialized backends off, the auto path
+        # must produce correct results through gram_eigh_svd (torch.linalg.eigh,
+        # i.e. cuSOLVER). Disabling only Triton would leave FLEigh in play; FL's
+        # adjugate eigenvector recovery (eigh.py:125-135) loses precision with
+        # near-degenerate eigenvalues, which the controlled-spectrum fixture
+        # can produce by chance — that path is exercised by stage 1 already.
+        # This stage is specifically the "cuSOLVER fallback" regression.
+        print("\n[backend toggle — Triton OFF, FL OFF]", flush=True)
         saved_triton = _be.use_triton
+        saved_fl = _be.use_fl_eigh
         _be.use_triton = False
+        _be.use_fl_eigh = False
         try:
             for cdt in ('fp32', 'fp64'):
                 torch_dt = torch.float32 if cdt == 'fp32' else torch.float64
@@ -1843,6 +1851,7 @@ if __name__ == '__main__':
                     _validate_svd(A, U, S, Vh, f"  off/{cdt} {m}x{n}")
         finally:
             _be.use_triton = saved_triton
+            _be.use_fl_eigh = saved_fl
 
         # 4) Throughput benchmark — mirror geolip_core/utils/triton/fl_eigh_gen.py
         # Pattern: warmup w iters, time r iters, report per-iter mean. Informational
