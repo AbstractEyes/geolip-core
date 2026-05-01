@@ -1683,6 +1683,37 @@ if __name__ == '__main__':
         U3, S3, Vh3 = batched_svd3(A3)
         _validate_svd(A3, U3, S3, Vh3, "  N=3 triton")
 
+        # Direct-call tests for batched_svd4/5/6 — pin the wrapper contract
+        # (dtype propagation, output shapes, fallback) independently of the
+        # linalg.svd dispatcher.
+        for n_, fn_ in ((4, batched_svd4), (5, batched_svd5), (6, batched_svd6)):
+            print(f"\nbatched_svd{n_} (Triton):")
+            # fp32 default
+            A_ = torch.randn(B, M, n_, device=device, dtype=torch.float32)
+            U_, S_, Vh_ = fn_(A_)
+            _check(f"  N={n_} triton fp32 dtype",
+                   U_.dtype == torch.float32 and S_.dtype == torch.float32 and Vh_.dtype == torch.float32)
+            _validate_svd(A_, U_, S_, Vh_, f"  N={n_} triton fp32")
+            # fp64 default
+            A_ = torch.randn(B, M, n_, device=device, dtype=torch.float64)
+            U_, S_, Vh_ = fn_(A_)
+            _check(f"  N={n_} triton fp64 dtype",
+                   U_.dtype == torch.float64 and S_.dtype == torch.float64 and Vh_.dtype == torch.float64)
+            _validate_svd(A_, U_, S_, Vh_, f"  N={n_} triton fp64")
+            # Tighter jacobi_iters knob — must converge at least as well.
+            A_ = torch.randn(B, M, n_, device=device, dtype=torch.float32)
+            U_, S_, Vh_ = fn_(A_, jacobi_iters=12)
+            _validate_svd(A_, U_, S_, Vh_, f"  N={n_} triton fp32 JI=12")
+            # Unsupported dtype routes to torch.linalg.svd fallback (no crash,
+            # output dtype matches input).
+            A_ = torch.randn(B, M, n_, device=device, dtype=torch.float16)
+            U_, S_, Vh_ = fn_(A_)
+            _check(f"  N={n_} fp16 fallback dtype",
+                   U_.dtype == torch.float16 and S_.dtype == torch.float16 and Vh_.dtype == torch.float16)
+            recon_ = torch.bmm(U_ * S_.unsqueeze(1), Vh_)
+            recon_err_ = (A_.float() - recon_.float()).pow(2).mean().sqrt().item()
+            _check(f"  N={n_} fp16 fallback recon", recon_err_ < 5e-3, f"err={recon_err_:.2e}")
+
     # ── gram_eigh_svd directly ──
     print("\ngram_eigh_svd:")
     for N in [4, 24, 48]:
