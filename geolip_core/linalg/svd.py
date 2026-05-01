@@ -2,10 +2,13 @@
 Batched thin SVD with auto-dispatch and FL eigh integration.
 
 Dispatch order:
-  N=2..6, Triton + CUDA:  Fused Triton kernel    (fp32 or fp64)
-  N<=12, CUDA:            Gram + FL eigh          compilable, 70/72 purity
-  N>12 or CPU:            Gram + torch.linalg.eigh
-  Any fallback:           torch.linalg.svd
+  N=2..6, Triton + CUDA:        Fused Triton kernel  (fp32 or fp64)
+  N<=12, CUDA, fp32:            Gram + FL eigh       (compilable, 70/72 purity)
+  N<=12, CUDA, fp64:            Gram + torch.linalg.eigh
+                                (FLEigh returns fp32 V; using torch.linalg.eigh
+                                 keeps the precision the user asked for.)
+  N>12 or CPU:                  Gram + torch.linalg.eigh
+  Any fallback:                 torch.linalg.svd
 
 Wide shapes (M < N) are handled transparently: the input is transposed,
 the standard thin SVD is computed on the (now tall) transpose, and U / Vh
@@ -208,11 +211,15 @@ def batched_svd(
         return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype)
 
     # method == 'auto'
+    use_fp64 = (dt == torch.float64)
     if 2 <= N <= 6 and backend.use_triton and A.is_cuda:
         A_c = A.to(dt) if A.dtype != dt else A
         U, S, Vh = _triton_resolver(N)(A_c, block_m)
         return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype)
-    elif N <= _FL_MAX_N and backend.use_fl_eigh and A.is_cuda:
+    # FLEigh internally returns fp32 eigenvectors (eigh.py:135 `vec.float()`),
+    # which silently caps fp64 SVD orthogonality at ~1e-3 even with fp64 input.
+    # Skip FL when compute_dtype is fp64 — torch.linalg.eigh stays in fp64.
+    elif N <= _FL_MAX_N and backend.use_fl_eigh and A.is_cuda and not use_fp64:
         return gram_fl_eigh_svd(A, compute_dtype=compute_dtype)
     elif A.is_cuda:
         return gram_eigh_svd(A, compute_dtype=compute_dtype)
