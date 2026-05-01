@@ -119,8 +119,12 @@ class _Backend:
             self.warn('svd5')
         return torch.linalg.svd(A, full_matrices=False)
 
-    def resolve_svd_n6(self, A, block_m=128, jacobi_iters=6):
-        """Triton SVD for N=6 (fp32/fp64), or torch fallback."""
+    def resolve_svd_n6(self, A, block_m=128, jacobi_iters=12):
+        """Triton SVD for N=6 (fp32/fp64), or torch fallback.
+
+        Default jacobi_iters=12: N=6 needs more sweeps than smaller N at fp32
+        for U-orthogonality to clear ~1e-3.
+        """
         if self.use_triton and self._triton and A.is_cuda:
             from geolip_core.utils.kernel import batched_svd6
             return batched_svd6(A, block_m, jacobi_iters)
