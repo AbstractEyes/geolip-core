@@ -132,6 +132,31 @@ class _Backend:
             self.warn('svd6')
         return torch.linalg.svd(A, full_matrices=False)
 
+    def resolve_svd_n7(self, A, block_m=128, jacobi_iters=14):
+        """Triton SVD for N=7 (fp32/fp64), or torch fallback.
+
+        Default jacobi_iters=14: N=7 has 21 pairs/sweep; iter count scaled
+        proportionally from N=6's 12-sweep anchor.
+        """
+        if self.use_triton and self._triton and A.is_cuda:
+            from geolip_core.utils.kernel import batched_svd7
+            return batched_svd7(A, block_m, jacobi_iters)
+        if not self._triton:
+            self.warn('svd7')
+        return torch.linalg.svd(A, full_matrices=False)
+
+    def resolve_svd_n8(self, A, block_m=128, jacobi_iters=16):
+        """Triton SVD for N=8 (fp32/fp64), or torch fallback.
+
+        Default jacobi_iters=16: N=8 has 28 pairs/sweep (448 rotations total).
+        """
+        if self.use_triton and self._triton and A.is_cuda:
+            from geolip_core.utils.kernel import batched_svd8
+            return batched_svd8(A, block_m, jacobi_iters)
+        if not self._triton:
+            self.warn('svd8')
+        return torch.linalg.svd(A, full_matrices=False)
+
     def status(self):
         """Print backend status."""
         print(f"geolip.linalg backend:")

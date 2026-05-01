@@ -2,7 +2,7 @@
 Batched thin SVD with auto-dispatch and FL eigh integration.
 
 Dispatch order:
-  N=2..6, Triton + CUDA:        Fused Triton kernel  (fp32 or fp64)
+  N=2..8, Triton + CUDA:        Fused Triton kernel  (fp32 or fp64)
   N<=12, CUDA, fp32:            Gram + FL eigh       (compilable, 70/72 purity)
   N<=12, CUDA, fp64:            Gram + torch.linalg.eigh
                                 (FLEigh returns fp32 V; using torch.linalg.eigh
@@ -33,7 +33,7 @@ Usage:
     U, S, Vh = svd(A)                           # auto-dispatch, fp64
     U, S, Vh = svd(A, compute_dtype='fp32')     # fp32 fast path
     U, S, Vh = svd(A, method='fl')              # force FL eigh path
-    U, S, Vh = svd(A, method='triton')          # force Triton (N=2..6)
+    U, S, Vh = svd(A, method='triton')          # force Triton (N=2..8)
     U, S, Vh = svd(A, method='torch')           # force torch.linalg.svd
 """
 
@@ -148,6 +148,8 @@ def _triton_resolver(N):
             4: backend.resolve_svd_n4,
             5: backend.resolve_svd_n5,
             6: backend.resolve_svd_n6,
+            7: backend.resolve_svd_n7,
+            8: backend.resolve_svd_n8,
         }
     return _TRITON_RESOLVERS.get(N)
 
@@ -165,7 +167,7 @@ def batched_svd(
       'auto':       Best available for each N (respects compute_dtype)
       'fl':         Force Gram + FL eigh (N <= 12)
       'gram_eigh':  Force Gram + torch.linalg.eigh
-      'triton':     Force Triton kernel (N=2..6, fp32 or fp64)
+      'triton':     Force Triton kernel (N=2..8, fp32 or fp64)
       'torch':      Force torch.linalg.svd
 
     Args:
@@ -205,14 +207,14 @@ def batched_svd(
     if method == 'triton':
         resolver = _triton_resolver(N)
         if resolver is None:
-            raise ValueError(f"Triton kernel only for N=2..6, got N={N}")
+            raise ValueError(f"Triton kernel only for N=2..8, got N={N}")
         A_c = A.to(dt) if A.dtype != dt else A
         U, S, Vh = resolver(A_c, block_m)
         return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype)
 
     # method == 'auto'
     use_fp64 = (dt == torch.float64)
-    if 2 <= N <= 6 and backend.use_triton and A.is_cuda:
+    if 2 <= N <= 8 and backend.use_triton and A.is_cuda:
         A_c = A.to(dt) if A.dtype != dt else A
         U, S, Vh = _triton_resolver(N)(A_c, block_m)
         return U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype)

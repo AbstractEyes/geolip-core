@@ -9,6 +9,7 @@ Provides:
   batched_svd(A)                    — Auto-dispatched thin SVD for (B, M, N)
   batched_svd2(A)                   — Fused Triton kernel for N=2
   batched_svd3(A)                   — Fused Triton kernel for N=3
+  batched_svd4(A) ... batched_svd8(A) — Fused Triton kernels for N=4..8
   gram_eigh_svd(A)                  — Gram + eigh hybrid for any N
   newton_schulz_invsqrt(G)          — Batched G^{-1/2} via pure bmm
   batched_procrustes(src, tgt)      — Subspace-preserving Procrustes alignment
@@ -37,6 +38,8 @@ __all__ = [
     'batched_svd4',
     'batched_svd5',
     'batched_svd6',
+    'batched_svd7',
+    'batched_svd8',
     'gram_eigh_svd',
     'newton_schulz_invsqrt',
     'batched_procrustes',
@@ -45,7 +48,7 @@ __all__ = [
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TRITON FUSED KERNELS (N=2, N=3)
+# TRITON FUSED KERNELS (N=2..8)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 HAS_TRITON = False
@@ -1277,6 +1280,11 @@ try:
             tl.store(U_ptr + u_base + row_idx * 6 + 4, u4, mask=mask)
             tl.store(U_ptr + u_base + row_idx * 6 + 5, u5, mask=mask)
 
+    # ── N=7, N=8: Cyclic Jacobi (21 / 28 pair sweeps), generated kernels ──
+    from geolip_core.utils.triton.svd_triton_kernels_n78 import (
+        _svd7_kernel, _svd8_kernel,
+    )
+
     HAS_TRITON = True
 
 except ImportError:
@@ -1412,8 +1420,54 @@ def batched_svd6(A, block_m=128, jacobi_iters=12):
     return U, S, Vh
 
 
+def batched_svd7(A, block_m=128, jacobi_iters=14):
+    """Fused Triton SVD for (B, M, 7) tensors. fp32/fp64.
+
+    Default jacobi_iters=14: N=7 has 21 pairs/sweep. Anchor: N=6 needed
+    12 sweeps (180 rotations) for orth_err < 1e-3 at fp32; N=7 with 14
+    sweeps yields 294 rotations, scaled in proportion.
+
+    Returns: U (B,M,7), S (B,7), Vh (B,7,7)
+    """
+    if not HAS_TRITON or not A.is_cuda or A.dtype not in (torch.float32, torch.float64):
+        return _torch_svd_fallback(A)
+    assert A.ndim == 3 and A.shape[2] == 7
+    B, M, _ = A.shape
+    A_c = A.contiguous()
+    U = torch.empty((B, M, 7), dtype=A.dtype, device=A.device)
+    S = torch.empty((B, 7), dtype=A.dtype, device=A.device)
+    Vh = torch.empty((B, 7, 7), dtype=A.dtype, device=A.device)
+    _svd7_kernel[(B,)](A_c, U, S, Vh, M=M, BLOCK_M=block_m,
+                       JACOBI_ITERS=jacobi_iters,
+                       DTYPE=_triton_dtype(A), EPS=1e-12)
+    return U, S, Vh
+
+
+def batched_svd8(A, block_m=128, jacobi_iters=16):
+    """Fused Triton SVD for (B, M, 8) tensors. fp32/fp64.
+
+    Default jacobi_iters=16: N=8 has 28 pairs/sweep (448 rotations). Tune
+    downward if benchmark shows headroom; tune up if fp32 orth_err breaches
+    1e-3 on real workloads.
+
+    Returns: U (B,M,8), S (B,8), Vh (B,8,8)
+    """
+    if not HAS_TRITON or not A.is_cuda or A.dtype not in (torch.float32, torch.float64):
+        return _torch_svd_fallback(A)
+    assert A.ndim == 3 and A.shape[2] == 8
+    B, M, _ = A.shape
+    A_c = A.contiguous()
+    U = torch.empty((B, M, 8), dtype=A.dtype, device=A.device)
+    S = torch.empty((B, 8), dtype=A.dtype, device=A.device)
+    Vh = torch.empty((B, 8, 8), dtype=A.dtype, device=A.device)
+    _svd8_kernel[(B,)](A_c, U, S, Vh, M=M, BLOCK_M=block_m,
+                       JACOBI_ITERS=jacobi_iters,
+                       DTYPE=_triton_dtype(A), EPS=1e-12)
+    return U, S, Vh
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# GRAM-EIGH HYBRID (N ≥ 4)
+# GRAM-EIGH HYBRID (any N — primary fallback path for N ≥ 9)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def gram_eigh_svd(A):
@@ -1452,8 +1506,8 @@ def batched_svd(A, method='auto', block_m=128):
     """Batched thin SVD for (B, M, N) tensors. M >= N.
 
     Auto-dispatches by N:
-      N=2..6: Fused Triton (fp32 or fp64)
-      N>=7:   Gram + eigh
+      N=2..8: Fused Triton (fp32 or fp64)
+      N>=9:   Gram + eigh
 
     Note: very large N hits eigh serialization. For Procrustes alignment at
     large N, use batched_procrustes() which bypasses this.
@@ -1472,12 +1526,12 @@ def batched_svd(A, method='auto', block_m=128):
     triton_eligible = HAS_TRITON and A.is_cuda and A.dtype in (torch.float32, torch.float64)
 
     if method == 'auto':
-        if 2 <= N <= 6 and triton_eligible:
+        if 2 <= N <= 8 and triton_eligible:
             return _TRITON_SVD_WRAPPERS[N](A, block_m)
         return gram_eigh_svd(A)
     elif method == 'triton':
-        if N not in (2, 3, 4, 5, 6):
-            raise ValueError(f"Triton kernel only for N=2..6, got N={N}")
+        if N not in (2, 3, 4, 5, 6, 7, 8):
+            raise ValueError(f"Triton kernel only for N=2..8, got N={N}")
         return _TRITON_SVD_WRAPPERS[N](A, block_m)
     elif method == 'gram_eigh':
         return gram_eigh_svd(A)
@@ -1493,6 +1547,8 @@ if HAS_TRITON:
         4: batched_svd4,
         5: batched_svd5,
         6: batched_svd6,
+        7: batched_svd7,
+        8: batched_svd8,
     }
 
 
@@ -1680,7 +1736,7 @@ if __name__ == '__main__':
 
     # ── batched_svd auto-dispatch ──
     print("batched_svd (auto-dispatch):")
-    for N in [2, 3, 8, 16, 32]:
+    for N in [2, 3, 7, 8, 16, 32]:
         A = torch.randn(B, M, N, device=device)
         U, S, Vh = batched_svd(A)
         _check(f"  N={N:>2} shapes", U.shape == (B, M, N) and S.shape == (B, N) and Vh.shape == (B, N, N))
@@ -1698,10 +1754,11 @@ if __name__ == '__main__':
         U3, S3, Vh3 = batched_svd3(A3)
         _validate_svd(A3, U3, S3, Vh3, "  N=3 triton")
 
-        # Direct-call tests for batched_svd4/5/6 — pin the wrapper contract
+        # Direct-call tests for batched_svd4..8 — pin the wrapper contract
         # (dtype propagation, output shapes, fallback) independently of the
         # linalg.svd dispatcher.
-        for n_, fn_ in ((4, batched_svd4), (5, batched_svd5), (6, batched_svd6)):
+        for n_, fn_ in ((4, batched_svd4), (5, batched_svd5), (6, batched_svd6),
+                        (7, batched_svd7), (8, batched_svd8)):
             print(f"\nbatched_svd{n_} (Triton):")
             # fp32 default
             A_ = torch.randn(B, M, n_, device=device, dtype=torch.float32)
@@ -1817,7 +1874,9 @@ if __name__ == '__main__':
         SHAPES = [(2, 2), (2, 3), (3, 2), (3, 3),
                   (4, 2), (4, 3), (4, 4),
                   (5, 2), (5, 3), (5, 4), (5, 5),
-                  (6, 2), (6, 3), (6, 4), (6, 5), (6, 6)]
+                  (6, 2), (6, 3), (6, 4), (6, 5), (6, 6),
+                  (7, 2), (7, 3), (7, 4), (7, 5), (7, 6), (7, 7),
+                  (8, 2), (8, 3), (8, 4), (8, 5), (8, 6), (8, 7), (8, 8)]
         B_T, M_OUTER = 32, 1024
 
         # Controlled-spectrum fixture builder. Random Gaussian (B, M, N) with
@@ -1859,7 +1918,9 @@ if __name__ == '__main__':
                 for n, resolver in ((3, _be.resolve_svd_n3),
                                     (4, _be.resolve_svd_n4),
                                     (5, _be.resolve_svd_n5),
-                                    (6, _be.resolve_svd_n6)):
+                                    (6, _be.resolve_svd_n6),
+                                    (7, _be.resolve_svd_n7),
+                                    (8, _be.resolve_svd_n8)):
                     A = _well_conditioned(B_T, M_OUTER, n, torch_dt, _bench_gen)
                     worst = []
                     for it in (2, 4, 6, 8, 12):
@@ -1926,7 +1987,7 @@ if __name__ == '__main__':
                 print(f"  {'shape':>10} | {'cuSOLVER':>10} | {'auto':>10} | "
                       f"{'triton':>10} | {'speedup':>8}", flush=True)
                 print("  " + "-" * 64, flush=True)
-                for n in (2, 3, 4, 5, 6):
+                for n in (2, 3, 4, 5, 6, 7, 8):
                     A = torch.randn(BENCH_B, BENCH_M, n, device=device, dtype=torch_dt)
                     t_torch = _gt(lambda A=A: torch.linalg.svd(A, full_matrices=False))
                     t_auto  = _gt(lambda A=A, c=cdt: _LA_batched_svd(A, method='auto',  compute_dtype=c))
