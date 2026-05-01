@@ -1693,11 +1693,17 @@ if __name__ == '__main__':
     _check("  invsqrt shape", G_inv_sqrt.shape == (B, N, N))
 
     # ── batched_procrustes (full, N ≤ 32) ──
+    # Use a real rotation between src and tgt so Procrustes has something to
+    # recover. Without a rotation, whitening + F.normalize destroy magnitudes
+    # and the "improved" check becomes RNG-dependent (was the prior failure
+    # mode). Seed locally for reproducibility.
     print("\nbatched_procrustes (full):")
+    _g = torch.Generator(device=device).manual_seed(20260501)
     N = 24
-    shared = torch.randn(500, N, device=device)
-    src = shared + 0.3 * torch.randn(500, N, device=device)
-    tgt = shared + 0.3 * torch.randn(500, N, device=device)
+    src = torch.randn(500, N, device=device, generator=_g)
+    # Random orthogonal R via QR; tgt = src @ R + small noise.
+    Q, _ = torch.linalg.qr(torch.randn(N, N, device=device, generator=_g))
+    tgt = src @ Q + 0.05 * torch.randn(500, N, device=device, generator=_g)
     cos_before = F.cosine_similarity(src, tgt, dim=-1).mean().item()
     aligned, info = batched_procrustes(src, tgt, rank=24)
     cos_after = F.cosine_similarity(aligned, tgt, dim=-1).mean().item()
@@ -1707,10 +1713,11 @@ if __name__ == '__main__':
 
     # ── batched_procrustes (subspace, N > 32) ──
     print("\nbatched_procrustes (subspace):")
+    _g = torch.Generator(device=device).manual_seed(20260502)
     N = 64
-    shared = torch.randn(500, N, device=device)
-    src = shared + 0.3 * torch.randn(500, N, device=device)
-    tgt = shared + 0.3 * torch.randn(500, N, device=device)
+    src = torch.randn(500, N, device=device, generator=_g)
+    Q, _ = torch.linalg.qr(torch.randn(N, N, device=device, generator=_g))
+    tgt = src @ Q + 0.05 * torch.randn(500, N, device=device, generator=_g)
     cos_before = F.cosine_similarity(src, tgt, dim=-1).mean().item()
     aligned, info = batched_procrustes(src, tgt, rank=24)
     cos_after = F.cosine_similarity(aligned, tgt, dim=-1).mean().item()
@@ -1728,70 +1735,91 @@ if __name__ == '__main__':
     _check("  batched method", info_b['method'] == 'full')
 
     # ── SVD Triton size-sweep battery ─────────────────────────────────
-    print("\n" + "="*50)
-    print("SVD Triton size-sweep battery")
-    print("="*50)
+    # Forced visibility: the previous battery section ran silently when an
+    # older site-packages copy of geolip_core was loaded ahead of the worktree.
+    # Print + flush a banner so it's obvious whether this section is reached,
+    # report the loaded module path so stale installs are caught, and wrap the
+    # body in try/except so any error reaches stdout (not just stderr).
+    import sys as _sys
+    print("\n" + "="*50, flush=True)
+    print("SVD Triton size-sweep battery", flush=True)
+    print("="*50, flush=True)
+    print(f"  loaded from: {__file__}", flush=True)
+    print(f"  python: {_sys.version.split()[0]}", flush=True)
 
-    from geolip_core.linalg._backend import backend as _be
-    from geolip_core.linalg import svd as _LA_svd
-    _be.status()
-
-    SHAPES = [(2, 2), (2, 3), (3, 2), (3, 3),
-              (4, 2), (4, 3), (4, 4),
-              (5, 2), (5, 3), (5, 4), (5, 5),
-              (6, 2), (6, 3), (6, 4), (6, 5), (6, 6)]
-    B_T, M_OUTER = 32, 1024
-
-    # 1) Shape × dtype sweep through linalg.svd(method='auto')
-    for cdt in ('fp32', 'fp64'):
-        torch_dt = torch.float32 if cdt == 'fp32' else torch.float64
-        print(f"\n[auto / {cdt}]")
-        for (m, n) in SHAPES:
-            # Tiny matrix, plus a stress run with M_OUTER rows for tall shapes.
-            M_used_set = (m, M_OUTER) if m >= n else (m,)
-            for M_used in M_used_set:
-                A = torch.randn(B_T, M_used, n, device=device, dtype=torch_dt)
-                U, S, Vh = _LA_svd.batched_svd(A, method='auto', compute_dtype=cdt)
-                _check(f"  {cdt} {M_used}x{n} dtype",
-                       U.dtype == torch_dt and S.dtype == torch_dt and Vh.dtype == torch_dt)
-                _validate_svd(A, U, S, Vh, f"  {cdt} {M_used}x{n}")
-
-    # 2) Jacobi convergence sweep — direct backend access
-    print("\n[convergence sweep — backend.resolve_svd_nN]")
-    if _be.use_triton and device == 'cuda':
-        for cdt, torch_dt in (('fp32', torch.float32), ('fp64', torch.float64)):
-            for n, resolver in ((3, _be.resolve_svd_n3),
-                                (4, _be.resolve_svd_n4),
-                                (5, _be.resolve_svd_n5),
-                                (6, _be.resolve_svd_n6)):
-                A = torch.randn(B_T, M_OUTER, n, device=device, dtype=torch_dt)
-                worst = []
-                for it in (2, 4, 6, 8, 12):
-                    U, S, Vh = resolver(A, 128, it)
-                    recon = torch.bmm(U * S.unsqueeze(1), Vh)
-                    err = (A - recon).pow(2).mean().sqrt().item()
-                    worst.append((it, err))
-                line = f"  {cdt} N={n}: " + " ".join(f"it={it}:{e:.2e}" for it, e in worst)
-                print(line)
-                # Final iter count (12) must be at least as accurate as iter=2.
-                _check(f"  {cdt} N={n} convergence monotone", worst[-1][1] <= worst[0][1] + 1e-6,
-                       f"first={worst[0][1]:.2e} last={worst[-1][1]:.2e}")
-    else:
-        print("  (skipped — Triton disabled or CPU device)")
-
-    # 3) Backend toggle: triton-off must still pass via torch.linalg.svd fallback
-    print("\n[backend toggle — Triton OFF]")
-    saved_triton = _be.use_triton
-    _be.use_triton = False
     try:
+        from geolip_core.linalg._backend import backend as _be
+        from geolip_core.linalg import svd as _LA_svd
+        import geolip_core as _gc
+        print(f"  geolip_core package: {getattr(_gc, '__file__', '?')}", flush=True)
+        _be.status()
+
+        SHAPES = [(2, 2), (2, 3), (3, 2), (3, 3),
+                  (4, 2), (4, 3), (4, 4),
+                  (5, 2), (5, 3), (5, 4), (5, 5),
+                  (6, 2), (6, 3), (6, 4), (6, 5), (6, 6)]
+        B_T, M_OUTER = 32, 1024
+
+        # 1) Shape × dtype sweep through linalg.svd(method='auto')
         for cdt in ('fp32', 'fp64'):
             torch_dt = torch.float32 if cdt == 'fp32' else torch.float64
+            print(f"\n[auto / {cdt}]", flush=True)
             for (m, n) in SHAPES:
-                A = torch.randn(B_T, m, n, device=device, dtype=torch_dt)
-                U, S, Vh = _LA_svd.batched_svd(A, method='auto', compute_dtype=cdt)
-                _validate_svd(A, U, S, Vh, f"  off/{cdt} {m}x{n}")
-    finally:
-        _be.use_triton = saved_triton
+                # Tiny matrix, plus a stress run with M_OUTER rows for tall shapes.
+                M_used_set = (m, M_OUTER) if m >= n else (m,)
+                for M_used in M_used_set:
+                    A = torch.randn(B_T, M_used, n, device=device, dtype=torch_dt)
+                    U, S, Vh = _LA_svd.batched_svd(A, method='auto', compute_dtype=cdt)
+                    _check(f"  {cdt} {M_used}x{n} dtype",
+                           U.dtype == torch_dt and S.dtype == torch_dt and Vh.dtype == torch_dt)
+                    _validate_svd(A, U, S, Vh, f"  {cdt} {M_used}x{n}")
+
+        # 2) Jacobi convergence sweep — direct backend access
+        print("\n[convergence sweep — backend.resolve_svd_nN]", flush=True)
+        if _be.use_triton and device == 'cuda':
+            for cdt, torch_dt in (('fp32', torch.float32), ('fp64', torch.float64)):
+                for n, resolver in ((3, _be.resolve_svd_n3),
+                                    (4, _be.resolve_svd_n4),
+                                    (5, _be.resolve_svd_n5),
+                                    (6, _be.resolve_svd_n6)):
+                    A = torch.randn(B_T, M_OUTER, n, device=device, dtype=torch_dt)
+                    worst = []
+                    for it in (2, 4, 6, 8, 12):
+                        U, S, Vh = resolver(A, 128, it)
+                        recon = torch.bmm(U * S.unsqueeze(1), Vh)
+                        err = (A - recon).pow(2).mean().sqrt().item()
+                        worst.append((it, err))
+                    line = f"  {cdt} N={n}: " + " ".join(f"it={it}:{e:.2e}" for it, e in worst)
+                    print(line, flush=True)
+                    # Final iter count (12) must be at least as accurate as iter=2.
+                    _check(f"  {cdt} N={n} convergence monotone",
+                           worst[-1][1] <= worst[0][1] + 1e-6,
+                           f"first={worst[0][1]:.2e} last={worst[-1][1]:.2e}")
+        else:
+            print("  (skipped — Triton disabled or CPU device)", flush=True)
+
+        # 3) Backend toggle: triton-off must still pass via torch.linalg.svd fallback
+        print("\n[backend toggle — Triton OFF]", flush=True)
+        saved_triton = _be.use_triton
+        _be.use_triton = False
+        try:
+            for cdt in ('fp32', 'fp64'):
+                torch_dt = torch.float32 if cdt == 'fp32' else torch.float64
+                for (m, n) in SHAPES:
+                    A = torch.randn(B_T, m, n, device=device, dtype=torch_dt)
+                    U, S, Vh = _LA_svd.batched_svd(A, method='auto', compute_dtype=cdt)
+                    _validate_svd(A, U, S, Vh, f"  off/{cdt} {m}x{n}")
+        finally:
+            _be.use_triton = saved_triton
+
+    except Exception as _battery_exc:
+        # Surface failures on stdout so they appear in line with the other test
+        # output instead of getting separated onto stderr.
+        import traceback as _tb
+        print("\n[battery FAULT] " + repr(_battery_exc), flush=True)
+        _tb.print_exc(file=_sys.stdout)
+        _sys.stdout.flush()
+        _counts['failed'] += 1
 
     # ── Summary ──
     total = _counts['passed'] + _counts['failed']
