@@ -1826,6 +1826,60 @@ if __name__ == '__main__':
         finally:
             _be.use_triton = saved_triton
 
+        # 4) Throughput benchmark — mirror geolip_core/utils/triton/fl_eigh_gen.py
+        # Pattern: warmup w iters, time r iters, report per-iter mean. Informational
+        # only (no _check calls) — kernels already passed correctness above.
+        if device == 'cuda' and _be.use_triton:
+            import time as _time
+            def _sync(): torch.cuda.synchronize()
+            def _gt(fn, w=20, r=200):
+                for _ in range(w):
+                    fn()
+                _sync(); _t0 = _time.perf_counter()
+                for _ in range(r):
+                    fn()
+                _sync()
+                return (_time.perf_counter() - _t0) / r
+            def _fmt(s):
+                if s < 1e-3: return f"{s*1e6:.1f}us"
+                if s < 1:    return f"{s*1e3:.2f}ms"
+                return f"{s:.3f}s"
+
+            BENCH_B, BENCH_M = 512, 1024
+
+            for cdt in ('fp32', 'fp64'):
+                torch_dt = torch.float32 if cdt == 'fp32' else torch.float64
+                print(f"\n[bench / {cdt}]  B={BENCH_B} M={BENCH_M}", flush=True)
+                print(f"  {'shape':>10} | {'cuSOLVER':>10} | {'auto':>10} | "
+                      f"{'triton':>10} | {'speedup':>8}", flush=True)
+                print("  " + "-" * 64, flush=True)
+                for n in (2, 3, 4, 5, 6):
+                    A = torch.randn(BENCH_B, BENCH_M, n, device=device, dtype=torch_dt)
+                    t_torch = _gt(lambda A=A: torch.linalg.svd(A, full_matrices=False))
+                    t_auto  = _gt(lambda A=A, c=cdt: _LA_batched_svd(A, method='auto',  compute_dtype=c))
+                    t_trit  = _gt(lambda A=A, c=cdt: _LA_batched_svd(A, method='triton', compute_dtype=c))
+                    sp = t_torch / t_trit if t_trit > 0 else float('inf')
+                    print(f"  {BENCH_M}x{n:<2d} | {_fmt(t_torch):>10} | {_fmt(t_auto):>10} | "
+                          f"{_fmt(t_trit):>10} | {sp:>6.1f}x", flush=True)
+                    del A
+                torch.cuda.empty_cache()
+
+            # Batch scaling at the worst case (M=1024, N=6, fp32) — mirrors the
+            # FL eigh batch scaling table in fl_eigh_gen.py.
+            print(f"\n[bench / batch scaling — fp32, M=1024, N=6]", flush=True)
+            print(f"  {'B':>6} | {'cuSOLVER':>10} | {'triton':>10} | {'speedup':>8}", flush=True)
+            print("  " + "-" * 44, flush=True)
+            for Bx in (256, 512, 1024, 2048, 4096, 8192):
+                Ax = torch.randn(Bx, 1024, 6, device=device, dtype=torch.float32)
+                t1 = _gt(lambda Ax=Ax: torch.linalg.svd(Ax, full_matrices=False), 10, 50)
+                t2 = _gt(lambda Ax=Ax: _LA_batched_svd(Ax, method='triton', compute_dtype='fp32'), 10, 50)
+                sp = t1 / t2 if t2 > 0 else float('inf')
+                print(f"  {Bx:>6} | {_fmt(t1):>10} | {_fmt(t2):>10} | {sp:>6.1f}x", flush=True)
+                del Ax
+                torch.cuda.empty_cache()
+        else:
+            print("\n[bench]  skipped — Triton disabled or CPU device", flush=True)
+
     except Exception as _battery_exc:
         # Surface failures on stdout so they appear in line with the other test
         # output instead of getting separated onto stderr.
