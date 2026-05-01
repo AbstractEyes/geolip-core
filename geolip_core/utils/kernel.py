@@ -56,19 +56,20 @@ try:
     @triton.jit
     def _svd2_kernel(
         A_ptr, U_ptr, S_ptr, Vh_ptr,
-        M: tl.constexpr, BLOCK_M: tl.constexpr, EPS: tl.constexpr,
+        M: tl.constexpr, BLOCK_M: tl.constexpr,
+        DTYPE: tl.constexpr, EPS: tl.constexpr,
     ):
         bid = tl.program_id(0)
         base = bid * M * 2
-        g00 = tl.zeros([], dtype=tl.float32)
-        g01 = tl.zeros([], dtype=tl.float32)
-        g11 = tl.zeros([], dtype=tl.float32)
+        g00 = tl.zeros([], dtype=DTYPE)
+        g01 = tl.zeros([], dtype=DTYPE)
+        g11 = tl.zeros([], dtype=DTYPE)
         for block_start in range(0, M, BLOCK_M):
             offs = tl.arange(0, BLOCK_M)
             row_idx = block_start + offs
             mask = row_idx < M
-            a0 = tl.load(A_ptr + base + row_idx * 2 + 0, mask=mask, other=0.0).to(tl.float32)
-            a1 = tl.load(A_ptr + base + row_idx * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+            a0 = tl.load(A_ptr + base + row_idx * 2 + 0, mask=mask, other=0.0).to(DTYPE)
+            a1 = tl.load(A_ptr + base + row_idx * 2 + 1, mask=mask, other=0.0).to(DTYPE)
             g00 += tl.sum(a0 * a0)
             g01 += tl.sum(a0 * a1)
             g11 += tl.sum(a1 * a1)
@@ -107,8 +108,8 @@ try:
             offs = tl.arange(0, BLOCK_M)
             row_idx = block_start + offs
             mask = row_idx < M
-            a0 = tl.load(A_ptr + base + row_idx * 2 + 0, mask=mask, other=0.0).to(tl.float32)
-            a1 = tl.load(A_ptr + base + row_idx * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+            a0 = tl.load(A_ptr + base + row_idx * 2 + 0, mask=mask, other=0.0).to(DTYPE)
+            a1 = tl.load(A_ptr + base + row_idx * 2 + 1, mask=mask, other=0.0).to(DTYPE)
             u0 = (a0 * v00 + a1 * v10) * inv_s0
             u1 = (a0 * v01 + a1 * v11) * inv_s1
             u_base = bid * M * 2
@@ -121,18 +122,19 @@ try:
     def _svd3_kernel(
         A_ptr, U_ptr, S_ptr, Vh_ptr,
         M: tl.constexpr, BLOCK_M: tl.constexpr,
-        JACOBI_ITERS: tl.constexpr, EPS: tl.constexpr,
+        JACOBI_ITERS: tl.constexpr,
+        DTYPE: tl.constexpr, EPS: tl.constexpr,
     ):
         bid = tl.program_id(0)
-        g00 = tl.zeros([], dtype=tl.float32); g01 = tl.zeros([], dtype=tl.float32)
-        g02 = tl.zeros([], dtype=tl.float32); g11 = tl.zeros([], dtype=tl.float32)
-        g12 = tl.zeros([], dtype=tl.float32); g22 = tl.zeros([], dtype=tl.float32)
+        g00 = tl.zeros([], dtype=DTYPE); g01 = tl.zeros([], dtype=DTYPE)
+        g02 = tl.zeros([], dtype=DTYPE); g11 = tl.zeros([], dtype=DTYPE)
+        g12 = tl.zeros([], dtype=DTYPE); g22 = tl.zeros([], dtype=DTYPE)
         base = bid * M * 3
         for block_start in range(0, M, BLOCK_M):
             offs = tl.arange(0, BLOCK_M); row_idx = block_start + offs; mask = row_idx < M
-            a0 = tl.load(A_ptr + base + row_idx * 3 + 0, mask=mask, other=0.0).to(tl.float32)
-            a1 = tl.load(A_ptr + base + row_idx * 3 + 1, mask=mask, other=0.0).to(tl.float32)
-            a2 = tl.load(A_ptr + base + row_idx * 3 + 2, mask=mask, other=0.0).to(tl.float32)
+            a0 = tl.load(A_ptr + base + row_idx * 3 + 0, mask=mask, other=0.0).to(DTYPE)
+            a1 = tl.load(A_ptr + base + row_idx * 3 + 1, mask=mask, other=0.0).to(DTYPE)
+            a2 = tl.load(A_ptr + base + row_idx * 3 + 2, mask=mask, other=0.0).to(DTYPE)
             g00 += tl.sum(a0 * a0); g01 += tl.sum(a0 * a1); g02 += tl.sum(a0 * a2)
             g11 += tl.sum(a1 * a1); g12 += tl.sum(a1 * a2); g22 += tl.sum(a2 * a2)
         v00 = 1.0; v01 = 0.0; v02 = 0.0
@@ -208,9 +210,9 @@ try:
         inv_s0 = 1.0 / (s0 + EPS); inv_s1 = 1.0 / (s1 + EPS); inv_s2 = 1.0 / (s2 + EPS)
         for block_start in range(0, M, BLOCK_M):
             offs = tl.arange(0, BLOCK_M); row_idx = block_start + offs; mask = row_idx < M
-            a0 = tl.load(A_ptr + base + row_idx * 3 + 0, mask=mask, other=0.0).to(tl.float32)
-            a1 = tl.load(A_ptr + base + row_idx * 3 + 1, mask=mask, other=0.0).to(tl.float32)
-            a2 = tl.load(A_ptr + base + row_idx * 3 + 2, mask=mask, other=0.0).to(tl.float32)
+            a0 = tl.load(A_ptr + base + row_idx * 3 + 0, mask=mask, other=0.0).to(DTYPE)
+            a1 = tl.load(A_ptr + base + row_idx * 3 + 1, mask=mask, other=0.0).to(DTYPE)
+            a2 = tl.load(A_ptr + base + row_idx * 3 + 2, mask=mask, other=0.0).to(DTYPE)
             u0 = (a0 * v00 + a1 * v10 + a2 * v20) * inv_s0
             u1 = (a0 * v01 + a1 * v11 + a2 * v21) * inv_s1
             u2 = (a0 * v02 + a1 * v12 + a2 * v22) * inv_s2
@@ -218,6 +220,540 @@ try:
             tl.store(U_ptr + u_base + row_idx * 3 + 0, u0, mask=mask)
             tl.store(U_ptr + u_base + row_idx * 3 + 1, u1, mask=mask)
             tl.store(U_ptr + u_base + row_idx * 3 + 2, u2, mask=mask)
+
+    # ── N=4: Cyclic Jacobi (6 pair sweep) ────────────────────────────────
+
+    @triton.jit
+    def _svd4_kernel(
+        A_ptr, U_ptr, S_ptr, Vh_ptr,
+        M: tl.constexpr, BLOCK_M: tl.constexpr,
+        JACOBI_ITERS: tl.constexpr,
+        DTYPE: tl.constexpr, EPS: tl.constexpr,
+    ):
+        bid = tl.program_id(0)
+        base = bid * M * 4
+        g00 = tl.zeros([], dtype=DTYPE); g01 = tl.zeros([], dtype=DTYPE)
+        g02 = tl.zeros([], dtype=DTYPE); g03 = tl.zeros([], dtype=DTYPE)
+        g11 = tl.zeros([], dtype=DTYPE); g12 = tl.zeros([], dtype=DTYPE)
+        g13 = tl.zeros([], dtype=DTYPE); g22 = tl.zeros([], dtype=DTYPE)
+        g23 = tl.zeros([], dtype=DTYPE); g33 = tl.zeros([], dtype=DTYPE)
+        for block_start in range(0, M, BLOCK_M):
+            offs = tl.arange(0, BLOCK_M); row_idx = block_start + offs; mask = row_idx < M
+            a0 = tl.load(A_ptr + base + row_idx * 4 + 0, mask=mask, other=0.0).to(DTYPE)
+            a1 = tl.load(A_ptr + base + row_idx * 4 + 1, mask=mask, other=0.0).to(DTYPE)
+            a2 = tl.load(A_ptr + base + row_idx * 4 + 2, mask=mask, other=0.0).to(DTYPE)
+            a3 = tl.load(A_ptr + base + row_idx * 4 + 3, mask=mask, other=0.0).to(DTYPE)
+            g00 += tl.sum(a0 * a0); g01 += tl.sum(a0 * a1); g02 += tl.sum(a0 * a2); g03 += tl.sum(a0 * a3)
+            g11 += tl.sum(a1 * a1); g12 += tl.sum(a1 * a2); g13 += tl.sum(a1 * a3)
+            g22 += tl.sum(a2 * a2); g23 += tl.sum(a2 * a3); g33 += tl.sum(a3 * a3)
+        v00 = tl.full([], 1.0, dtype=DTYPE); v01 = tl.zeros([], dtype=DTYPE); v02 = tl.zeros([], dtype=DTYPE); v03 = tl.zeros([], dtype=DTYPE)
+        v10 = tl.zeros([], dtype=DTYPE); v11 = tl.full([], 1.0, dtype=DTYPE); v12 = tl.zeros([], dtype=DTYPE); v13 = tl.zeros([], dtype=DTYPE)
+        v20 = tl.zeros([], dtype=DTYPE); v21 = tl.zeros([], dtype=DTYPE); v22 = tl.full([], 1.0, dtype=DTYPE); v23 = tl.zeros([], dtype=DTYPE)
+        v30 = tl.zeros([], dtype=DTYPE); v31 = tl.zeros([], dtype=DTYPE); v32 = tl.zeros([], dtype=DTYPE); v33 = tl.full([], 1.0, dtype=DTYPE)
+        for _ in range(JACOBI_ITERS):
+            # pair (0,1)
+            off_diag = g01; diag_diff = g11 - g00; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng00 = c*c*g00 - 2.0*s*c*g01 + s*s*g11; ng11 = s*s*g00 + 2.0*s*c*g01 + c*c*g11
+            ng02 = c*g02 - s*g12; ng12 = s*g02 + c*g12
+            ng03 = c*g03 - s*g13; ng13 = s*g03 + c*g13
+            g00 = ng00; g11 = ng11; g01 = tl.zeros([], dtype=DTYPE)
+            g02 = ng02; g12 = ng12; g03 = ng03; g13 = ng13
+            nv00 = c*v00 - s*v01; nv01 = s*v00 + c*v01
+            nv10 = c*v10 - s*v11; nv11 = s*v10 + c*v11
+            nv20 = c*v20 - s*v21; nv21 = s*v20 + c*v21
+            nv30 = c*v30 - s*v31; nv31 = s*v30 + c*v31
+            v00 = nv00; v01 = nv01; v10 = nv10; v11 = nv11
+            v20 = nv20; v21 = nv21; v30 = nv30; v31 = nv31
+            # pair (0,2)
+            off_diag = g02; diag_diff = g22 - g00; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng00 = c*c*g00 - 2.0*s*c*g02 + s*s*g22; ng22 = s*s*g00 + 2.0*s*c*g02 + c*c*g22
+            ng01 = c*g01 - s*g12; ng12 = s*g01 + c*g12
+            ng03 = c*g03 - s*g23; ng23 = s*g03 + c*g23
+            g00 = ng00; g22 = ng22; g02 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g12 = ng12; g03 = ng03; g23 = ng23
+            nv00 = c*v00 - s*v02; nv02 = s*v00 + c*v02
+            nv10 = c*v10 - s*v12; nv12 = s*v10 + c*v12
+            nv20 = c*v20 - s*v22; nv22 = s*v20 + c*v22
+            nv30 = c*v30 - s*v32; nv32 = s*v30 + c*v32
+            v00 = nv00; v02 = nv02; v10 = nv10; v12 = nv12
+            v20 = nv20; v22 = nv22; v30 = nv30; v32 = nv32
+            # pair (0,3)
+            off_diag = g03; diag_diff = g33 - g00; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng00 = c*c*g00 - 2.0*s*c*g03 + s*s*g33; ng33 = s*s*g00 + 2.0*s*c*g03 + c*c*g33
+            ng01 = c*g01 - s*g13; ng13 = s*g01 + c*g13
+            ng02 = c*g02 - s*g23; ng23 = s*g02 + c*g23
+            g00 = ng00; g33 = ng33; g03 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g13 = ng13; g02 = ng02; g23 = ng23
+            nv00 = c*v00 - s*v03; nv03 = s*v00 + c*v03
+            nv10 = c*v10 - s*v13; nv13 = s*v10 + c*v13
+            nv20 = c*v20 - s*v23; nv23 = s*v20 + c*v23
+            nv30 = c*v30 - s*v33; nv33 = s*v30 + c*v33
+            v00 = nv00; v03 = nv03; v10 = nv10; v13 = nv13
+            v20 = nv20; v23 = nv23; v30 = nv30; v33 = nv33
+            # pair (1,2)
+            off_diag = g12; diag_diff = g22 - g11; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng11 = c*c*g11 - 2.0*s*c*g12 + s*s*g22; ng22 = s*s*g11 + 2.0*s*c*g12 + c*c*g22
+            ng01 = c*g01 - s*g02; ng02 = s*g01 + c*g02
+            ng13 = c*g13 - s*g23; ng23 = s*g13 + c*g23
+            g11 = ng11; g22 = ng22; g12 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g02 = ng02; g13 = ng13; g23 = ng23
+            nv01 = c*v01 - s*v02; nv02 = s*v01 + c*v02
+            nv11 = c*v11 - s*v12; nv12 = s*v11 + c*v12
+            nv21 = c*v21 - s*v22; nv22 = s*v21 + c*v22
+            nv31 = c*v31 - s*v32; nv32 = s*v31 + c*v32
+            v01 = nv01; v02 = nv02; v11 = nv11; v12 = nv12
+            v21 = nv21; v22 = nv22; v31 = nv31; v32 = nv32
+            # pair (1,3)
+            off_diag = g13; diag_diff = g33 - g11; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng11 = c*c*g11 - 2.0*s*c*g13 + s*s*g33; ng33 = s*s*g11 + 2.0*s*c*g13 + c*c*g33
+            ng01 = c*g01 - s*g03; ng03 = s*g01 + c*g03
+            ng12 = c*g12 - s*g23; ng23 = s*g12 + c*g23
+            g11 = ng11; g33 = ng33; g13 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g03 = ng03; g12 = ng12; g23 = ng23
+            nv01 = c*v01 - s*v03; nv03 = s*v01 + c*v03
+            nv11 = c*v11 - s*v13; nv13 = s*v11 + c*v13
+            nv21 = c*v21 - s*v23; nv23 = s*v21 + c*v23
+            nv31 = c*v31 - s*v33; nv33 = s*v31 + c*v33
+            v01 = nv01; v03 = nv03; v11 = nv11; v13 = nv13
+            v21 = nv21; v23 = nv23; v31 = nv31; v33 = nv33
+            # pair (2,3)
+            off_diag = g23; diag_diff = g33 - g22; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng22 = c*c*g22 - 2.0*s*c*g23 + s*s*g33; ng33 = s*s*g22 + 2.0*s*c*g23 + c*c*g33
+            ng02 = c*g02 - s*g03; ng03 = s*g02 + c*g03
+            ng12 = c*g12 - s*g13; ng13 = s*g12 + c*g13
+            g22 = ng22; g33 = ng33; g23 = tl.zeros([], dtype=DTYPE)
+            g02 = ng02; g03 = ng03; g12 = ng12; g13 = ng13
+            nv02 = c*v02 - s*v03; nv03 = s*v02 + c*v03
+            nv12 = c*v12 - s*v13; nv13 = s*v12 + c*v13
+            nv22 = c*v22 - s*v23; nv23 = s*v22 + c*v23
+            nv32 = c*v32 - s*v33; nv33 = s*v32 + c*v33
+            v02 = nv02; v03 = nv03; v12 = nv12; v13 = nv13
+            v22 = nv22; v23 = nv23; v32 = nv32; v33 = nv33
+        s0 = tl.sqrt(tl.maximum(g00, EPS))
+        s1 = tl.sqrt(tl.maximum(g11, EPS))
+        s2 = tl.sqrt(tl.maximum(g22, EPS))
+        s3 = tl.sqrt(tl.maximum(g33, EPS))
+        # Sort descending (selection sort; swap columns of V when swapping singular values)
+        do_swap = s0 < s1
+        s0, s1 = tl.where(do_swap, s1, s0), tl.where(do_swap, s0, s1)
+        tv = v00; v00 = tl.where(do_swap, v01, v00); v01 = tl.where(do_swap, tv, v01)
+        tv = v10; v10 = tl.where(do_swap, v11, v10); v11 = tl.where(do_swap, tv, v11)
+        tv = v20; v20 = tl.where(do_swap, v21, v20); v21 = tl.where(do_swap, tv, v21)
+        tv = v30; v30 = tl.where(do_swap, v31, v30); v31 = tl.where(do_swap, tv, v31)
+        do_swap = s0 < s2
+        s0, s2 = tl.where(do_swap, s2, s0), tl.where(do_swap, s0, s2)
+        tv = v00; v00 = tl.where(do_swap, v02, v00); v02 = tl.where(do_swap, tv, v02)
+        tv = v10; v10 = tl.where(do_swap, v12, v10); v12 = tl.where(do_swap, tv, v12)
+        tv = v20; v20 = tl.where(do_swap, v22, v20); v22 = tl.where(do_swap, tv, v22)
+        tv = v30; v30 = tl.where(do_swap, v32, v30); v32 = tl.where(do_swap, tv, v32)
+        do_swap = s0 < s3
+        s0, s3 = tl.where(do_swap, s3, s0), tl.where(do_swap, s0, s3)
+        tv = v00; v00 = tl.where(do_swap, v03, v00); v03 = tl.where(do_swap, tv, v03)
+        tv = v10; v10 = tl.where(do_swap, v13, v10); v13 = tl.where(do_swap, tv, v13)
+        tv = v20; v20 = tl.where(do_swap, v23, v20); v23 = tl.where(do_swap, tv, v23)
+        tv = v30; v30 = tl.where(do_swap, v33, v30); v33 = tl.where(do_swap, tv, v33)
+        do_swap = s1 < s2
+        s1, s2 = tl.where(do_swap, s2, s1), tl.where(do_swap, s1, s2)
+        tv = v01; v01 = tl.where(do_swap, v02, v01); v02 = tl.where(do_swap, tv, v02)
+        tv = v11; v11 = tl.where(do_swap, v12, v11); v12 = tl.where(do_swap, tv, v12)
+        tv = v21; v21 = tl.where(do_swap, v22, v21); v22 = tl.where(do_swap, tv, v22)
+        tv = v31; v31 = tl.where(do_swap, v32, v31); v32 = tl.where(do_swap, tv, v32)
+        do_swap = s1 < s3
+        s1, s3 = tl.where(do_swap, s3, s1), tl.where(do_swap, s1, s3)
+        tv = v01; v01 = tl.where(do_swap, v03, v01); v03 = tl.where(do_swap, tv, v03)
+        tv = v11; v11 = tl.where(do_swap, v13, v11); v13 = tl.where(do_swap, tv, v13)
+        tv = v21; v21 = tl.where(do_swap, v23, v21); v23 = tl.where(do_swap, tv, v23)
+        tv = v31; v31 = tl.where(do_swap, v33, v31); v33 = tl.where(do_swap, tv, v33)
+        do_swap = s2 < s3
+        s2, s3 = tl.where(do_swap, s3, s2), tl.where(do_swap, s2, s3)
+        tv = v02; v02 = tl.where(do_swap, v03, v02); v03 = tl.where(do_swap, tv, v03)
+        tv = v12; v12 = tl.where(do_swap, v13, v12); v13 = tl.where(do_swap, tv, v13)
+        tv = v22; v22 = tl.where(do_swap, v23, v22); v23 = tl.where(do_swap, tv, v23)
+        tv = v32; v32 = tl.where(do_swap, v33, v32); v33 = tl.where(do_swap, tv, v33)
+        s_base = bid * 4
+        tl.store(S_ptr + s_base + 0, s0); tl.store(S_ptr + s_base + 1, s1)
+        tl.store(S_ptr + s_base + 2, s2); tl.store(S_ptr + s_base + 3, s3)
+        # Vh = V^T — row r of Vh is column r of V.
+        vh_base = bid * 16
+        tl.store(Vh_ptr + vh_base + 0, v00); tl.store(Vh_ptr + vh_base + 1, v10)
+        tl.store(Vh_ptr + vh_base + 2, v20); tl.store(Vh_ptr + vh_base + 3, v30)
+        tl.store(Vh_ptr + vh_base + 4, v01); tl.store(Vh_ptr + vh_base + 5, v11)
+        tl.store(Vh_ptr + vh_base + 6, v21); tl.store(Vh_ptr + vh_base + 7, v31)
+        tl.store(Vh_ptr + vh_base + 8, v02); tl.store(Vh_ptr + vh_base + 9, v12)
+        tl.store(Vh_ptr + vh_base + 10, v22); tl.store(Vh_ptr + vh_base + 11, v32)
+        tl.store(Vh_ptr + vh_base + 12, v03); tl.store(Vh_ptr + vh_base + 13, v13)
+        tl.store(Vh_ptr + vh_base + 14, v23); tl.store(Vh_ptr + vh_base + 15, v33)
+        inv_s0 = 1.0 / (s0 + EPS); inv_s1 = 1.0 / (s1 + EPS)
+        inv_s2 = 1.0 / (s2 + EPS); inv_s3 = 1.0 / (s3 + EPS)
+        for block_start in range(0, M, BLOCK_M):
+            offs = tl.arange(0, BLOCK_M); row_idx = block_start + offs; mask = row_idx < M
+            a0 = tl.load(A_ptr + base + row_idx * 4 + 0, mask=mask, other=0.0).to(DTYPE)
+            a1 = tl.load(A_ptr + base + row_idx * 4 + 1, mask=mask, other=0.0).to(DTYPE)
+            a2 = tl.load(A_ptr + base + row_idx * 4 + 2, mask=mask, other=0.0).to(DTYPE)
+            a3 = tl.load(A_ptr + base + row_idx * 4 + 3, mask=mask, other=0.0).to(DTYPE)
+            u0 = (a0*v00 + a1*v10 + a2*v20 + a3*v30) * inv_s0
+            u1 = (a0*v01 + a1*v11 + a2*v21 + a3*v31) * inv_s1
+            u2 = (a0*v02 + a1*v12 + a2*v22 + a3*v32) * inv_s2
+            u3 = (a0*v03 + a1*v13 + a2*v23 + a3*v33) * inv_s3
+            u_base = bid * M * 4
+            tl.store(U_ptr + u_base + row_idx * 4 + 0, u0, mask=mask)
+            tl.store(U_ptr + u_base + row_idx * 4 + 1, u1, mask=mask)
+            tl.store(U_ptr + u_base + row_idx * 4 + 2, u2, mask=mask)
+            tl.store(U_ptr + u_base + row_idx * 4 + 3, u3, mask=mask)
+
+    # ── N=5: Cyclic Jacobi (10 pair sweep) ───────────────────────────────
+
+    @triton.jit
+    def _svd5_kernel(
+        A_ptr, U_ptr, S_ptr, Vh_ptr,
+        M: tl.constexpr, BLOCK_M: tl.constexpr,
+        JACOBI_ITERS: tl.constexpr,
+        DTYPE: tl.constexpr, EPS: tl.constexpr,
+    ):
+        bid = tl.program_id(0)
+        base = bid * M * 5
+        g00 = tl.zeros([], dtype=DTYPE); g01 = tl.zeros([], dtype=DTYPE); g02 = tl.zeros([], dtype=DTYPE); g03 = tl.zeros([], dtype=DTYPE); g04 = tl.zeros([], dtype=DTYPE)
+        g11 = tl.zeros([], dtype=DTYPE); g12 = tl.zeros([], dtype=DTYPE); g13 = tl.zeros([], dtype=DTYPE); g14 = tl.zeros([], dtype=DTYPE)
+        g22 = tl.zeros([], dtype=DTYPE); g23 = tl.zeros([], dtype=DTYPE); g24 = tl.zeros([], dtype=DTYPE)
+        g33 = tl.zeros([], dtype=DTYPE); g34 = tl.zeros([], dtype=DTYPE)
+        g44 = tl.zeros([], dtype=DTYPE)
+        for block_start in range(0, M, BLOCK_M):
+            offs = tl.arange(0, BLOCK_M); row_idx = block_start + offs; mask = row_idx < M
+            a0 = tl.load(A_ptr + base + row_idx * 5 + 0, mask=mask, other=0.0).to(DTYPE)
+            a1 = tl.load(A_ptr + base + row_idx * 5 + 1, mask=mask, other=0.0).to(DTYPE)
+            a2 = tl.load(A_ptr + base + row_idx * 5 + 2, mask=mask, other=0.0).to(DTYPE)
+            a3 = tl.load(A_ptr + base + row_idx * 5 + 3, mask=mask, other=0.0).to(DTYPE)
+            a4 = tl.load(A_ptr + base + row_idx * 5 + 4, mask=mask, other=0.0).to(DTYPE)
+            g00 += tl.sum(a0 * a0); g01 += tl.sum(a0 * a1); g02 += tl.sum(a0 * a2); g03 += tl.sum(a0 * a3); g04 += tl.sum(a0 * a4)
+            g11 += tl.sum(a1 * a1); g12 += tl.sum(a1 * a2); g13 += tl.sum(a1 * a3); g14 += tl.sum(a1 * a4)
+            g22 += tl.sum(a2 * a2); g23 += tl.sum(a2 * a3); g24 += tl.sum(a2 * a4)
+            g33 += tl.sum(a3 * a3); g34 += tl.sum(a3 * a4)
+            g44 += tl.sum(a4 * a4)
+        v00 = tl.full([], 1.0, dtype=DTYPE); v01 = tl.zeros([], dtype=DTYPE); v02 = tl.zeros([], dtype=DTYPE); v03 = tl.zeros([], dtype=DTYPE); v04 = tl.zeros([], dtype=DTYPE)
+        v10 = tl.zeros([], dtype=DTYPE); v11 = tl.full([], 1.0, dtype=DTYPE); v12 = tl.zeros([], dtype=DTYPE); v13 = tl.zeros([], dtype=DTYPE); v14 = tl.zeros([], dtype=DTYPE)
+        v20 = tl.zeros([], dtype=DTYPE); v21 = tl.zeros([], dtype=DTYPE); v22 = tl.full([], 1.0, dtype=DTYPE); v23 = tl.zeros([], dtype=DTYPE); v24 = tl.zeros([], dtype=DTYPE)
+        v30 = tl.zeros([], dtype=DTYPE); v31 = tl.zeros([], dtype=DTYPE); v32 = tl.zeros([], dtype=DTYPE); v33 = tl.full([], 1.0, dtype=DTYPE); v34 = tl.zeros([], dtype=DTYPE)
+        v40 = tl.zeros([], dtype=DTYPE); v41 = tl.zeros([], dtype=DTYPE); v42 = tl.zeros([], dtype=DTYPE); v43 = tl.zeros([], dtype=DTYPE); v44 = tl.full([], 1.0, dtype=DTYPE)
+        for _ in range(JACOBI_ITERS):
+            # pair (0,1)
+            off_diag = g01; diag_diff = g11 - g00; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng00 = c*c*g00 - 2.0*s*c*g01 + s*s*g11; ng11 = s*s*g00 + 2.0*s*c*g01 + c*c*g11
+            ng02 = c*g02 - s*g12; ng12 = s*g02 + c*g12
+            ng03 = c*g03 - s*g13; ng13 = s*g03 + c*g13
+            ng04 = c*g04 - s*g14; ng14 = s*g04 + c*g14
+            g00 = ng00; g11 = ng11; g01 = tl.zeros([], dtype=DTYPE)
+            g02 = ng02; g12 = ng12; g03 = ng03; g13 = ng13; g04 = ng04; g14 = ng14
+            nv00 = c*v00 - s*v01; nv01 = s*v00 + c*v01
+            nv10 = c*v10 - s*v11; nv11 = s*v10 + c*v11
+            nv20 = c*v20 - s*v21; nv21 = s*v20 + c*v21
+            nv30 = c*v30 - s*v31; nv31 = s*v30 + c*v31
+            nv40 = c*v40 - s*v41; nv41 = s*v40 + c*v41
+            v00 = nv00; v01 = nv01; v10 = nv10; v11 = nv11; v20 = nv20; v21 = nv21
+            v30 = nv30; v31 = nv31; v40 = nv40; v41 = nv41
+            # pair (0,2)
+            off_diag = g02; diag_diff = g22 - g00; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng00 = c*c*g00 - 2.0*s*c*g02 + s*s*g22; ng22 = s*s*g00 + 2.0*s*c*g02 + c*c*g22
+            ng01 = c*g01 - s*g12; ng12 = s*g01 + c*g12
+            ng03 = c*g03 - s*g23; ng23 = s*g03 + c*g23
+            ng04 = c*g04 - s*g24; ng24 = s*g04 + c*g24
+            g00 = ng00; g22 = ng22; g02 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g12 = ng12; g03 = ng03; g23 = ng23; g04 = ng04; g24 = ng24
+            nv00 = c*v00 - s*v02; nv02 = s*v00 + c*v02
+            nv10 = c*v10 - s*v12; nv12 = s*v10 + c*v12
+            nv20 = c*v20 - s*v22; nv22 = s*v20 + c*v22
+            nv30 = c*v30 - s*v32; nv32 = s*v30 + c*v32
+            nv40 = c*v40 - s*v42; nv42 = s*v40 + c*v42
+            v00 = nv00; v02 = nv02; v10 = nv10; v12 = nv12; v20 = nv20; v22 = nv22
+            v30 = nv30; v32 = nv32; v40 = nv40; v42 = nv42
+            # pair (0,3)
+            off_diag = g03; diag_diff = g33 - g00; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng00 = c*c*g00 - 2.0*s*c*g03 + s*s*g33; ng33 = s*s*g00 + 2.0*s*c*g03 + c*c*g33
+            ng01 = c*g01 - s*g13; ng13 = s*g01 + c*g13
+            ng02 = c*g02 - s*g23; ng23 = s*g02 + c*g23
+            ng04 = c*g04 - s*g34; ng34 = s*g04 + c*g34
+            g00 = ng00; g33 = ng33; g03 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g13 = ng13; g02 = ng02; g23 = ng23; g04 = ng04; g34 = ng34
+            nv00 = c*v00 - s*v03; nv03 = s*v00 + c*v03
+            nv10 = c*v10 - s*v13; nv13 = s*v10 + c*v13
+            nv20 = c*v20 - s*v23; nv23 = s*v20 + c*v23
+            nv30 = c*v30 - s*v33; nv33 = s*v30 + c*v33
+            nv40 = c*v40 - s*v43; nv43 = s*v40 + c*v43
+            v00 = nv00; v03 = nv03; v10 = nv10; v13 = nv13; v20 = nv20; v23 = nv23
+            v30 = nv30; v33 = nv33; v40 = nv40; v43 = nv43
+            # pair (0,4)
+            off_diag = g04; diag_diff = g44 - g00; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng00 = c*c*g00 - 2.0*s*c*g04 + s*s*g44; ng44 = s*s*g00 + 2.0*s*c*g04 + c*c*g44
+            ng01 = c*g01 - s*g14; ng14 = s*g01 + c*g14
+            ng02 = c*g02 - s*g24; ng24 = s*g02 + c*g24
+            ng03 = c*g03 - s*g34; ng34 = s*g03 + c*g34
+            g00 = ng00; g44 = ng44; g04 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g14 = ng14; g02 = ng02; g24 = ng24; g03 = ng03; g34 = ng34
+            nv00 = c*v00 - s*v04; nv04 = s*v00 + c*v04
+            nv10 = c*v10 - s*v14; nv14 = s*v10 + c*v14
+            nv20 = c*v20 - s*v24; nv24 = s*v20 + c*v24
+            nv30 = c*v30 - s*v34; nv34 = s*v30 + c*v34
+            nv40 = c*v40 - s*v44; nv44 = s*v40 + c*v44
+            v00 = nv00; v04 = nv04; v10 = nv10; v14 = nv14; v20 = nv20; v24 = nv24
+            v30 = nv30; v34 = nv34; v40 = nv40; v44 = nv44
+            # pair (1,2)
+            off_diag = g12; diag_diff = g22 - g11; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng11 = c*c*g11 - 2.0*s*c*g12 + s*s*g22; ng22 = s*s*g11 + 2.0*s*c*g12 + c*c*g22
+            ng01 = c*g01 - s*g02; ng02 = s*g01 + c*g02
+            ng13 = c*g13 - s*g23; ng23 = s*g13 + c*g23
+            ng14 = c*g14 - s*g24; ng24 = s*g14 + c*g24
+            g11 = ng11; g22 = ng22; g12 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g02 = ng02; g13 = ng13; g23 = ng23; g14 = ng14; g24 = ng24
+            nv01 = c*v01 - s*v02; nv02 = s*v01 + c*v02
+            nv11 = c*v11 - s*v12; nv12 = s*v11 + c*v12
+            nv21 = c*v21 - s*v22; nv22 = s*v21 + c*v22
+            nv31 = c*v31 - s*v32; nv32 = s*v31 + c*v32
+            nv41 = c*v41 - s*v42; nv42 = s*v41 + c*v42
+            v01 = nv01; v02 = nv02; v11 = nv11; v12 = nv12; v21 = nv21; v22 = nv22
+            v31 = nv31; v32 = nv32; v41 = nv41; v42 = nv42
+            # pair (1,3)
+            off_diag = g13; diag_diff = g33 - g11; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng11 = c*c*g11 - 2.0*s*c*g13 + s*s*g33; ng33 = s*s*g11 + 2.0*s*c*g13 + c*c*g33
+            ng01 = c*g01 - s*g03; ng03 = s*g01 + c*g03
+            ng12 = c*g12 - s*g23; ng23 = s*g12 + c*g23
+            ng14 = c*g14 - s*g34; ng34 = s*g14 + c*g34
+            g11 = ng11; g33 = ng33; g13 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g03 = ng03; g12 = ng12; g23 = ng23; g14 = ng14; g34 = ng34
+            nv01 = c*v01 - s*v03; nv03 = s*v01 + c*v03
+            nv11 = c*v11 - s*v13; nv13 = s*v11 + c*v13
+            nv21 = c*v21 - s*v23; nv23 = s*v21 + c*v23
+            nv31 = c*v31 - s*v33; nv33 = s*v31 + c*v33
+            nv41 = c*v41 - s*v43; nv43 = s*v41 + c*v43
+            v01 = nv01; v03 = nv03; v11 = nv11; v13 = nv13; v21 = nv21; v23 = nv23
+            v31 = nv31; v33 = nv33; v41 = nv41; v43 = nv43
+            # pair (1,4)
+            off_diag = g14; diag_diff = g44 - g11; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng11 = c*c*g11 - 2.0*s*c*g14 + s*s*g44; ng44 = s*s*g11 + 2.0*s*c*g14 + c*c*g44
+            ng01 = c*g01 - s*g04; ng04 = s*g01 + c*g04
+            ng12 = c*g12 - s*g24; ng24 = s*g12 + c*g24
+            ng13 = c*g13 - s*g34; ng34 = s*g13 + c*g34
+            g11 = ng11; g44 = ng44; g14 = tl.zeros([], dtype=DTYPE)
+            g01 = ng01; g04 = ng04; g12 = ng12; g24 = ng24; g13 = ng13; g34 = ng34
+            nv01 = c*v01 - s*v04; nv04 = s*v01 + c*v04
+            nv11 = c*v11 - s*v14; nv14 = s*v11 + c*v14
+            nv21 = c*v21 - s*v24; nv24 = s*v21 + c*v24
+            nv31 = c*v31 - s*v34; nv34 = s*v31 + c*v34
+            nv41 = c*v41 - s*v44; nv44 = s*v41 + c*v44
+            v01 = nv01; v04 = nv04; v11 = nv11; v14 = nv14; v21 = nv21; v24 = nv24
+            v31 = nv31; v34 = nv34; v41 = nv41; v44 = nv44
+            # pair (2,3)
+            off_diag = g23; diag_diff = g33 - g22; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng22 = c*c*g22 - 2.0*s*c*g23 + s*s*g33; ng33 = s*s*g22 + 2.0*s*c*g23 + c*c*g33
+            ng02 = c*g02 - s*g03; ng03 = s*g02 + c*g03
+            ng12 = c*g12 - s*g13; ng13 = s*g12 + c*g13
+            ng24 = c*g24 - s*g34; ng34 = s*g24 + c*g34
+            g22 = ng22; g33 = ng33; g23 = tl.zeros([], dtype=DTYPE)
+            g02 = ng02; g03 = ng03; g12 = ng12; g13 = ng13; g24 = ng24; g34 = ng34
+            nv02 = c*v02 - s*v03; nv03 = s*v02 + c*v03
+            nv12 = c*v12 - s*v13; nv13 = s*v12 + c*v13
+            nv22 = c*v22 - s*v23; nv23 = s*v22 + c*v23
+            nv32 = c*v32 - s*v33; nv33 = s*v32 + c*v33
+            nv42 = c*v42 - s*v43; nv43 = s*v42 + c*v43
+            v02 = nv02; v03 = nv03; v12 = nv12; v13 = nv13; v22 = nv22; v23 = nv23
+            v32 = nv32; v33 = nv33; v42 = nv42; v43 = nv43
+            # pair (2,4)
+            off_diag = g24; diag_diff = g44 - g22; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng22 = c*c*g22 - 2.0*s*c*g24 + s*s*g44; ng44 = s*s*g22 + 2.0*s*c*g24 + c*c*g44
+            ng02 = c*g02 - s*g04; ng04 = s*g02 + c*g04
+            ng12 = c*g12 - s*g14; ng14 = s*g12 + c*g14
+            ng23 = c*g23 - s*g34; ng34 = s*g23 + c*g34
+            g22 = ng22; g44 = ng44; g24 = tl.zeros([], dtype=DTYPE)
+            g02 = ng02; g04 = ng04; g12 = ng12; g14 = ng14; g23 = ng23; g34 = ng34
+            nv02 = c*v02 - s*v04; nv04 = s*v02 + c*v04
+            nv12 = c*v12 - s*v14; nv14 = s*v12 + c*v14
+            nv22 = c*v22 - s*v24; nv24 = s*v22 + c*v24
+            nv32 = c*v32 - s*v34; nv34 = s*v32 + c*v34
+            nv42 = c*v42 - s*v44; nv44 = s*v42 + c*v44
+            v02 = nv02; v04 = nv04; v12 = nv12; v14 = nv14; v22 = nv22; v24 = nv24
+            v32 = nv32; v34 = nv34; v42 = nv42; v44 = nv44
+            # pair (3,4)
+            off_diag = g34; diag_diff = g44 - g33; abs_off = tl.abs(off_diag)
+            tau = tl.where(abs_off > EPS, diag_diff / (2.0 * off_diag), 0.0)
+            t = tl.where(abs_off > EPS, tl.where(tau >= 0, 1.0, -1.0) / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau)), 0.0)
+            c = 1.0 / tl.sqrt(1.0 + t * t); s = t * c
+            ng33 = c*c*g33 - 2.0*s*c*g34 + s*s*g44; ng44 = s*s*g33 + 2.0*s*c*g34 + c*c*g44
+            ng03 = c*g03 - s*g04; ng04 = s*g03 + c*g04
+            ng13 = c*g13 - s*g14; ng14 = s*g13 + c*g14
+            ng23 = c*g23 - s*g24; ng24 = s*g23 + c*g24
+            g33 = ng33; g44 = ng44; g34 = tl.zeros([], dtype=DTYPE)
+            g03 = ng03; g04 = ng04; g13 = ng13; g14 = ng14; g23 = ng23; g24 = ng24
+            nv03 = c*v03 - s*v04; nv04 = s*v03 + c*v04
+            nv13 = c*v13 - s*v14; nv14 = s*v13 + c*v14
+            nv23 = c*v23 - s*v24; nv24 = s*v23 + c*v24
+            nv33 = c*v33 - s*v34; nv34 = s*v33 + c*v34
+            nv43 = c*v43 - s*v44; nv44 = s*v43 + c*v44
+            v03 = nv03; v04 = nv04; v13 = nv13; v14 = nv14; v23 = nv23; v24 = nv24
+            v33 = nv33; v34 = nv34; v43 = nv43; v44 = nv44
+        s0 = tl.sqrt(tl.maximum(g00, EPS))
+        s1 = tl.sqrt(tl.maximum(g11, EPS))
+        s2 = tl.sqrt(tl.maximum(g22, EPS))
+        s3 = tl.sqrt(tl.maximum(g33, EPS))
+        s4 = tl.sqrt(tl.maximum(g44, EPS))
+        # Selection sort descending: swap V columns too.
+        # swap(0,1)
+        do_swap = s0 < s1
+        s0, s1 = tl.where(do_swap, s1, s0), tl.where(do_swap, s0, s1)
+        tv = v00; v00 = tl.where(do_swap, v01, v00); v01 = tl.where(do_swap, tv, v01)
+        tv = v10; v10 = tl.where(do_swap, v11, v10); v11 = tl.where(do_swap, tv, v11)
+        tv = v20; v20 = tl.where(do_swap, v21, v20); v21 = tl.where(do_swap, tv, v21)
+        tv = v30; v30 = tl.where(do_swap, v31, v30); v31 = tl.where(do_swap, tv, v31)
+        tv = v40; v40 = tl.where(do_swap, v41, v40); v41 = tl.where(do_swap, tv, v41)
+        # swap(0,2)
+        do_swap = s0 < s2
+        s0, s2 = tl.where(do_swap, s2, s0), tl.where(do_swap, s0, s2)
+        tv = v00; v00 = tl.where(do_swap, v02, v00); v02 = tl.where(do_swap, tv, v02)
+        tv = v10; v10 = tl.where(do_swap, v12, v10); v12 = tl.where(do_swap, tv, v12)
+        tv = v20; v20 = tl.where(do_swap, v22, v20); v22 = tl.where(do_swap, tv, v22)
+        tv = v30; v30 = tl.where(do_swap, v32, v30); v32 = tl.where(do_swap, tv, v32)
+        tv = v40; v40 = tl.where(do_swap, v42, v40); v42 = tl.where(do_swap, tv, v42)
+        # swap(0,3)
+        do_swap = s0 < s3
+        s0, s3 = tl.where(do_swap, s3, s0), tl.where(do_swap, s0, s3)
+        tv = v00; v00 = tl.where(do_swap, v03, v00); v03 = tl.where(do_swap, tv, v03)
+        tv = v10; v10 = tl.where(do_swap, v13, v10); v13 = tl.where(do_swap, tv, v13)
+        tv = v20; v20 = tl.where(do_swap, v23, v20); v23 = tl.where(do_swap, tv, v23)
+        tv = v30; v30 = tl.where(do_swap, v33, v30); v33 = tl.where(do_swap, tv, v33)
+        tv = v40; v40 = tl.where(do_swap, v43, v40); v43 = tl.where(do_swap, tv, v43)
+        # swap(0,4)
+        do_swap = s0 < s4
+        s0, s4 = tl.where(do_swap, s4, s0), tl.where(do_swap, s0, s4)
+        tv = v00; v00 = tl.where(do_swap, v04, v00); v04 = tl.where(do_swap, tv, v04)
+        tv = v10; v10 = tl.where(do_swap, v14, v10); v14 = tl.where(do_swap, tv, v14)
+        tv = v20; v20 = tl.where(do_swap, v24, v20); v24 = tl.where(do_swap, tv, v24)
+        tv = v30; v30 = tl.where(do_swap, v34, v30); v34 = tl.where(do_swap, tv, v34)
+        tv = v40; v40 = tl.where(do_swap, v44, v40); v44 = tl.where(do_swap, tv, v44)
+        # swap(1,2)
+        do_swap = s1 < s2
+        s1, s2 = tl.where(do_swap, s2, s1), tl.where(do_swap, s1, s2)
+        tv = v01; v01 = tl.where(do_swap, v02, v01); v02 = tl.where(do_swap, tv, v02)
+        tv = v11; v11 = tl.where(do_swap, v12, v11); v12 = tl.where(do_swap, tv, v12)
+        tv = v21; v21 = tl.where(do_swap, v22, v21); v22 = tl.where(do_swap, tv, v22)
+        tv = v31; v31 = tl.where(do_swap, v32, v31); v32 = tl.where(do_swap, tv, v32)
+        tv = v41; v41 = tl.where(do_swap, v42, v41); v42 = tl.where(do_swap, tv, v42)
+        # swap(1,3)
+        do_swap = s1 < s3
+        s1, s3 = tl.where(do_swap, s3, s1), tl.where(do_swap, s1, s3)
+        tv = v01; v01 = tl.where(do_swap, v03, v01); v03 = tl.where(do_swap, tv, v03)
+        tv = v11; v11 = tl.where(do_swap, v13, v11); v13 = tl.where(do_swap, tv, v13)
+        tv = v21; v21 = tl.where(do_swap, v23, v21); v23 = tl.where(do_swap, tv, v23)
+        tv = v31; v31 = tl.where(do_swap, v33, v31); v33 = tl.where(do_swap, tv, v33)
+        tv = v41; v41 = tl.where(do_swap, v43, v41); v43 = tl.where(do_swap, tv, v43)
+        # swap(1,4)
+        do_swap = s1 < s4
+        s1, s4 = tl.where(do_swap, s4, s1), tl.where(do_swap, s1, s4)
+        tv = v01; v01 = tl.where(do_swap, v04, v01); v04 = tl.where(do_swap, tv, v04)
+        tv = v11; v11 = tl.where(do_swap, v14, v11); v14 = tl.where(do_swap, tv, v14)
+        tv = v21; v21 = tl.where(do_swap, v24, v21); v24 = tl.where(do_swap, tv, v24)
+        tv = v31; v31 = tl.where(do_swap, v34, v31); v34 = tl.where(do_swap, tv, v34)
+        tv = v41; v41 = tl.where(do_swap, v44, v41); v44 = tl.where(do_swap, tv, v44)
+        # swap(2,3)
+        do_swap = s2 < s3
+        s2, s3 = tl.where(do_swap, s3, s2), tl.where(do_swap, s2, s3)
+        tv = v02; v02 = tl.where(do_swap, v03, v02); v03 = tl.where(do_swap, tv, v03)
+        tv = v12; v12 = tl.where(do_swap, v13, v12); v13 = tl.where(do_swap, tv, v13)
+        tv = v22; v22 = tl.where(do_swap, v23, v22); v23 = tl.where(do_swap, tv, v23)
+        tv = v32; v32 = tl.where(do_swap, v33, v32); v33 = tl.where(do_swap, tv, v33)
+        tv = v42; v42 = tl.where(do_swap, v43, v42); v43 = tl.where(do_swap, tv, v43)
+        # swap(2,4)
+        do_swap = s2 < s4
+        s2, s4 = tl.where(do_swap, s4, s2), tl.where(do_swap, s2, s4)
+        tv = v02; v02 = tl.where(do_swap, v04, v02); v04 = tl.where(do_swap, tv, v04)
+        tv = v12; v12 = tl.where(do_swap, v14, v12); v14 = tl.where(do_swap, tv, v14)
+        tv = v22; v22 = tl.where(do_swap, v24, v22); v24 = tl.where(do_swap, tv, v24)
+        tv = v32; v32 = tl.where(do_swap, v34, v32); v34 = tl.where(do_swap, tv, v34)
+        tv = v42; v42 = tl.where(do_swap, v44, v42); v44 = tl.where(do_swap, tv, v44)
+        # swap(3,4)
+        do_swap = s3 < s4
+        s3, s4 = tl.where(do_swap, s4, s3), tl.where(do_swap, s3, s4)
+        tv = v03; v03 = tl.where(do_swap, v04, v03); v04 = tl.where(do_swap, tv, v04)
+        tv = v13; v13 = tl.where(do_swap, v14, v13); v14 = tl.where(do_swap, tv, v14)
+        tv = v23; v23 = tl.where(do_swap, v24, v23); v24 = tl.where(do_swap, tv, v24)
+        tv = v33; v33 = tl.where(do_swap, v34, v33); v34 = tl.where(do_swap, tv, v34)
+        tv = v43; v43 = tl.where(do_swap, v44, v43); v44 = tl.where(do_swap, tv, v44)
+        s_base = bid * 5
+        tl.store(S_ptr + s_base + 0, s0); tl.store(S_ptr + s_base + 1, s1)
+        tl.store(S_ptr + s_base + 2, s2); tl.store(S_ptr + s_base + 3, s3)
+        tl.store(S_ptr + s_base + 4, s4)
+        vh_base = bid * 25
+        tl.store(Vh_ptr + vh_base + 0, v00); tl.store(Vh_ptr + vh_base + 1, v10)
+        tl.store(Vh_ptr + vh_base + 2, v20); tl.store(Vh_ptr + vh_base + 3, v30); tl.store(Vh_ptr + vh_base + 4, v40)
+        tl.store(Vh_ptr + vh_base + 5, v01); tl.store(Vh_ptr + vh_base + 6, v11)
+        tl.store(Vh_ptr + vh_base + 7, v21); tl.store(Vh_ptr + vh_base + 8, v31); tl.store(Vh_ptr + vh_base + 9, v41)
+        tl.store(Vh_ptr + vh_base + 10, v02); tl.store(Vh_ptr + vh_base + 11, v12)
+        tl.store(Vh_ptr + vh_base + 12, v22); tl.store(Vh_ptr + vh_base + 13, v32); tl.store(Vh_ptr + vh_base + 14, v42)
+        tl.store(Vh_ptr + vh_base + 15, v03); tl.store(Vh_ptr + vh_base + 16, v13)
+        tl.store(Vh_ptr + vh_base + 17, v23); tl.store(Vh_ptr + vh_base + 18, v33); tl.store(Vh_ptr + vh_base + 19, v43)
+        tl.store(Vh_ptr + vh_base + 20, v04); tl.store(Vh_ptr + vh_base + 21, v14)
+        tl.store(Vh_ptr + vh_base + 22, v24); tl.store(Vh_ptr + vh_base + 23, v34); tl.store(Vh_ptr + vh_base + 24, v44)
+        inv_s0 = 1.0 / (s0 + EPS); inv_s1 = 1.0 / (s1 + EPS)
+        inv_s2 = 1.0 / (s2 + EPS); inv_s3 = 1.0 / (s3 + EPS); inv_s4 = 1.0 / (s4 + EPS)
+        for block_start in range(0, M, BLOCK_M):
+            offs = tl.arange(0, BLOCK_M); row_idx = block_start + offs; mask = row_idx < M
+            a0 = tl.load(A_ptr + base + row_idx * 5 + 0, mask=mask, other=0.0).to(DTYPE)
+            a1 = tl.load(A_ptr + base + row_idx * 5 + 1, mask=mask, other=0.0).to(DTYPE)
+            a2 = tl.load(A_ptr + base + row_idx * 5 + 2, mask=mask, other=0.0).to(DTYPE)
+            a3 = tl.load(A_ptr + base + row_idx * 5 + 3, mask=mask, other=0.0).to(DTYPE)
+            a4 = tl.load(A_ptr + base + row_idx * 5 + 4, mask=mask, other=0.0).to(DTYPE)
+            u0 = (a0*v00 + a1*v10 + a2*v20 + a3*v30 + a4*v40) * inv_s0
+            u1 = (a0*v01 + a1*v11 + a2*v21 + a3*v31 + a4*v41) * inv_s1
+            u2 = (a0*v02 + a1*v12 + a2*v22 + a3*v32 + a4*v42) * inv_s2
+            u3 = (a0*v03 + a1*v13 + a2*v23 + a3*v33 + a4*v43) * inv_s3
+            u4 = (a0*v04 + a1*v14 + a2*v24 + a3*v34 + a4*v44) * inv_s4
+            u_base = bid * M * 5
+            tl.store(U_ptr + u_base + row_idx * 5 + 0, u0, mask=mask)
+            tl.store(U_ptr + u_base + row_idx * 5 + 1, u1, mask=mask)
+            tl.store(U_ptr + u_base + row_idx * 5 + 2, u2, mask=mask)
+            tl.store(U_ptr + u_base + row_idx * 5 + 3, u3, mask=mask)
+            tl.store(U_ptr + u_base + row_idx * 5 + 4, u4, mask=mask)
 
     HAS_TRITON = True
 
